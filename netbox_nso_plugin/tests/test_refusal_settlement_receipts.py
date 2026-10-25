@@ -81,6 +81,8 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
                             )
                         },
                         "job_id": automatic["carrier_job_id"],
+                        "carrier_job_id": automatic["carrier_job_id"],
+                        "carrier_job_status": automatic["carrier_job_status"],
                     }
                 )
                 return make_response(200, generations)
@@ -178,6 +180,49 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
+
+    def test_reissue_provenance_does_not_block_receipt_discovery(self):
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+
+        from ._adapter_http import make_generation_listing, make_response
+
+        self.capture_lost_publication()
+        original = self.adapter._handle
+        reissue = make_generation_listing(
+            generation_id=80,
+            seq=3,
+            job_id=500,
+            carrier_job_id=500,
+            stream_revisions={},
+            source_push_seq={"bgp": self.selection.source_push_seq},
+        )
+        result = {"row_outcomes": [], "refusals": [], "settlement_owners": [], "commit_acknowledged": True}
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                return make_response(200, [reissue, *response.json()])
+            if method == "GET" and url.endswith("/jobs"):
+                template = original(method, url, params={"after_settle_seq": 0}).json()[0]
+                jobs = [
+                    {**template, "id": 500, "result": result, "row_outcomes": [], "refusals": [], "settle_seq": 1},
+                    {**template, "settle_seq": 2},
+                ]
+                after = int(kwargs["params"]["after_settle_seq"])
+                return make_response(
+                    200, [job for job in jobs if job["settle_seq"] > after][: int(kwargs["params"]["limit"])]
+                )
+            return response
+
+        self.adapter._handle = handle
+        settle_device_apply_attempts(self.management)
+        self.selection.refresh_from_db()
+        self.assertIsNotNone(self.selection.acknowledged_at)
+        self.assertEqual(self.receipt_reads, 1)
+        self.assertEqual(
+            set(NSOApplyExecution.objects.values_list("generation_id", "consumption_state")),
+            {(80, "consumed"), (81, "consumed")},
+        )
 
     def test_lost_automatic_response_recovers_without_another_put(self):
         from datetime import timedelta
@@ -317,7 +362,8 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         )
 
     def test_malformed_generation_sources_fail_as_safe_evidence_invariants(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
         from ._adapter_http import make_response
 
@@ -340,8 +386,9 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         self.adapter._handle = malformed
         for invalid in (missing, None, [], {"bgp": True}):
             with self.subTest(source=repr(invalid)):
-                with self.assertRaises(EvidenceInvariantError):
+                with self.assertRaises(AdapterError) as raised:
                     settle_device_apply_attempts(self.management)
+                self.assertEqual(raised.exception.code, "invalid_response")
                 self.selection.refresh_from_db()
                 self.assertIsNone(self.selection.acknowledged_at)
                 self.assertFalse(NSOApplyExecution.objects.filter(consumption_state="consumed").exists())

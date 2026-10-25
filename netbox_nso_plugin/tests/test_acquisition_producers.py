@@ -213,7 +213,6 @@ UNRESOLVED_DISPOSITIONS = {
         "Secret verification response status is not overlay status.",
     ),
     ("apply_settlement.py", "_record_replay_answer"): (1, "HTTP response status is not overlay status."),
-    ("adapter_client.py", "list_device_generations"): (1, "Validate external generation status."),
     ("adapter_client.py", "_validated_secret_verification"): (1, "Validate external verification status."),
     ("provision_lifecycle.py", "validate_provision_evidence"): (1, "Validate external job status."),
     ("provision_lifecycle.py", "mark_provision_terminal"): (1, "Write provision lifecycle status, not overlay status."),

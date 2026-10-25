@@ -16,7 +16,7 @@ from django.conf import settings
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from ._adapter_http import make_response
+from ._adapter_http import make_generation_listing, make_response
 from ._outbox_case import make_managed, mirror_update, own_vlan
 from ._ownership_case import acquire_overlay
 
@@ -114,13 +114,13 @@ def _payload(adapter_device_id, attempts, *, head=None):
     )
 
 
-def _epoch_session(session):
+def _epoch_session(session, *, generations=()):
     """Serve epoch and generation HTTP reads around the existing request double."""
 
     class Session:
         def request(self, method, url, **kwargs):
             if method == "GET" and url.endswith(("/jobs", "/generations")):
-                response = make_response(200, [])
+                response = make_response(200, list(generations) if url.endswith("/generations") else [])
                 response.headers["X-Store-Incarnation"] = "placeholder-store"
                 return response
             return session.request(method, url, **kwargs)
@@ -264,7 +264,20 @@ class TestAttemptSettlement(TestCase):
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
-            patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(ReplaySession())),
+            patch(
+                "netbox_nso_plugin.adapter_client._get_session",
+                return_value=_epoch_session(
+                    ReplaySession(),
+                    generations=[
+                        make_generation_listing(
+                            **known["response"]["generations"][0],
+                            status="pending",
+                            carrier_job_id=None,
+                            carrier_job_status=None,
+                        )
+                    ],
+                ),
+            ),
         ):
             evidence = load_deployment_evidence(self.management)
 
@@ -519,7 +532,20 @@ class TestAttemptSettlement(TestCase):
         def load():
             with (
                 patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
-                patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(session)),
+                patch(
+                    "netbox_nso_plugin.adapter_client._get_session",
+                    return_value=_epoch_session(
+                        session,
+                        generations=[
+                            make_generation_listing(
+                                **admitted["response"]["generations"][0],
+                                status="pending",
+                                carrier_job_id=None,
+                                carrier_job_status=None,
+                            )
+                        ],
+                    ),
+                ),
             ):
                 return load_deployment_evidence(self.management)
 

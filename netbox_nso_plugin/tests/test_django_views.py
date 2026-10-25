@@ -770,6 +770,33 @@ class TestNSOInterfaceStateListView(ViewTestBase):
         small = render(2)
         self.assertEqual(render(6), small)
 
+    def test_csv_export_adds_no_queries_per_row(self):
+        """An export projects every exported row once, so its state cells issue no per-row lookups."""
+        import csv
+
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_list")
+
+        def export(total):
+            for index in range(NSOInterfaceState.objects.count(), total):
+                interface = Interface.objects.create(device=self.device, name=f"Ethernet{index}", type="1000base-t")
+                NSOInterfaceState.objects.create(
+                    interface=interface, attribute="description", status="changed", nso_value=f"device {index}"
+                )
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get(url, {"export": "table", "per_page": 1})
+            self.assertEqual(response.status_code, 200)
+            rows = list(csv.DictReader(response.content.decode().splitlines()))
+            self.assertEqual(len(rows), total)
+            self.assertEqual({row["Status"].strip() for row in rows}, {"drift"})
+            return len(queries.captured_queries)
+
+        export(2)  # Warm the per-process caches before counting.
+        small = export(2)
+        self.assertEqual(export(6), small)
+
 
 class TestInterfacesPageNoAttrsHint(ViewTestBase):
     """The interfaces page must explain an empty tab caused by no attrs in scope.
@@ -2504,12 +2531,17 @@ class TestNSOApplyPreviewView(ViewTestBase):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
         from ipam.models import VLAN
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
-        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOVLANState
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOOSPFInterfaceState, NSOVLANState
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
         url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
         timers = {"min_tx": 300, "min_rx": 300, "multiplier": 3}
+        ospf = OSPFInstance.objects.create(
+            device=self.device, name="preview-ospf", process_id="1", router_id="192.0.2.1"
+        )
+        area = OSPFArea.objects.create(area_id="0.0.0.1", area_type="standard")
 
         def preview(total):
             for index in range(NSOVLANState.objects.count(), total):
@@ -2520,18 +2552,64 @@ class TestNSOApplyPreviewView(ViewTestBase):
                     )
                     vlan = VLAN.objects.create(vid=100 + index, name=f"placeholder-vlan-{index}")
                     acquire_overlay(NSOVLANState, management=self.mgmt, vlan=vlan, status="accepted")
+                    OSPFInterface.objects.create(
+                        instance=ospf, area=area, interface=interface, cost=10, network_type="broadcast"
+                    )
+                    acquire_overlay(
+                        NSOOSPFInterfaceState,
+                        management=self.mgmt,
+                        interface=interface,
+                        process_id="1",
+                        area_id="0.0.0.0",
+                        status="accepted",
+                    )
             with CaptureQueriesContext(connection) as queries:
                 response = self.client.get(url)
             self.assertEqual(response.status_code, 200)
             shown = {(row["category"], row["item"], row["detail"]) for row in response.json()["routing_changes"]}
             expected = {("BFD", f"Ethernet{index}", "tx 300 / rx 300 x3") for index in range(total)}
             expected |= {("VLAN", f"VLAN {100 + index}", f"name placeholder-vlan-{index}") for index in range(total)}
+            expected |= {
+                ("OSPF interface", f"Ethernet{index}", "area 0.0.0.1 · cost 10 · broadcast") for index in range(total)
+            }
             self.assertEqual(shown, expected)
             return len(queries.captured_queries)
 
         preview(2)  # Warm the per-process caches before counting.
         small = preview(2)
         self.assertEqual(preview(6), small)
+
+    def test_owner_formatter_error_fails_the_preview(self):
+        """A formatter error reaches the caller; the preview does not show a placeholder for it."""
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+
+        content_bulk_update(self.iface_state, status="in_sync", nso_value="")
+        acquire_overlay(
+            NSOOSPFInterfaceState, management=self.mgmt, interface=self.interface, process_id="1", status="accepted"
+        )
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        with patch("netbox_nso_plugin.views._ospf_iface_detail", side_effect=RuntimeError("formatter defect")):
+            with self.assertRaisesMessage(RuntimeError, "formatter defect"):
+                self.client.get(url)
+
+    def test_owner_rows_without_formatter_relations_join_no_tables(self):
+        """A formatter that reads no relation gets a plain owner query, not select_related() of every FK."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSORoutePolicyState, NSOSnmpHostState
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        for model in (NSORoutePolicyState, NSOSnmpHostState, NSOLoggingHostState):
+            table = model._meta.db_table
+            owner_queries = [q["sql"] for q in queries.captured_queries if f'FROM "{table}"' in q["sql"]]
+            self.assertTrue(owner_queries, table)
+            for sql in owner_queries:
+                selected = set(re.findall(r'"(\w+)"\."', sql.split(f' FROM "{table}"', 1)[0]))
+                self.assertEqual(selected, {table}, sql)
 
     def test_preview_isis_interface_detail_includes_bfd(self):
         """#77 transparency: a tri-state bfd intent MUST appear in 'properties pushed' —
@@ -8764,15 +8842,16 @@ class _ApplyBoundaryAdapter(ReceiptAdapter):
     attempt's admission and the evidence that later settles it, which is what this pin needs.
     """
 
-    def __init__(self, apply_response, evidence=None):
+    def __init__(self, apply_response, evidence=None, *, generations=()):
         super().__init__()
         self.apply_response = apply_response
         self.evidence = evidence
+        self.generations = list(generations)
         self.apply_requests: list[dict] = []
 
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith(("/jobs", "/generations")):
-            response = make_response(200, [])
+            response = make_response(200, self.generations if url.endswith("/generations") else [])
             response.headers["X-Store-Incarnation"] = "placeholder-store"
             return response
         if url.endswith("/deployment-evidence"):
@@ -8898,7 +8977,15 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
             replayed.append(True)
             return 202, admitted["response"]
 
-        recovery = _ApplyBoundaryAdapter(replay, evidence=lambda: known if replayed else unknown)
+        from ._adapter_http import make_generation_listing
+
+        listing = make_generation_listing(
+            **admitted["response"]["generations"][0],
+            status=terminal["status"],
+            carrier_job_id=terminal["carrier_job_id"],
+            carrier_job_status=terminal["carrier_job_status"],
+        )
+        recovery = _ApplyBoundaryAdapter(replay, evidence=lambda: known if replayed else unknown, generations=[listing])
         config, session = recovery.patches()
         with config, session:
             settle_device_apply_attempts(self.mgmt)

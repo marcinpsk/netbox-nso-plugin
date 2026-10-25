@@ -14,6 +14,7 @@ from netbox_nso_plugin.device_differences import NOT_VISIBLE, differences
 from netbox_nso_plugin.models import NSOFamilyObservation, NSOFamilyReadState
 from netbox_nso_plugin.observations import observation_defaults
 
+from ._difference_fields import shown_fields
 from ._routing_observation_case import routing_observation
 from .test_gated_reconcile import _make
 
@@ -408,7 +409,7 @@ class TestRoutingProtocolDifferences(TestCase):
                 rows = self._rows(scope)
                 self.assertTrue(any(row.kind == "ambiguous" for row in rows))
                 self.assertTrue(all(row.identity == "" for row in rows))
-                self.assertNotIn("123", repr(rows))
+                self.assertNotIn("123", shown_fields(rows))
         permission = ObjectPermission.objects.create(name="Visible IS-IS overlay", actions=["view"])
         permission.object_types.add(ObjectType.objects.get_for_model(NSOISISInstanceState))
         permission.users.add(self.user)
@@ -748,7 +749,7 @@ class TestRoutingProtocolDifferences(TestCase):
         rows = self._rows("redistribution")
         compared = [(row.kind, row.reason) for row in rows if row.kind != "unavailable"]
         self.assertEqual(compared, [("ambiguous", NOT_VISIBLE)])
-        self.assertNotIn("4747", repr(rows))
+        self.assertNotIn("4747", shown_fields(rows))
 
     def test_redistribution_bgp_source_asdot_matches_asplain(self):
         native = self._redistribution(self._process())

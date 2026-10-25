@@ -78,7 +78,11 @@ def check_settled_probes(attempt_ids, device_id, *, quiesced_at):
 def check_active_streams():
     """Require current provenance for local owners and every adapter-held stream."""
     from . import delivery
-    from .apply_settlement import consumed_generation_certificates, terminal_carrier_requires_certificate
+    from .apply_settlement import (
+        certified_projection,
+        generation_certificate_candidates,
+        terminal_carrier_requires_certificate,
+    )
     from .durable_capture import _validate_snapshot_membership, _wire, mapping_epoch
     from .intent_drift import _delivery_key, _scopes
     from .models import NSOIntentRevision
@@ -176,11 +180,12 @@ def check_active_streams():
             )
         generations = adapter_client.list_device_generations(management.adapter_device_id)
         terminal = [generation for generation in generations if terminal_carrier_requires_certificate(generation)]
-        certificates = consumed_generation_certificates(management, incarnation, terminal)
+        certificates = generation_certificate_candidates(management, incarnation, terminal)
         for generation in generations:
             if terminal_carrier_requires_certificate(generation):
+                identity = generation["generation_id"], generation["carrier_job_id"]
                 _require(
-                    certificates[generation["generation_id"], generation["job_id"]] is not None,
+                    certified_projection(generation, certificates.get(identity, ())) is not None,
                     "missing_generation_evidence: A terminal remote carrier has no verified consumed execution evidence",
                 )
             for stream, revision in generation["stream_revisions"].items():

@@ -12,7 +12,7 @@ from uuid import uuid4
 from dcim.models import Device
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.db import transaction
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -6061,14 +6061,11 @@ def _ospf_iface_detail(r):
     overlay's value columns are refreshed from the device on reconcile and can read
     stale (None) before an owned change has been applied. Fall back to the overlay.
     """
-    src = None
     try:
-        from netbox_routing.models import OSPFInterface
-
-        src = OSPFInterface.objects.filter(interface=r.interface).first()
-    except Exception:
+        src = r.interface.ospf_interfaces
+    except ObjectDoesNotExist:
         src = None
-    area = (getattr(getattr(src, "area", None), "area_id", "") or r.area_id) if src else r.area_id
+    area = (src.area.area_id or r.area_id) if src else r.area_id
     cost = src.cost if (src and src.cost is not None) else r.cost
     net = (src.network_type if src else "") or r.network_type
     prio = src.priority if (src and src.priority is not None) else r.priority
@@ -6155,75 +6152,83 @@ def _apply_preview_owner_changes(device_pk):
     """List every settled owner outside the interface attribute panel."""
 
     def _iface(r):
-        try:
-            return r.interface.name
-        except Exception:
-            return "—"
-
-    def _vlan_item(r):
-        return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
+        return r.interface.name
 
     bgp_observations = {}
 
-    # Formatters affect presentation only; the settlement registry selects every owner.
+    # (label, relations the formatters read, item, detail); the settlement registry selects every owner.
     preview_formatters = {
-        "nsovlanstate": ("VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else ""),
-        "nsoswitchportstate": ("Switchport", _iface, lambda r: r.mode or ""),
+        "nsovlanstate": ("VLAN", ("vlan",), lambda r: f"VLAN {r.vlan.vid}", lambda r: f"name {r.vlan.name}"),
+        "nsoswitchportstate": ("Switchport", ("interface",), _iface, lambda r: r.mode or ""),
         "nsosvistate": (
             "SVI / IRB",
+            ("interface", "vlan"),
             _iface,
             lambda r: f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else (r.vrf or ""),
         ),
-        "nsosubinterfacestate": ("Subinterface", _iface, lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else ""),
+        "nsosubinterfacestate": (
+            "Subinterface",
+            ("interface",),
+            _iface,
+            lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else "",
+        ),
         "nsobfdinterfacestate": (
             "BFD",
+            ("interface",),
             _iface,
             lambda r: f"tx {r.min_tx or '?'} / rx {r.min_rx or '?'} x{r.multiplier or '?'}",
         ),
-        "nsolacpbundlestate": ("LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else ""),
+        "nsolacpbundlestate": ("LACP", ("interface",), _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else ""),
         "nsostaticroutestate": (
             "Static route",
+            (),
             lambda r: r.nso_prefix or "",
             lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
         ),
-        "nsoisisinterfacestate": ("IS-IS interface", _iface, _isis_iface_detail),
-        "nsoisisinstancestate": ("IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or ""),
-        "nsoospfinterfacestate": ("OSPF interface", _iface, _ospf_iface_detail),
-        "nsoospfinstancestate": ("OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or ""),
+        "nsoisisinterfacestate": ("IS-IS interface", ("interface", "isis_interface"), _iface, _isis_iface_detail),
+        "nsoisisinstancestate": ("IS-IS", (), lambda r: r.process_tag or "instance", lambda r: r.net or ""),
+        "nsoospfinterfacestate": ("OSPF interface", ("interface__ospf_interfaces__area",), _iface, _ospf_iface_detail),
+        "nsoospfinstancestate": ("OSPF", (), lambda r: f"process {r.process_id}", lambda r: r.router_id or ""),
         "nsobgprouterstate": (
             "BGP router",
+            ("bgp_router",),
             lambda r: f"AS {r.asn_str}",
             lambda r: str(r.bgp_router.router_id or "") if r.bgp_router_id else "",
         ),
         "nsobgppeerstate": (
             "BGP peer",
+            ("bgp_peer__remote_as",),
             lambda r: r.peer_address_str or "",
             lambda r: _bgp_peer_preview_detail(r, bgp_observations),
         ),
-        "nsoroutepolicystate": ("Route policy", lambda r: r.object_name or "", lambda r: r.family or ""),
+        "nsoroutepolicystate": ("Route policy", (), lambda r: r.object_name or "", lambda r: r.family or ""),
         "nsoredistributionstate": (
             "Redistribution",
+            (),
             lambda r: f"{r.source_protocol} → {r.dest_protocol}",
             lambda r: r.route_map or "",
         ),
-        "nsosnmpcommunitystate": ("SNMP community", lambda r: "community", lambda r: r.access or ""),
-        "nsosnmpv3userstate": ("SNMP v3 user", lambda r: r.username or "user", lambda r: ""),
+        "nsosnmpcommunitystate": ("SNMP community", (), lambda r: "community", lambda r: r.access or ""),
+        "nsosnmpv3userstate": ("SNMP v3 user", (), lambda r: r.username or "user", lambda r: ""),
         "nsosnmphoststate": (
             "SNMP host",
+            (),
             lambda r: r.address or "",
             lambda r: f"v{r.version}" if r.version else "",
         ),
-        "nsosnmpsysteminfostate": ("SNMP system", lambda r: "system-info", lambda r: ""),
-        "nsologginghoststate": ("Logging host", lambda r: r.address or "", lambda r: r.severity or ""),
+        "nsosnmpsysteminfostate": ("SNMP system", (), lambda r: "system-info", lambda r: ""),
+        "nsologginghoststate": ("Logging host", (), lambda r: r.address or "", lambda r: r.severity or ""),
         "nsologginglevelstate": (
             "Logging levels",
+            (),
             lambda r: "local-levels",
             lambda r: ", ".join(f"{f.split('_')[0]}={v}" for f, v in r.set_severities().items()),
         ),
-        "nsol2sapstate": ("L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or ""),
-        "nsointerfaceipstate": ("Interface IP", _iface, lambda r: _join_props([r.address, r.vrf])),
+        "nsol2sapstate": ("L2 SAP", (), lambda r: r.sap_id or "", lambda r: r.service_name or ""),
+        "nsointerfaceipstate": ("Interface IP", ("interface",), _iface, lambda r: _join_props([r.address, r.vrf])),
         "nsointerfacemtustate": (
             "Interface MTU",
+            ("interface",),
             _iface,
             lambda r: _join_props(
                 [f"{key} {getattr(r, key)}" for key in ("l2_mtu", "ip_mtu", "mpls_mtu") if getattr(r, key) is not None]
@@ -6231,30 +6236,16 @@ def _apply_preview_owner_changes(device_pk):
         ),
         "nsolacpmemberstate": (
             "LACP member",
+            ("interface",),
             _iface,
             lambda r: _join_props([r.mode, f"priority {r.port_priority}" if r.port_priority is not None else ""]),
         ),
         "nsoisisflexalgostate": (
             "IS-IS Flex-Algo",
+            (),
             lambda r: f"{r.process_tag} / {r.algo_id}",
             lambda r: r.metric_type or "",
         ),
-    }
-    # The relations each formatter above reads, loaded with the owner rows.
-    preview_relations = {
-        "nsovlanstate": ("vlan",),
-        "nsoswitchportstate": ("interface",),
-        "nsosvistate": ("interface", "vlan"),
-        "nsosubinterfacestate": ("interface",),
-        "nsobfdinterfacestate": ("interface",),
-        "nsolacpbundlestate": ("interface",),
-        "nsoisisinterfacestate": ("interface", "isis_interface"),
-        "nsoospfinterfacestate": ("interface",),
-        "nsobgprouterstate": ("bgp_router",),
-        "nsobgppeerstate": ("bgp_peer__remote_as",),
-        "nsointerfaceipstate": ("interface",),
-        "nsointerfacemtustate": ("interface",),
-        "nsolacpmemberstate": ("interface",),
     }
 
     from .delivery import delivery_keys
@@ -6266,26 +6257,15 @@ def _apply_preview_owner_changes(device_pk):
         model = spec.model
         if model is NSOInterfaceState:
             continue
-        label, item_fn, detail_fn = preview_formatters.get(
-            model._meta.model_name,
-            (str(model._meta.verbose_name), lambda r: f"row {r.pk}", lambda r: ""),
-        )
+        label, relations, item_fn, detail_fn = preview_formatters[model._meta.model_name]
         # Include pending owners and unresolved executions in the confirmation count.
-        rows = model.objects.filter(**{spec.device_lookup: device_pk}).select_related(
-            *preview_relations.get(model._meta.model_name, ())
-        )
+        rows = model.objects.filter(**{spec.device_lookup: device_pk})
+        if relations:  # select_related() without arguments follows every non-null FK
+            rows = rows.select_related(*relations)
         for r in project_rows(rows):
             projected = row_projection(r)
             if not projected["pending"]:
                 continue
-            try:
-                item = item_fn(r)
-            except Exception:
-                item = "—"
-            try:
-                detail = detail_fn(r)
-            except Exception:
-                detail = ""
             key = r.dest_protocol if len(spec.delivery_keys) > 1 else spec.delivery_keys[0]
             # A read can store a destination protocol that has no delivery key.
             entry = delivery_keys().get(key)
@@ -6299,8 +6279,8 @@ def _apply_preview_owner_changes(device_pk):
                     "model": r._meta.model_name,
                     "pk": r.pk,
                     "category": label,
-                    "item": item,
-                    "detail": detail,
+                    "item": item_fn(r),
+                    "detail": detail_fn(r),
                     "status": r.status,
                     "scope": scope_val,
                     "staged_days": staged_days,
