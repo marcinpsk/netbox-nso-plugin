@@ -113,6 +113,7 @@ from .request_authorization import (
     OverlayFamily,
     OverlayRow,
     generic_policy,
+    parse_object_id,
     permitted_instance,
     shared_vlan_rename,
 )
@@ -6538,8 +6539,8 @@ class NSOAutoAssignIPView(AuthorizedView):
         from .ip_autoassign import auto_assign_ip
 
         device = self.target.device
-        pks_raw = request.POST.getlist("interface_pks") or request.POST.get("interface_pks", "").split(",")
-        pks = [int(p.strip()) for p in pks_raw if p.strip().isascii() and p.strip().isdecimal()]
+        pks_raw = request.POST.getlist("interface_pks")
+        pks = [pk for raw in pks_raw for value in raw.split(",") if (pk := parse_object_id(value.strip())) is not None]
 
         if not pks:
             messages.warning(request, "No interfaces selected for IP auto-assignment.")
@@ -6595,8 +6596,8 @@ class NSOProvisionLinkRoleView(AuthorizedView):
         from .link_role import provision_link_role
 
         device = self.target.device
-        pks_raw = request.POST.getlist("interface_pks") or request.POST.get("interface_pks", "").split(",")
-        pks = [int(p.strip()) for p in pks_raw if p.strip().isascii() and p.strip().isdecimal()]
+        pks_raw = request.POST.getlist("interface_pks")
+        pks = [pk for raw in pks_raw for value in raw.split(",") if (pk := parse_object_id(value.strip())) is not None]
 
         if not pks:
             messages.warning(request, "No interfaces selected for link-role provisioning.")

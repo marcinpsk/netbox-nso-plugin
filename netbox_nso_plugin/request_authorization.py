@@ -380,6 +380,17 @@ def permitted_instance(user, selected):
     return default if default is not None and visible.filter(pk=default.pk).exists() else None
 
 
+def parse_object_id(value: str) -> int | None:
+    """Parse an ASCII decimal object ID. Return None if conversion fails."""
+    if not (value.isascii() and value.isdecimal()):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        # Python rejects decimal strings that exceed its integer digit limit.
+        return None
+
+
 @dataclass(frozen=True)
 class Onboarding(TargetSpec):
     """Onboard a device: the posted device and the selected instance must be visible (404 otherwise)."""
@@ -390,10 +401,10 @@ class Onboarding(TargetSpec):
     def resolve(self, request, user, kwargs):  # noqa: D102
         from .models import NSOInstance
 
-        raw = request.POST.get("device", "")
-        if not (raw.isascii() and raw.isdecimal()):
+        device_id = parse_object_id(request.POST.get("device", ""))
+        if device_id is None:
             raise Http404
-        device = get_object_or_404(_device_model().objects.restrict(user, "view"), pk=int(raw))
+        device = get_object_or_404(_device_model().objects.restrict(user, "view"), pk=device_id)
         selected = request.POST.get("instance")
         if not is_valid_instance_id(selected):
             raise BadRequest("Invalid NSO instance identity")

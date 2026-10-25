@@ -717,7 +717,7 @@ class TestBulkAllocationFailures(AdapterCase):
     def test_auto_assignment_continues_after_an_allocation_failure(self):
         self._post_with_rejected_address("device_auto_assign_ip")
 
-    def test_link_role_provisioning_continues_after_an_allocation_failure(self):
+    def _assign_link_role(self):
         from netbox_nso_plugin.models import NSOLinkRole, NSOLinkRoleAssignment
 
         role = NSOLinkRole.objects.create(
@@ -731,4 +731,26 @@ class TestBulkAllocationFailures(AdapterCase):
         )
         for interface in self.interfaces:
             NSOLinkRoleAssignment.objects.create(role=role, interface=interface)
+
+    def test_link_role_provisioning_continues_after_an_allocation_failure(self):
+        self._assign_link_role()
         self._post_with_rejected_address("device_provision_link_role", database_failure=True)
+
+    def _assert_comma_selection(self, route):
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        url = reverse(f"plugins:netbox_nso_plugin:{route}", kwargs={"device_pk": self.device.pk})
+        response = self.client.post(url, {"interface_pks": ", ".join(str(row.pk) for row in self.interfaces)})
+        self.assertEqual(response.status_code, 302)
+        for interface in self.interfaces:
+            self.assertEqual(IPAddress.objects.filter(assigned_object_id=interface.pk).count(), 2)
+            self.assertEqual(NSOInterfaceIPState.objects.filter(interface=interface, status="accepted").count(), 2)
+
+    def test_auto_assignment_accepts_comma_separated_selection(self):
+        self._assert_comma_selection("device_auto_assign_ip")
+
+    def test_link_role_provisioning_accepts_comma_separated_selection(self):
+        self._assign_link_role()
+        self._assert_comma_selection("device_provision_link_role")

@@ -12,6 +12,7 @@ import importlib
 import json
 import pkgutil
 import re
+import sys
 from contextlib import contextmanager
 from unittest.mock import patch
 from uuid import uuid4
@@ -910,27 +911,34 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertFalse(NSODeviceManagement.objects.filter(device=unmanaged).exists())
         self.assertEqual(_CountingSession.calls, [])
 
-    def test_onboarding_rejects_non_decimal_device_ids(self):
+    def test_onboarding_rejects_invalid_device_identities(self):
+        previous_limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(4300)
+        self.addCleanup(sys.set_int_max_str_digits, previous_limit)
         _grant(self.user, ("add",), NSODeviceManagement)
         _grant(self.user, ("view",), Device)
         before = list(NSODeviceManagement.objects.values())
         for route in ("onboard", "quick_manage"):
-            for value in ("²", "①"):
-                with self.subTest(route=route, value=value):
+            for value in ("²", "①", "9" * 5000):
+                with self.subTest(route=route, value=value if len(value) < 20 else "oversized"):
                     response = self.client.post(reverse(f"plugins:netbox_nso_plugin:{route}"), {"device": value})
                     self.assertEqual(response.status_code, 404)
                     self.assertEqual(list(NSODeviceManagement.objects.values()), before)
                     self.assertEqual(_CountingSession.calls, [])
 
-    def test_bulk_interface_actions_ignore_non_decimal_ids(self):
+    def test_bulk_interface_actions_ignore_invalid_ids(self):
+        previous_limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(4300)
+        self.addCleanup(sys.set_int_max_str_digits, previous_limit)
         _grant(self.user, ("change",), NSODeviceManagement)
         _grant(self.user, ("view",), Device)
         for route in ("device_auto_assign_ip", "device_provision_link_role"):
-            with self.subTest(route=route):
-                url = reverse(f"plugins:netbox_nso_plugin:{route}", kwargs={"device_pk": self.device_a.pk})
-                response = self.client.post(url, {"interface_pks": "²"})
-                self.assertEqual(response.status_code, 302)
-                self.assertEqual(_CountingSession.calls, [])
+            for value in ("²", "9" * 5000):
+                with self.subTest(route=route, value=value if len(value) < 20 else "oversized"):
+                    url = reverse(f"plugins:netbox_nso_plugin:{route}", kwargs={"device_pk": self.device_a.pk})
+                    response = self.client.post(url, {"interface_pks": value})
+                    self.assertEqual(response.status_code, 302)
+                    self.assertEqual(_CountingSession.calls, [])
 
     def test_anonymous_device_tab_honors_netbox_view_exemption(self):
         device = Device.objects.create(

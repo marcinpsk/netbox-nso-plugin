@@ -863,12 +863,20 @@ rules:
   - id: nso-request-identity-isdigit
     languages: [python]
     severity: ERROR
-    message: Validate request identities with ASCII decimal digits before integer conversion.
+    message: Parse request identities through parse_object_id before lookup.
     pattern-either:
       - pattern: |
           if not $TEXT.isdigit():
               ...
       - pattern: '[int($VALUE) for $ITEM in $VALUES if $TEXT.isdigit()]'
+      - patterns:
+          - pattern: int(...)
+          - pattern-inside: |
+              class $CLASS(...):
+                  ...
+          - metavariable-regex:
+              metavariable: $CLASS
+              regex: '^(Onboarding|NSOAutoAssignIPView|NSOProvisionLinkRoleView)$'
     paths:
       include:
         - "netbox_nso_plugin/request_authorization.py"

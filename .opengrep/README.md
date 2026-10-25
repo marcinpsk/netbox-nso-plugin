@@ -114,9 +114,12 @@ detect comparisons under other function names.
 
 The `nso-request-identity-isdigit` rule rejects negative `isdigit()` guards
 and `isdigit()` filters on integer list comprehensions in request authorization
-and UI views. These modules parse integer identities. Use ASCII decimal validation
-so the accepted characters can be converted with `int()`. The rule does not follow
-validators in other modules. Behavioral tests cover onboarding and both bulk actions.
+and UI views. It also rejects raw `int()` calls in `Onboarding`,
+`NSOAutoAssignIPView`, and `NSOProvisionLinkRoleView`. These boundaries use
+`parse_object_id`, which rejects non-ASCII digits and conversion failures from
+Python's integer digit limit. The rule recognizes the three literal class names.
+It does not follow renamed classes or validators in other modules. Real request
+tests cover Unicode and oversized identities on all four routes.
 
 The `nso-bulk-allocation-failure-isolation` rule requires direct bulk allocation
 and link-role calls in UI views to use a savepoint with the known allocation

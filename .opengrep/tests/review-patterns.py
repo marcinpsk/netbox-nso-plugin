@@ -3186,3 +3186,33 @@ def qualified_bulk_allocation_with_failure_isolation(interfaces):
                 roles.provision_link_role(interface)
         except (ValidationError, DatabaseError, ObjectDoesNotExist):
             report_failure(interface)
+
+
+class Onboarding:
+    def parse_raw_identity(self, raw):
+        # ruleid: nso-request-identity-isdigit
+        return int(raw)
+
+    def parse_checked_identity(self, raw):
+        # ok: nso-request-identity-isdigit
+        return parse_object_id(raw)
+
+
+class NSOAutoAssignIPView:
+    def parse_raw_identity(self, raw):
+        # ruleid: nso-request-identity-isdigit
+        return int(raw)
+
+    def parse_checked_identity(self, raw):
+        # ok: nso-request-identity-isdigit
+        return parse_object_id(raw)
+
+
+class NSOProvisionLinkRoleView:
+    def parse_raw_identity(self, raw):
+        # ruleid: nso-request-identity-isdigit
+        return int(raw)
+
+    def parse_checked_identity(self, raw):
+        # ok: nso-request-identity-isdigit
+        return parse_object_id(raw)
