@@ -92,7 +92,9 @@ interface process or a redistribution) also needs the NetBox permission on each 
 writes: `add` for a new object, `change` for an existing one (checked on the stored object
 and on the result), `delete` for a removed one, with the permission's constraints. A refusal
 answers HTTP 403 and the action writes nothing. Onboarding (UI and API) needs `add` on
-**NSO Device Management**, and its constraints must admit the new row.
+**NSO Device Management**, and its constraints must admit the new row. The operator also
+needs `view` on the target device and on the NSO instance used for onboarding, whether
+selected explicitly or taken from the default.
 
 Programmatic writers must wrap each create, save, or delete of a managed intent model in
 `intent_transaction()`. The renderer write, revision bump, and intent outbox entry must

@@ -390,8 +390,8 @@ class Onboarding(TargetSpec):
     def resolve(self, request, user, kwargs):  # noqa: D102
         from .models import NSOInstance
 
-        raw = request.POST.get("device")
-        if not str(raw or "").isdigit():
+        raw = request.POST.get("device", "")
+        if not (raw.isascii() and raw.isdecimal()):
             raise Http404
         device = get_object_or_404(_device_model().objects.restrict(user, "view"), pk=int(raw))
         selected = request.POST.get("instance")

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
 from django.db import OperationalError
 from django.test import TestCase
+from django.test.utils import isolate_apps
 
 from ._adapter_http import make_session
 from ._ownership_case import acquire_overlay, save_overlay_fixture
@@ -908,6 +909,55 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         ]
         state.refresh_from_db()
         self.assertEqual(state.status, "in_sync")
+
+    @isolate_apps()
+    def test_owned_intent_matches_when_optional_native_columns_are_absent(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        class NativeInterfaceWithoutOptionalColumns(ISISInterface):
+            class Meta:
+                proxy = True
+                app_label = "netbox_routing"
+
+            def __getattribute__(self, name):
+                if name in {"bfd_enabled", "frr_enabled", "frr_protection"}:
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+
+        management = self._make_mgmt()
+        instance = ISISInstance.objects.create(device=self.device, process_tag="")
+        native = ISISInterface.objects.create(
+            interface=self.iface_ge0,
+            address_family="ipv4",
+            instance=instance,
+            circuit_type="level-1-2",
+            metric=10,
+        )
+        state = acquire_overlay(
+            NSOISISInterfaceState,
+            management=management,
+            interface=self.iface_ge0,
+            af="ipv4",
+            isis_interface=native,
+            status="accepted",
+            circuit_type="level-1-2",
+            metric=10,
+            bfd_enabled=True,
+            frr_enabled=True,
+            frr_protection="node",
+        )
+        payload = {"interfaces": [self._entry(metric=10, bfd_enabled=True, frr_enabled=True, frr_protection="node")]}
+        # The proxy exercises the real ORM with the older dependency's column interface.
+        with patch("netbox_routing.models.ISISInterface", NativeInterfaceWithoutOptionalColumns):
+            reconcile_isis(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        native.refresh_from_db()
+        self.assertIsNone(native.bfd_enabled)
+        self.assertIsNone(native.frr_enabled)
 
     def test_owned_native_routing_drift_prevents_in_sync(self):
         from netbox_routing.models import ISISInstance, ISISInterface

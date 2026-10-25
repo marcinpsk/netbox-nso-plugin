@@ -910,6 +910,41 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertFalse(NSODeviceManagement.objects.filter(device=unmanaged).exists())
         self.assertEqual(_CountingSession.calls, [])
 
+    def test_onboarding_rejects_non_decimal_device_ids(self):
+        _grant(self.user, ("add",), NSODeviceManagement)
+        _grant(self.user, ("view",), Device)
+        before = list(NSODeviceManagement.objects.values())
+        for route in ("onboard", "quick_manage"):
+            for value in ("²", "①"):
+                with self.subTest(route=route, value=value):
+                    response = self.client.post(reverse(f"plugins:netbox_nso_plugin:{route}"), {"device": value})
+                    self.assertEqual(response.status_code, 404)
+                    self.assertEqual(list(NSODeviceManagement.objects.values()), before)
+                    self.assertEqual(_CountingSession.calls, [])
+
+    def test_bulk_interface_actions_ignore_non_decimal_ids(self):
+        _grant(self.user, ("change",), NSODeviceManagement)
+        _grant(self.user, ("view",), Device)
+        for route in ("device_auto_assign_ip", "device_provision_link_role"):
+            with self.subTest(route=route):
+                url = reverse(f"plugins:netbox_nso_plugin:{route}", kwargs={"device_pk": self.device_a.pk})
+                response = self.client.post(url, {"interface_pks": "²"})
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(_CountingSession.calls, [])
+
+    def test_anonymous_device_tab_honors_netbox_view_exemption(self):
+        device = Device.objects.create(
+            name="authz-public",
+            device_type=self.device_a.device_type,
+            role=self.device_a.role,
+            site=self.device_a.site,
+        )
+        self.client.logout()
+        with self.settings(LOGIN_REQUIRED=False, EXEMPT_VIEW_PERMISSIONS=["dcim.device"]):
+            response = self.client.get(reverse("dcim:device_nso", kwargs={"pk": device.pk}))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(_CountingSession.calls, [])
+
     def test_onboarding_without_device_view_is_403(self):
         _grant(self.user, ("add",), NSODeviceManagement)
         response = self.client.post(reverse("plugins:netbox_nso_plugin:onboard"), {"device": self.device_a.pk})

@@ -12,8 +12,8 @@ from uuid import uuid4
 from dcim.models import Device
 from django.apps import apps
 from django.contrib import messages
-from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
-from django.db import transaction
+from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
+from django.db import DatabaseError, transaction
 from django.http import Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -6539,7 +6539,7 @@ class NSOAutoAssignIPView(AuthorizedView):
 
         device = self.target.device
         pks_raw = request.POST.getlist("interface_pks") or request.POST.get("interface_pks", "").split(",")
-        pks = [int(p.strip()) for p in pks_raw if p.strip().isdigit()]
+        pks = [int(p.strip()) for p in pks_raw if p.strip().isascii() and p.strip().isdecimal()]
 
         if not pks:
             messages.warning(request, "No interfaces selected for IP auto-assignment.")
@@ -6549,7 +6549,14 @@ class NSOAutoAssignIPView(AuthorizedView):
         allocated_total, skipped_total, error_total = 0, 0, 0
 
         for iface in interfaces:
-            result = auto_assign_ip(iface)
+            try:
+                with transaction.atomic():
+                    result = auto_assign_ip(iface)
+            except (ValidationError, DatabaseError, ObjectDoesNotExist):
+                logger.exception("IP allocation failed for interface %s", iface.pk)
+                error_total += 1
+                messages.warning(request, f"{iface.name}: IP allocation failed. See the server log.")
+                continue
             allocated_total += len(result["allocated"])
             skipped_total += len(result["skipped"])
             error_total += len(result["errors"])
@@ -6589,7 +6596,7 @@ class NSOProvisionLinkRoleView(AuthorizedView):
 
         device = self.target.device
         pks_raw = request.POST.getlist("interface_pks") or request.POST.get("interface_pks", "").split(",")
-        pks = [int(p.strip()) for p in pks_raw if p.strip().isdigit()]
+        pks = [int(p.strip()) for p in pks_raw if p.strip().isascii() and p.strip().isdecimal()]
 
         if not pks:
             messages.warning(request, "No interfaces selected for link-role provisioning.")
@@ -6600,7 +6607,14 @@ class NSOProvisionLinkRoleView(AuthorizedView):
         for iface in self.target.selected(Interface.objects.filter(device=device), pks):
             if iface.pk in covered:
                 continue  # far end of a link already provisioned from the other side
-            summary = provision_link_role(iface)
+            try:
+                with transaction.atomic():
+                    summary = provision_link_role(iface)
+            except (ValidationError, DatabaseError, ObjectDoesNotExist):
+                logger.exception("Link-role provisioning failed for interface %s", iface.pk)
+                rolled_back += 1
+                messages.warning(request, f"{iface.name}: Link-role provisioning failed. See the server log.")
+                continue
             covered.update(summary.get("ends", []))
             if summary["provisioned"]:
                 provisioned += 1

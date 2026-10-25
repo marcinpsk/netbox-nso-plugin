@@ -111,3 +111,16 @@ BFD and FRR intent fields in the shared IS-IS interface and device comparisons.
 It also rejects conversion of their dictionary values. Display conversions
 outside those comparisons remain valid. The rule does not follow aliases or
 detect comparisons under other function names.
+
+The `nso-request-identity-isdigit` rule rejects negative `isdigit()` guards
+and `isdigit()` filters on integer list comprehensions in request authorization
+and UI views. These modules parse integer identities. Use ASCII decimal validation
+so the accepted characters can be converted with `int()`. The rule does not follow
+validators in other modules. Behavioral tests cover onboarding and both bulk actions.
+
+The `nso-bulk-allocation-failure-isolation` rule requires direct bulk allocation
+and link-role calls in UI views to use a savepoint with the known allocation
+failure handler. The rule recognizes the literal call names, context manager,
+and exception tuple. It does not follow aliases or prove loop continuation.
+Real request tests verify rollback, continuation, public warnings, and whole-request
+permission refusal. Unexpected protocol errors still propagate.

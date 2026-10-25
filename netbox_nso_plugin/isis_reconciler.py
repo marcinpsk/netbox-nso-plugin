@@ -753,7 +753,11 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                     and _isis_device_matches_intent(entry, state, current_native, ned_id)
                     and _isis_interface_children_match(entry, current_native)
                     and _isis_interface_matches_intent(
-                        {field: getattr(current_native, field, None) for field in _ISIS_IFACE_SCALAR_ATTRS}, state
+                        {
+                            field: getattr(current_native, field, getattr(state, field, None))
+                            for field in _ISIS_IFACE_SCALAR_ATTRS
+                        },
+                        state,
                     )
                 )
                 state.status = sm.on_reconcile(state.status, matches=matches)

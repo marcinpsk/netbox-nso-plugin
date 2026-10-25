@@ -659,3 +659,76 @@ class TestInterfaceIpPrefixRefresh(AdapterCase):
         self.assertTrue(Prefix.objects.filter(prefix="198.18.61.0/24").exists())
         self.child.refresh_from_db()
         self.assertEqual(self.child._depth, 1)
+
+
+class TestBulkAllocationFailures(AdapterCase):
+    """A failed allocation rolls back its interface and the remaining batch continues."""
+
+    def setUp(self):
+        super().setUp()
+        from ipam.models import Prefix, Role
+
+        self.device, self.management = make_managed("bulk-allocation", 17190)
+        self.interfaces = [
+            Interface.objects.create(device=self.device, name=f"Loopback{index}", type="virtual") for index in range(3)
+        ]
+        role, _ = Role.objects.get_or_create(slug="loopback", defaults={"name": "Loopback pool"})
+        Prefix.objects.create(prefix="198.18.240.0/24", role=role)
+        Prefix.objects.create(prefix="2001:db8:240::/120", role=role)
+        self.client.force_login(User.objects.create_superuser(username=f"bulk-{uuid4().hex[:6]}"))
+
+    def _post_with_rejected_address(self, route, *, database_failure=False):
+        from django.contrib.messages import get_messages
+        from django.core.exceptions import ValidationError
+        from django.db import connection
+        from django.db.models.signals import post_save
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        rejected = self.interfaces[1]
+
+        def reject_address(sender, instance, **kwargs):
+            if instance.assigned_object_id == rejected.pk and instance.family == 6:
+                if database_failure:
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT 1 / 0")
+                raise ValidationError("private allocation failure")
+
+        post_save.connect(reject_address, sender=IPAddress, dispatch_uid="test_bulk_allocation_rejection")
+        try:
+            url = reverse(f"plugins:netbox_nso_plugin:{route}", kwargs={"device_pk": self.device.pk})
+            response = self.client.post(url, {"interface_pks": [row.pk for row in self.interfaces]})
+        finally:
+            post_save.disconnect(reject_address, sender=IPAddress, dispatch_uid="test_bulk_allocation_rejection")
+        self.assertEqual(response.status_code, 302)
+        for interface in (self.interfaces[0], self.interfaces[2]):
+            self.assertEqual(IPAddress.objects.filter(assigned_object_id=interface.pk).count(), 2)
+            self.assertEqual(NSOInterfaceIPState.objects.filter(interface=interface, status="accepted").count(), 2)
+        self.assertFalse(IPAddress.objects.filter(assigned_object_id=rejected.pk).exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(interface=rejected).exists())
+        text = " ".join(str(message) for message in get_messages(response.wsgi_request))
+        self.assertIn(rejected.name, text)
+        expected = "Provisioned 2 interface(s)" if database_failure else "Auto-assigned 4 IP address(es)"
+        self.assertIn(expected, text)
+        self.assertNotIn("private allocation failure", text)
+        self.assertNotIn("division by zero", text)
+
+    def test_auto_assignment_continues_after_an_allocation_failure(self):
+        self._post_with_rejected_address("device_auto_assign_ip")
+
+    def test_link_role_provisioning_continues_after_an_allocation_failure(self):
+        from netbox_nso_plugin.models import NSOLinkRole, NSOLinkRoleAssignment
+
+        role = NSOLinkRole.objects.create(
+            name="Bulk loopback",
+            slug="bulk-loopback",
+            link_type="single",
+            assign_ipv4=True,
+            ipv4_pool_role="loopback",
+            assign_ipv6=True,
+            ipv6_pool_role="loopback",
+        )
+        for interface in self.interfaces:
+            NSOLinkRoleAssignment.objects.create(role=role, interface=interface)
+        self._post_with_rejected_address("device_provision_link_role", database_failure=True)

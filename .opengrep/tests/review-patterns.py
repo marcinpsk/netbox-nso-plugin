@@ -3127,3 +3127,42 @@ def _isis_device_matches_intent(entry, state):
 def show_isis_bfd(state):
     # ok: nso-nullable-isis-intent-bool
     return bool(state.bfd_enabled)
+
+
+def onboarding_numeric_identity(raw):
+    # ruleid: nso-request-identity-isdigit
+    if not str(raw or "").isdigit():
+        return None
+    return int(raw)
+
+
+def bulk_numeric_identities(values):
+    # ruleid: nso-request-identity-isdigit
+    return [int(value.strip()) for value in values if value.strip().isdigit()]
+
+
+def decimal_numeric_identity(raw):
+    # ok: nso-request-identity-isdigit
+    if not (raw.isascii() and raw.isdecimal()):
+        return None
+    return int(raw)
+
+
+def bulk_allocation_without_failure_isolation(interfaces):
+    for interface in interfaces:
+        # ruleid: nso-bulk-allocation-failure-isolation
+        auto_assign_ip(interface)
+        # ruleid: nso-bulk-allocation-failure-isolation
+        provision_link_role(interface)
+
+
+def bulk_allocation_with_failure_isolation(interfaces):
+    for interface in interfaces:
+        try:
+            with transaction.atomic():
+                # ok: nso-bulk-allocation-failure-isolation
+                auto_assign_ip(interface)
+                # ok: nso-bulk-allocation-failure-isolation
+                provision_link_role(interface)
+        except (ValidationError, DatabaseError, ObjectDoesNotExist):
+            report_failure(interface)
