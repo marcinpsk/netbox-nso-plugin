@@ -29,6 +29,13 @@ from netbox_nso_plugin.models import (
 from ._authority_case import AdapterCase, FakeAdapter, grant, operator
 from ._outbox_case import make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
+from ._routing_observation_case import (
+    redistribution_components,
+    routing_observation,
+    store_redistribution_observation,
+)
+from ._scope_observation_case import entry
+from .test_read_gate import _rs
 
 User = get_user_model()
 
@@ -381,22 +388,43 @@ class TestRedistributionConversion(AdapterCase):
                 metric_type="type-1",
                 status="accepted",
             )
+        store_redistribution_observation(cls.management)
         cls.admin = User.objects.create_superuser(username=f"nw-redist-admin-{uuid4().hex[:6]}")
 
     def setUp(self):
         super().setUp()
+        observed = {
+            "dest_protocol": "ospf",
+            "dest_ref": "7",
+            "source_protocol": "static",
+            "source_ref": "",
+            "metric": 30,
+        }
+        source = entry(source_protocol="static", source_ref="", metric=30)
+        snapshot = routing_observation(
+            "redistribution",
+            document={
+                "entries": [entry(**observed)],
+                "components": redistribution_components(
+                    [
+                        {
+                            "protocol": "ospf",
+                            "inventory": [entry(process_id="7", vrf="", redistribute=[source])],
+                            "present": ["inventory"],
+                        }
+                    ]
+                ),
+                "unprojectable": [],
+            },
+            coverage={
+                "attributes": ["metric", "metric_type", "route_map"],
+                "components": [
+                    {"protocol": "ospf", "destinations": ["7"], "sources": [{"protocol": "static", "reference": ""}]}
+                ],
+            },
+        )
         FakeAdapter.documents = {
-            "/redistribution": {
-                "entries": [
-                    {
-                        "dest_protocol": "ospf",
-                        "dest_ref": "7",
-                        "source_protocol": "static",
-                        "source_ref": "",
-                        "metric": 30,
-                    }
-                ]
-            }
+            "/redistribution": {"entries": [observed], "observation": snapshot, "read_state": _rs(attempt_id=1)}
         }
 
     def test_refresh_creates_nothing_and_accept_needs_the_native_permission(self):
