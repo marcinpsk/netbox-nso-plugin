@@ -187,6 +187,17 @@ class TestImportTimeCheck(SimpleTestCase):
                 def initial(self, request, *args, **kwargs):
                     return None
 
+    def test_a_drf_view_overriding_handle_exception_is_rejected(self):
+        from rest_framework.views import APIView
+
+        with self.assertRaisesMessage(ImproperlyConfigured, "overrides handle_exception()"):
+
+            class Api(authz.AuthorizedAPIView, APIView):
+                policy = EndpointPolicy(DeviceRead(), "read")
+
+                def handle_exception(self, exc):
+                    return None
+
     def test_netbox_generic_target_needs_a_netbox_generic_view(self):
         with self.assertRaisesMessage(ImproperlyConfigured, "not a NetBox generic view"):
 

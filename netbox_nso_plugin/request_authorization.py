@@ -740,13 +740,13 @@ class AuthorizedView(_PolicyEnforced, LoginRequiredMixin, View):
         is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest" or "key" in kwargs
         try:
             with authority_scope(policy.effects, user, target=self.target):
-                try:
-                    return super().dispatch(request, *args, **kwargs)
-                except OwnershipNotQualified as exc:
-                    if is_ajax or exc.device_id is None:
-                        return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
-                    messages.error(request, exc.public_message)
-                    return redirect(_device_nso_tab_url(exc.device_id))
+                return super().dispatch(request, *args, **kwargs)
+        except OwnershipNotQualified as exc:
+            # The refusal left the authority scope by raising, so the operator scope rolled back.
+            if is_ajax or exc.device_id is None:
+                return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
+            messages.error(request, exc.public_message)
+            return redirect(_device_nso_tab_url(exc.device_id))
         except SharedOperationConflict as exc:
             if is_ajax or self.target.device is None:
                 return JsonResponse({"status": "error", "message": exc.public_message}, status=409)
@@ -781,7 +781,7 @@ class AuthorizedAPIView(_PolicyEnforced):
     """Mixin placed before a DRF view. ``dispatch`` and ``initial`` are final."""
 
     _authz_enforcer = True
-    _authz_final = ("dispatch", "initial")
+    _authz_final = ("dispatch", "initial", "handle_exception")
     _authz_api = True
 
     def dispatch(self, request, *args, **kwargs):
@@ -792,6 +792,7 @@ class AuthorizedAPIView(_PolicyEnforced):
         try:
             with contextlib.ExitStack() as stack:
                 self._authz_scope = stack
+                self._authz_operator = False
                 return super().dispatch(request, *args, **kwargs)
         except SharedOperationConflict as exc:
             return self.finalize_response(
@@ -800,6 +801,15 @@ class AuthorizedAPIView(_PolicyEnforced):
         except PermissionsViolation as exc:
             # The operator scope rolled back every write of the request.
             return self.finalize_response(self.request, Response({"detail": exc.message}, status=403), *args, **kwargs)
+
+    def handle_exception(self, exc):
+        """Answer the exception as DRF does; the operator scope then rolls back instead of committing."""
+        from django.db import transaction
+
+        response = super().handle_exception(exc)
+        if self._authz_operator:
+            transaction.set_rollback(True)
+        return response
 
     def initial(self, request, *args, **kwargs):
         """Authenticate (DRF), then run the endpoint policy and open its authority scope."""
@@ -815,6 +825,7 @@ class AuthorizedAPIView(_PolicyEnforced):
             # A NetBox viewset authorizes its own object writes (design 2b): no operator scope.
             return
         self._authz_scope.enter_context(authority_scope(policy.effects, user, target=self.target))
+        self._authz_operator = policy.effects == "native_mutation"
 
 
 def view_class_of(callback):
