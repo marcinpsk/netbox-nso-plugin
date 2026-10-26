@@ -170,8 +170,13 @@ class BlockedRemovalTestBase(TestCase):
         since_seq=None,
         apply_state=None,
         apply_state_status=200,
+        job_id=None,
+        stored_jobs=(),
     ):
-        """Hit device_nso_jobs with the adapter's job list canned at the transport."""
+        """Hit device_nso_jobs with the adapter's job list canned at the transport.
+
+        *stored_jobs* are the jobs ``GET /api/v1/jobs/{id}`` serves; the listing page serves *jobs*.
+        """
         apply_state = apply_state or {
             "device_id": 10,
             "head": None,
@@ -182,6 +187,8 @@ class BlockedRemovalTestBase(TestCase):
             "last_apply_job": None,
         }
         generation_request_params = []
+        job_lookups = []
+        stored = {job["id"]: job for job in stored_jobs}
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
@@ -198,6 +205,14 @@ class BlockedRemovalTestBase(TestCase):
                     limit = params.get("limit", 100)
                     page = [row for row in generations if row["seq"] > cursor][:limit]
                     return make_response(200, json_data=page)
+                if lookup := re.search(r"/api/v1/jobs/(\d+)$", url):
+                    job_lookups.append(int(lookup.group(1)))
+                    job = stored.get(int(lookup.group(1)))
+                    if job is None:
+                        return make_response(
+                            404, json_data={"error": {"code": "not_found", "message": "Job not found"}}
+                        )
+                    return make_response(200, json_data=job)
                 return make_response(200, json_data=jobs)
 
             session.request.side_effect = request
@@ -206,8 +221,11 @@ class BlockedRemovalTestBase(TestCase):
             query = {"generation_id": generation_ids}
             if since_seq is not None:
                 query["since_seq"] = since_seq
+            if job_id is not None:
+                query["job_id"] = job_id
             response = self.client.get(url, query)
         self.generation_request_params = generation_request_params
+        self.job_lookups = job_lookups
         self.assertEqual(response.status_code, 200)
         return json.loads(response.content)
 
@@ -393,6 +411,53 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
 
         self.assertEqual(data["generations"], [generations[-1]])
         self.assertEqual(data["jobs"], _served(jobs))
+
+    def test_a_polled_job_past_the_listing_page_is_served(self):
+        # The adapter listing page holds the newest jobs; the polled job is older than all of them.
+        page = [_removal_job(job_id, "vlan", "succeeded") for job_id in range(700, 600, -1)]
+        polled = _removal_job(42, "isis", "running")
+
+        data = self._get_jobs(page, job_id=42, stored_jobs=[polled])
+
+        self.assertEqual(self.job_lookups, [42])
+        self.assertIn(_served([polled])[0], data["jobs"])
+
+    def test_a_polled_job_on_the_listing_page_needs_no_lookup(self):
+        listed = _removal_job(42, "isis", "running")
+
+        data = self._get_jobs([listed], job_id=42)
+
+        self.assertEqual(self.job_lookups, [])
+        self.assertEqual(data["jobs"], _served([listed]))
+
+    def test_a_polled_job_of_another_device_is_never_served(self):
+        other_device = {**_removal_job(42, "isis", "succeeded"), "device_id": 11}
+
+        data = self._get_jobs([], job_id=42, stored_jobs=[other_device])
+
+        self.assertEqual(self.job_lookups, [42])
+        self.assertEqual(data["jobs"], [])
+
+    def test_a_polled_job_the_adapter_does_not_know_is_absent(self):
+        data = self._get_jobs([], job_id=42)
+
+        self.assertEqual(data["jobs"], [])
+
+    def test_an_apply_chain_job_past_the_listing_page_is_served(self):
+        generations = _device_generations()
+        polled = _removal_job(501, "vlan", "succeeded")
+
+        data = self._get_jobs([], generations=generations, generation_ids=(81,), stored_jobs=[polled])
+
+        self.assertEqual(self.job_lookups, [501])
+        self.assertEqual(data["jobs"], _served([polled]))
+
+    def test_a_non_integer_job_id_is_rejected(self):
+        with patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG):
+            url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
+            response = self.client.get(url, {"job_id": "x"})
+
+        self.assertEqual(response.status_code, 400)
 
     def test_requested_apply_generation_starts_after_the_browser_cursor(self):
         wanted = _GENERATION_PAGE_LIMIT + 1

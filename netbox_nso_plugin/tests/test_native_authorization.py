@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
-from django.db import connection
+from django.db import connection, connections
 from django.test import SimpleTestCase, TestCase
 from utilities.exceptions import PermissionsViolation
 
@@ -305,6 +305,38 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
                 cursor.execute("UPDATE dcim_interface SET description = %s WHERE id = %s", ["raw", self.first.pk])
 
         self.assertRefused(raw)
+
+    def test_an_add_denial_inside_a_system_entry_latches_on_the_operator(self):
+        swallowed = []
+
+        def entry():
+            try:
+                native.require_operator_add(self.management)
+            except PermissionsViolation as exc:
+                swallowed.append(exc.message)
+
+        wrapped = native.system_entry("test")(entry)
+        viewer = User.objects.create_user(username=f"native-viewer-{uuid4().hex[:6]}")
+        try:
+            with self.assertRaises(PermissionsViolation), authority_scope("native_mutation", viewer):
+                wrapped()
+        finally:
+            native.SYSTEM_ENTRIES.pop(f"{entry.__module__}.{entry.__qualname__}", None)
+        self.assertEqual(len(swallowed), 1)
+
+    def test_the_sql_backstop_wraps_every_database_alias(self):
+        # A test may not connect to a second alias; the wrapper list proves the backstop sees its SQL.
+        alias = "nso_backstop_second"
+        connections.settings[alias] = dict(connections.settings["default"])
+        try:
+            for effects in ("read", "native_mutation"):
+                with self.subTest(effects=effects), authority_scope(effects, self.admin):
+                    self.assertIn(native._backstop, connections[alias].execute_wrappers)
+            self.assertNotIn(native._backstop, connections[alias].execute_wrappers)
+        finally:
+            connections[alias].close()
+            del connections[alias]
+            del connections.settings[alias]
         self.first.refresh_from_db()
         self.assertEqual(self.first.description, "one")
 

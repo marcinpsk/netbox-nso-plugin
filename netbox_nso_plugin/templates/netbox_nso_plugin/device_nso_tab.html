@@ -721,9 +721,15 @@
 
     // The device job collection is the only job surface: a job id from another device is never fetched.
     function pollJob(jobId, label) {
+      var jobUrl = null;
+      if (deviceJobsUrl) {
+        jobUrl = new URL(deviceJobsUrl, window.location.href);
+        // The collection serves this job even when it is older than the listing page.
+        jobUrl.searchParams.set('job_id', String(jobId));
+      }
       var interval = setInterval(async function () {
         try {
-          var r = deviceJobsUrl ? await fetch(deviceJobsUrl) : null;
+          var r = jobUrl ? await fetch(jobUrl.toString()) : null;
           var payload = r && r.ok ? await r.json() : null;
           var job = payload && (payload.jobs || []).find(function (item) { return String(item.id) === String(jobId); });
           if (!job) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }

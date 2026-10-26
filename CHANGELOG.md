@@ -2,6 +2,35 @@
 
 <!-- version list -->
 
+## v1.13.0 (2026-10-25)
+
+### Bug Fixes
+
+- **settlement**: Read null admission generations as empty links
+  ([`50b564a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/50b564a6d2ae6b0a484f070f5061daca74b4387b))
+
+- **settlement**: Report a null evidence response as an invalid stored response
+  ([`fcd4b5d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/fcd4b5d853df2c559696980890aea0dad2a84ad8))
+
+- **settlement**: Validate replay responses before reconciliation
+  ([`2b770b9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2b770b96e1c7d5fe5d36d3d2fa20b1fea7a2b4f6))
+
+### Chores
+
+- **opengrep**: Match repr() assertions that carry a failure message
+  ([`96bcafb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/96bcafbd467fa930e7c6a4158c50a2da80d5dd75))
+
+### Continuous Integration
+
+- Pin the joined adapter to the refusal catalog contract
+  ([`13cbc31`](https://github.com/marcinpsk/netbox-nso-plugin/commit/13cbc3117b2c6b03a7c5b9bf8cec2c5bdb349bc6))
+
+### Testing
+
+- **refusal**: Bind each corpus message to its corpus records
+  ([`7d88f69`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7d88f6933a0db924f05a409b4008dfafc68b3021))
+
+
 ## v1.12.0 (2026-10-23)
 
 ### Bug Fixes

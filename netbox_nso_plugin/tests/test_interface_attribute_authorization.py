@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Marcin Zieba
+# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Interface attribute ownership through refresh, operator requests, and native guards."""
 
 from dcim.models import Interface

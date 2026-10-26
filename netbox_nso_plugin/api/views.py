@@ -40,7 +40,7 @@ from ..request_authorization import (
     OwnerRow,
     generic_policy,
     is_valid_instance_id,
-    permitted_instance,
+    selected_instance,
 )
 from .serializers import (
     NSOBGPRouterStateSerializer,
@@ -229,14 +229,9 @@ class OnboardingCandidatesView(AuthorizedAPIView, APIView):
         selected = request.query_params.get("instance")
         if not is_valid_instance_id(selected):
             raise ParseError("Invalid NSO instance identity")
-        if selected:
-            instance = NSOInstance.objects.restrict(request.user, "view").filter(adapter_instance_id=selected).first()
-            if instance is None:
-                raise NotFound(f"unknown instance '{selected}'")
-        else:
-            instance = permitted_instance(request.user, None)
+        instance = selected_instance(request.user, selected)
         if instance is None:
-            raise NotFound("no NSO instance configured")
+            raise NotFound(f"unknown instance '{selected}'" if selected else "no NSO instance configured")
 
         data = build_onboarding_dashboard(instance, request.user)
         return Response(

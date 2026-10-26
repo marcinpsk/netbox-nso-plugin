@@ -380,6 +380,18 @@ def permitted_instance(user, selected):
     return default if default is not None and visible.filter(pk=default.pk).exists() else None
 
 
+def selected_instance(user, selected):
+    """Return the explicitly selected visible instance (None if hidden or unknown), else the permitted default.
+
+    A mutation never substitutes the default for an explicit selection. The caller validates *selected*.
+    """
+    from .models import NSOInstance
+
+    if selected:
+        return NSOInstance.objects.restrict(user, "view").filter(adapter_instance_id=selected).first()
+    return permitted_instance(user, None)
+
+
 def parse_object_id(value: str) -> int | None:
     """Parse an ASCII decimal object ID. Return None if conversion fails."""
     if not (value.isascii() and value.isdecimal()):
@@ -399,8 +411,6 @@ class Onboarding(TargetSpec):
         return ("netbox_nso_plugin.add_nsodevicemanagement", "dcim.view_device")
 
     def resolve(self, request, user, kwargs):  # noqa: D102
-        from .models import NSOInstance
-
         device_id = parse_object_id(request.POST.get("device", ""))
         if device_id is None:
             raise Http404
@@ -408,12 +418,9 @@ class Onboarding(TargetSpec):
         selected = request.POST.get("instance")
         if not is_valid_instance_id(selected):
             raise BadRequest("Invalid NSO instance identity")
-        if selected:
-            # A mutation never substitutes the default for an explicit selection.
-            visible = NSOInstance.objects.restrict(user, "view")
-            instance = get_object_or_404(visible, adapter_instance_id=selected)
-        else:
-            instance = permitted_instance(user, None)
+        instance = selected_instance(user, selected)
+        if selected and instance is None:
+            raise Http404
         return AuthorizedTarget(user=user, primary=device, device=device, related={"instance": instance})
 
 
@@ -563,8 +570,6 @@ class ApiOnboarding(TargetSpec):
     def resolve(self, request, user, kwargs):  # noqa: D102
         from rest_framework.exceptions import NotFound, ParseError
 
-        from .models import NSOInstance
-
         body = _request_body(request)
         device_id = body.get("netbox_device_id")
         if device_id is None:
@@ -577,14 +582,9 @@ class ApiOnboarding(TargetSpec):
         selected = body.get("instance")
         if not is_valid_instance_id(selected):
             raise ParseError("Invalid NSO instance identity")
-        if selected:
-            instance = NSOInstance.objects.restrict(user, "view").filter(adapter_instance_id=selected).first()
-            if instance is None:
-                raise NotFound(f"unknown instance '{selected}'")
-        else:
-            instance = permitted_instance(user, None)
+        instance = selected_instance(user, selected)
         if instance is None:
-            raise NotFound("no NSO instance configured")
+            raise NotFound(f"unknown instance '{selected}'" if selected else "no NSO instance configured")
         return AuthorizedTarget(user=user, primary=device, device=device, related={"instance": instance})
 
 
@@ -740,13 +740,13 @@ class AuthorizedView(_PolicyEnforced, LoginRequiredMixin, View):
         is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest" or "key" in kwargs
         try:
             with authority_scope(policy.effects, user, target=self.target):
-                try:
-                    return super().dispatch(request, *args, **kwargs)
-                except OwnershipNotQualified as exc:
-                    if is_ajax or exc.device_id is None:
-                        return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
-                    messages.error(request, exc.public_message)
-                    return redirect(_device_nso_tab_url(exc.device_id))
+                return super().dispatch(request, *args, **kwargs)
+        except OwnershipNotQualified as exc:
+            # The refusal left the authority scope by raising, so the operator scope rolled back.
+            if is_ajax or exc.device_id is None:
+                return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
+            messages.error(request, exc.public_message)
+            return redirect(_device_nso_tab_url(exc.device_id))
         except SharedOperationConflict as exc:
             if is_ajax or self.target.device is None:
                 return JsonResponse({"status": "error", "message": exc.public_message}, status=409)
@@ -781,7 +781,7 @@ class AuthorizedAPIView(_PolicyEnforced):
     """Mixin placed before a DRF view. ``dispatch`` and ``initial`` are final."""
 
     _authz_enforcer = True
-    _authz_final = ("dispatch", "initial")
+    _authz_final = ("dispatch", "initial", "handle_exception")
     _authz_api = True
 
     def dispatch(self, request, *args, **kwargs):
@@ -792,6 +792,7 @@ class AuthorizedAPIView(_PolicyEnforced):
         try:
             with contextlib.ExitStack() as stack:
                 self._authz_scope = stack
+                self._authz_operator = False
                 return super().dispatch(request, *args, **kwargs)
         except SharedOperationConflict as exc:
             return self.finalize_response(
@@ -800,6 +801,15 @@ class AuthorizedAPIView(_PolicyEnforced):
         except PermissionsViolation as exc:
             # The operator scope rolled back every write of the request.
             return self.finalize_response(self.request, Response({"detail": exc.message}, status=403), *args, **kwargs)
+
+    def handle_exception(self, exc):
+        """Answer the exception as DRF does; the operator scope then rolls back instead of committing."""
+        from django.db import transaction
+
+        response = super().handle_exception(exc)
+        if self._authz_operator:
+            transaction.set_rollback(True)
+        return response
 
     def initial(self, request, *args, **kwargs):
         """Authenticate (DRF), then run the endpoint policy and open its authority scope."""
@@ -815,6 +825,7 @@ class AuthorizedAPIView(_PolicyEnforced):
             # A NetBox viewset authorizes its own object writes (design 2b): no operator scope.
             return
         self._authz_scope.enter_context(authority_scope(policy.effects, user, target=self.target))
+        self._authz_operator = policy.effects == "native_mutation"
 
 
 def view_class_of(callback):
