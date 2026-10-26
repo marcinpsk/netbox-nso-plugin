@@ -922,6 +922,39 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertFalse(NSODeviceManagement.objects.filter(device=unmanaged).exists())
         self.assertEqual(_CountingSession.calls, [])
 
+    def test_an_excluded_api_instance_selection_is_404_not_the_default(self):
+        """The API onboard and candidate listing never substitute the default for an excluded selection."""
+        from netbox_nso_plugin.models import NSOInstance
+
+        unmanaged = Device.objects.create(
+            name="authz-api-manage-me",
+            device_type=self.device_a.device_type,
+            role=self.device_a.role,
+            site=self.device_a.site,
+        )
+        excluded = self.management_b.nso_instance
+        default = self.management_a.nso_instance
+        NSOInstance.objects.filter(pk=default.pk).update(is_default=True)
+        NSOInstance.objects.exclude(pk=default.pk).update(is_default=False)
+        _grant(self.user, ("add",), NSODeviceManagement)
+        _grant(self.user, ("view",), Device)
+        _grant(self.user, ("view",), NSOInstance, {"pk": default.pk})
+        api = self._api()
+        onboard = api.post(
+            reverse("plugins-api:netbox_nso_plugin-api:onboard"),
+            {"netbox_device_id": unmanaged.pk, "instance": excluded.adapter_instance_id},
+            format="json",
+        )
+        candidates = api.get(
+            reverse("plugins-api:netbox_nso_plugin-api:onboarding_candidates"),
+            {"instance": excluded.adapter_instance_id},
+        )
+        for response in (onboard, candidates):
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json()["detail"], f"unknown instance '{excluded.adapter_instance_id}'")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=unmanaged).exists())
+        self.assertEqual(_CountingSession.calls, [])
+
     def test_onboarding_rejects_invalid_device_identities(self):
         previous_limit = sys.get_int_max_str_digits()
         sys.set_int_max_str_digits(4300)

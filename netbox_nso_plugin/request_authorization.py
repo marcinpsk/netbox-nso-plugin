@@ -380,6 +380,18 @@ def permitted_instance(user, selected):
     return default if default is not None and visible.filter(pk=default.pk).exists() else None
 
 
+def selected_instance(user, selected):
+    """Return the explicitly selected visible instance (None if hidden or unknown), else the permitted default.
+
+    A mutation never substitutes the default for an explicit selection. The caller validates *selected*.
+    """
+    from .models import NSOInstance
+
+    if selected:
+        return NSOInstance.objects.restrict(user, "view").filter(adapter_instance_id=selected).first()
+    return permitted_instance(user, None)
+
+
 def parse_object_id(value: str) -> int | None:
     """Parse an ASCII decimal object ID. Return None if conversion fails."""
     if not (value.isascii() and value.isdecimal()):
@@ -399,8 +411,6 @@ class Onboarding(TargetSpec):
         return ("netbox_nso_plugin.add_nsodevicemanagement", "dcim.view_device")
 
     def resolve(self, request, user, kwargs):  # noqa: D102
-        from .models import NSOInstance
-
         device_id = parse_object_id(request.POST.get("device", ""))
         if device_id is None:
             raise Http404
@@ -408,12 +418,9 @@ class Onboarding(TargetSpec):
         selected = request.POST.get("instance")
         if not is_valid_instance_id(selected):
             raise BadRequest("Invalid NSO instance identity")
-        if selected:
-            # A mutation never substitutes the default for an explicit selection.
-            visible = NSOInstance.objects.restrict(user, "view")
-            instance = get_object_or_404(visible, adapter_instance_id=selected)
-        else:
-            instance = permitted_instance(user, None)
+        instance = selected_instance(user, selected)
+        if selected and instance is None:
+            raise Http404
         return AuthorizedTarget(user=user, primary=device, device=device, related={"instance": instance})
 
 
@@ -563,8 +570,6 @@ class ApiOnboarding(TargetSpec):
     def resolve(self, request, user, kwargs):  # noqa: D102
         from rest_framework.exceptions import NotFound, ParseError
 
-        from .models import NSOInstance
-
         body = _request_body(request)
         device_id = body.get("netbox_device_id")
         if device_id is None:
@@ -577,14 +582,9 @@ class ApiOnboarding(TargetSpec):
         selected = body.get("instance")
         if not is_valid_instance_id(selected):
             raise ParseError("Invalid NSO instance identity")
-        if selected:
-            instance = NSOInstance.objects.restrict(user, "view").filter(adapter_instance_id=selected).first()
-            if instance is None:
-                raise NotFound(f"unknown instance '{selected}'")
-        else:
-            instance = permitted_instance(user, None)
+        instance = selected_instance(user, selected)
         if instance is None:
-            raise NotFound("no NSO instance configured")
+            raise NotFound(f"unknown instance '{selected}'" if selected else "no NSO instance configured")
         return AuthorizedTarget(user=user, primary=device, device=device, related={"instance": instance})
 
 
