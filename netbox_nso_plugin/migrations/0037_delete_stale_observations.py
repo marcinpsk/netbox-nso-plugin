@@ -8,13 +8,10 @@ def delete_stale_observations(apps, schema_editor):
     """Delete snapshots stored before #1833 added presence and status; the next authoritative read stores them again."""
     NSOFamilyObservation = apps.get_model("netbox_nso_plugin", "NSOFamilyObservation")
     NSOFamilyReadState = apps.get_model("netbox_nso_plugin", "NSOFamilyReadState")
-    states = list(
-        NSOFamilyReadState.objects.filter(family__in=STALE_FAMILIES, observation__isnull=False).values_list(
-            "pk", flat=True
-        )
-    )
-    NSOFamilyObservation.objects.filter(read_state_id__in=states).delete()
-    NSOFamilyReadState.objects.filter(pk__in=states).update(publication_sequence=F("publication_sequence") + 1)
+    read_states = NSOFamilyReadState.objects.using(schema_editor.connection.alias)
+    states = list(read_states.filter(family__in=STALE_FAMILIES, observation__isnull=False).values_list("pk", flat=True))
+    NSOFamilyObservation.objects.using(schema_editor.connection.alias).filter(read_state_id__in=states).delete()
+    read_states.filter(pk__in=states).update(publication_sequence=F("publication_sequence") + 1)
 
 
 class Migration(migrations.Migration):

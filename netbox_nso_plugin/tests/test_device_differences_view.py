@@ -190,7 +190,8 @@ class TestDeviceDifferencesView(TestCase):
             self.client.get(self.url)
 
         migration = import_module("netbox_nso_plugin.migrations.0037_delete_stale_observations")
-        migration.delete_stale_observations(apps, None)
+        with connection.schema_editor() as schema_editor:
+            migration.delete_stale_observations(apps, schema_editor)
 
         response = self.client.get(self.url, {"scope": "interface"})
         self.assertEqual(response.status_code, 200)
