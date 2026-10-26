@@ -3014,6 +3014,17 @@ def caught_exception_text_in_responses(request):
     except ValueError as exc:
         # ruleid: nso-caught-exception-text-to-operator
         return Response({"detail": exc.args}, status=409)
+    except TypeError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        contrib.messages.warning(request, repr(exc))
+        # ruleid: nso-caught-exception-text-to-operator
+        return http.JsonResponse({"message": str(exc)}, status=400)
+    except KeyError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise exceptions.PermissionDenied(str(exc)) from None
+    except LookupError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        return response.Response({"detail": str(exc)}, status=400)
     try:
         mutate(request)
     except SharedOperationConflict as exc:

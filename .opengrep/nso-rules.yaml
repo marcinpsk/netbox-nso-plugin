@@ -769,9 +769,13 @@ rules:
                   metavariable: $FORM
                   regex: ^(?!self$)
           - pattern: 'JsonResponse({..., $KEY: $RAW, ...}, ...)'
+          - pattern: '$MODULE.JsonResponse({..., $KEY: $RAW, ...}, ...)'
           - pattern: 'Response({..., $KEY: $RAW, ...}, ...)'
+          - pattern: '$MODULE.Response({..., $KEY: $RAW, ...}, ...)'
           - pattern: messages.$LEVEL($REQUEST, $RAW, ...)
+          - pattern: $MODULE.messages.$LEVEL($REQUEST, $RAW, ...)
           - pattern: PermissionDenied($RAW)
+          - pattern: $MODULE.PermissionDenied($RAW)
       - metavariable-pattern:
           metavariable: $RAW
           pattern-either:
