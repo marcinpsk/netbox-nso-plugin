@@ -384,7 +384,12 @@ class TestRunDeviceReconcile(APITestCase):
 
 
 class TestSyncCompleteEndpoint(APITestCase):
-    """POST /api/plugins/nso/sync-complete/ — the adapter's sync-done callback."""
+    """POST /api/plugins/nso/sync-complete/ — the adapter's sync-done callback.
+
+    The caller holds the integration action ``sync`` on NSO device management rows.
+    """
+
+    user_permissions = ("netbox_nso_plugin.sync_nsodevicemanagement",)
 
     def _url(self):
         return "/api/plugins/nso/sync-complete/"
@@ -408,11 +413,38 @@ class TestSyncCompleteEndpoint(APITestCase):
                 enqueue.assert_not_called()
 
     def test_netbox_device_id_enqueues_and_returns_202(self):
+        from netbox_nso_plugin.delivery import delivery_keys
+        from netbox_nso_plugin.intent_state import content_mutation
+
+        device = _make_device("rec-netbox-id")
+        inst = NSOInstance.objects.create(name="rec-netbox-id", adapter_instance_id="rec-netbox-id")
+        with content_mutation({(device.pk, scope) for scope in delivery_keys()}):
+            NSODeviceManagement.objects.bulk_create(
+                [
+                    NSODeviceManagement(
+                        device=device, nso_instance=inst, nso_device_name="rec-netbox-id", custom_field_data={}
+                    )
+                ]
+            )
+        with patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as m:
+            response = self.client.post(self._url(), {"netbox_device_id": device.pk}, format="json", **self.header)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        m.assert_called_once_with(device.pk)
+        self.assertEqual(response.data["netbox_device_id"], device.pk)
+
+    def test_an_unmanaged_device_id_returns_404_without_enqueue(self):
+        """Target authority: the callback names a management row, not a bare device id (#1709)."""
         with patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as m:
             response = self.client.post(self._url(), {"netbox_device_id": 42}, format="json", **self.header)
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-        m.assert_called_once_with(42)
-        self.assertEqual(response.data["netbox_device_id"], 42)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        m.assert_not_called()
+
+    def test_an_authenticated_token_without_the_integration_permission_is_denied(self):
+        self.remove_permissions("netbox_nso_plugin.sync_nsodevicemanagement")
+        with patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as m:
+            response = self.client.post(self._url(), {"netbox_device_id": 42}, format="json", **self.header)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        m.assert_not_called()
 
     def test_unknown_adapter_device_id_returns_404(self):
         response = self.client.post(self._url(), {"adapter_device_id": 999_999}, format="json", **self.header)

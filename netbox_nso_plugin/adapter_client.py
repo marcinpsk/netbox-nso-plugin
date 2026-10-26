@@ -480,6 +480,9 @@ def _error_envelope(resp):
 
 def _request_response(method, path, **kwargs):
     """Send one adapter request and return the raw response, for callers that read a header."""
+    from .native_authorization import refuse_adapter_call_in_mutation_phase
+
+    refuse_adapter_call_in_mutation_phase(method)
     cfg = _resolve_config()
 
     if not cfg["url"]:

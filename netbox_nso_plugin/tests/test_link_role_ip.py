@@ -5,7 +5,7 @@
 Exercises the real M13 carve/reserve engine parameterized by an NSOLinkRole:
 p2p both-ends from an explicit Prefix FK and from a role slug, role-driven child
 mask, dual-stack, single-ended loopback, fill-empty-only, unmanaged peer, no pool,
-and rollback. These tests inspect persisted allocation state. Commit callbacks do not run.
+and skips. These tests inspect persisted allocation state. Commit callbacks do not run.
 """
 
 from dcim.models import (
@@ -21,7 +21,7 @@ from dcim.models import (
 from django.test import TestCase
 from ipam.models import Prefix, Role
 
-from netbox_nso_plugin.ip_autoassign import assign_ips_for_role, rollback_auto_assigned
+from netbox_nso_plugin.ip_autoassign import assign_ips_for_role
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState, NSOLinkRole
 
 from ._ownership_case import acquire_overlay
@@ -168,19 +168,6 @@ class TestAssignP2PForRole(_Base):
         result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("peer device has no adapter_device_id", result["errors"][0]["reason"])
-
-    def test_p2p_rollback_cascades(self):
-        pool = Prefix.objects.create(prefix="198.18.17.0/24")
-        role = NSOLinkRole.objects.create(
-            name="c9", slug="c9", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool, ipv4_mask=31
-        )
-        assign_ips_for_role(self.if_a, role, other_end=self.if_b)
-        state_a = NSOInterfaceIPState.objects.get(interface=self.if_a, family="ipv4")
-        child = state_a.source_pool
-        rollback_auto_assigned(state_a)
-        self.assertFalse(NSOInterfaceIPState.objects.filter(interface=self.if_a, family="ipv4").exists())
-        self.assertFalse(NSOInterfaceIPState.objects.filter(interface=self.if_b, family="ipv4").exists())
-        self.assertFalse(Prefix.objects.filter(pk=child.pk).exists())
 
 
 class TestAssignSingleForRole(_Base):

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from django.urls import path
-from netbox.views.generic.feature_views import ObjectChangeLogView, ObjectJournalView
 
 from . import views
 from .models import (
@@ -39,13 +38,13 @@ urlpatterns = [
     path("instances/<int:pk>/delete/", views.NSOInstanceDeleteView.as_view(), name="nsoinstance_delete"),
     path(
         "instances/<int:pk>/changelog/",
-        ObjectChangeLogView.as_view(),
+        views.NSOObjectChangeLogView.as_view(),
         name="nsoinstance_changelog",
         kwargs={"model": NSOInstance},
     ),
     path(
         "instances/<int:pk>/journal/",
-        ObjectJournalView.as_view(),
+        views.NSOObjectJournalView.as_view(),
         name="nsoinstance_journal",
         kwargs={"model": NSOInstance},
     ),
@@ -58,13 +57,13 @@ urlpatterns = [
     path("link-roles/<int:pk>/delete/", views.NSOLinkRoleDeleteView.as_view(), name="nsolinkrole_delete"),
     path(
         "link-roles/<int:pk>/changelog/",
-        ObjectChangeLogView.as_view(),
+        views.NSOObjectChangeLogView.as_view(),
         name="nsolinkrole_changelog",
         kwargs={"model": NSOLinkRole},
     ),
     path(
         "link-roles/<int:pk>/journal/",
-        ObjectJournalView.as_view(),
+        views.NSOObjectJournalView.as_view(),
         name="nsolinkrole_journal",
         kwargs={"model": NSOLinkRole},
     ),
@@ -97,7 +96,7 @@ urlpatterns = [
     ),
     path(
         "link-role-assignments/<int:pk>/changelog/",
-        ObjectChangeLogView.as_view(),
+        views.NSOObjectChangeLogView.as_view(),
         name="nsolinkroleassignment_changelog",
         kwargs={"model": NSOLinkRoleAssignment},
     ),
@@ -139,13 +138,13 @@ urlpatterns = [
     ),
     path(
         "derived-intent-templates/<int:pk>/changelog/",
-        ObjectChangeLogView.as_view(),
+        views.NSOObjectChangeLogView.as_view(),
         name="nsoderivedintenttemplate_changelog",
         kwargs={"model": NSODerivedIntentTemplate},
     ),
     path(
         "derived-intent-templates/<int:pk>/journal/",
-        ObjectJournalView.as_view(),
+        views.NSOObjectJournalView.as_view(),
         name="nsoderivedintenttemplate_journal",
         kwargs={"model": NSODerivedIntentTemplate},
     ),
@@ -170,7 +169,7 @@ urlpatterns = [
     ),
     path(
         "ned-mappings/<int:pk>/changelog/",
-        ObjectChangeLogView.as_view(),
+        views.NSOObjectChangeLogView.as_view(),
         name="nsoplatformnedmapping_changelog",
         kwargs={"model": NSOPlatformNedMapping},
     ),
@@ -214,13 +213,13 @@ urlpatterns = [
     ),
     path(
         "device-management/<int:pk>/changelog/",
-        ObjectChangeLogView.as_view(),
+        views.NSOObjectChangeLogView.as_view(),
         name="nsodevicemanagement_changelog",
         kwargs={"model": NSODeviceManagement},
     ),
     path(
         "device-management/<int:pk>/journal/",
-        ObjectJournalView.as_view(),
+        views.NSOObjectJournalView.as_view(),
         name="nsodevicemanagement_journal",
         kwargs={"model": NSODeviceManagement},
     ),
@@ -254,8 +253,6 @@ urlpatterns = [
         views.NSOForceRemovalView.as_view(),
         name="nsodevicemanagement_force_removal",
     ),
-    # Adapter job status (JSON, for client-side polling)
-    path("jobs/<int:job_id>/status/", views.NSOJobStatusView.as_view(), name="nsojob_status"),
     # Device job-activity summary (JSON: running + last finished) for the tab status strip
     path("devices/<int:pk>/jobs/", views.NSODeviceJobsView.as_view(), name="device_nso_jobs"),
     path(
@@ -283,13 +280,13 @@ urlpatterns = [
     ),
     path(
         "interface-state/<int:pk>/changelog/",
-        ObjectChangeLogView.as_view(),
+        views.NSOObjectChangeLogView.as_view(),
         name="nsointerfacestate_changelog",
         kwargs={"model": NSOInterfaceState},
     ),
     path(
         "interface-state/<int:pk>/journal/",
-        ObjectJournalView.as_view(),
+        views.NSOObjectJournalView.as_view(),
         name="nsointerfacestate_journal",
         kwargs={"model": NSOInterfaceState},
     ),

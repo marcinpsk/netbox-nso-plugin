@@ -15,9 +15,12 @@ from netbox.plugins import PluginTemplateExtension
 
 from . import status_machine as sm
 from .intent_state import IntentMutationProtocolError, MutationFootprint, locked_mirror_refresh, mirror_reconciler
+from .native_authorization import Observed
 from .snmp_versions import canonical_snmp_version
 
 logger = logging.getLogger(__name__)
+_OBSERVED_IP = Observed("ip")
+_OBSERVED_STATIC = Observed("static_route")
 
 
 def _cas_mirror_update(queryset, **values):
@@ -344,7 +347,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
         )
         return native_by_assignment.get(key)
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), expected_before=None):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), expected_before=None, origin=None):
         saves.append(
             planned_save(
                 instance,
@@ -352,6 +355,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                 force_insert=force_insert,
                 natural_key=natural_key,
                 expected_before=expected_before,
+                origin=origin,
             )
         )
         operations.append(("save", instance, update_fields, force_insert))
@@ -394,14 +398,14 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
             ):
                 native = copy.copy(existing_ip)
                 native.status = "active"
-                save(native, update_fields=("status",), expected_before=existing_ip)
+                save(native, update_fields=("status",), expected_before=existing_ip, origin=_OBSERVED_IP)
                 if state.peer_state is not None:
                     peer_vrf = vrf(state.peer_state.vrf)
                     peer_ip = _interface_ip_native(state.peer_state, peer_vrf, IPAddress, interface_type)
                     if peer_ip is not None and peer_ip.status == "reserved":
                         peer_candidate = copy.copy(peer_ip)
                         peer_candidate.status = "active"
-                        save(peer_candidate, update_fields=("status",), expected_before=peer_ip)
+                        save(peer_candidate, update_fields=("status",), expected_before=peer_ip, origin=_OBSERVED_IP)
         elif existing_ip is not None and existing_ip.assigned_object is None:
             if auto_create:
                 native = copy.copy(existing_ip)
@@ -410,6 +414,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                     native,
                     update_fields=("assigned_object_type", "assigned_object_id"),
                     expected_before=existing_ip,
+                    origin=_OBSERVED_IP,
                 )
                 state.status = sm.on_reconcile(state.status, matches=True)
             elif not sm.is_owned(state.status):
@@ -425,7 +430,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                 if not sm.is_owned(state.status):
                     state.status = "conflict"
             else:
-                save(native, force_insert=True, natural_key=("address", "vrf"))
+                save(native, force_insert=True, natural_key=("address", "vrf"), origin=_OBSERVED_IP)
                 prefixes.append((address, vrf_obj))
                 if not sm.is_owned(state.status):
                     state.status = "imported"
@@ -454,6 +459,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                     native_candidate,
                     update_fields=("assigned_object_type", "assigned_object_id"),
                     expected_before=native,
+                    origin=_OBSERVED_IP,
                 )
             delete(stale)
             continue
@@ -467,6 +473,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                 native_candidate,
                 update_fields=("assigned_object_type", "assigned_object_id"),
                 expected_before=native,
+                origin=_OBSERVED_IP,
             )
         candidate = copy.copy(stale)
         candidate.status = next_status
@@ -524,7 +531,9 @@ def _ensure_interface_ip_prefixes(writer, prefixes):
             prefix__net_contains_or_equals=str(address_interface.ip), vrf=vrf_obj
         ).first()
         if containing is None:
-            Prefix(prefix=str(address_interface.network), vrf=vrf_obj).save()
+            from .native_authorization import save_native
+
+            save_native(Prefix(prefix=str(address_interface.network), vrf=vrf_obj), origin=_OBSERVED_IP)
 
 
 def _reconcile_interface_ips(device, payload: dict) -> list:
@@ -1322,13 +1331,14 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
     seen_state_pks = set()
     confirmed_drift = False
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), origin=None):
         saves.append(
             planned_save(
                 instance,
                 update_fields=update_fields,
                 force_insert=force_insert,
                 natural_key=natural_key,
+                origin=origin,
             )
         )
         operations.append(("save", instance, update_fields, force_insert, None))
@@ -1353,7 +1363,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
             if vrf is None:
                 vrf = VRF(name=vrf_name)
                 vrf.full_clean()
-                save(vrf, force_insert=True, natural_key=("name",))
+                save(vrf, force_insert=True, natural_key=("name",), origin=_OBSERVED_STATIC)
                 vrfs[vrf_name] = vrf
 
         identity = static_route_identity(vrf_name, prefix, next_hop, interface_next_hop)
@@ -1387,6 +1397,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
                 route,
                 force_insert=True,
                 natural_key=("vrf", "prefix", "next_hop", "interface_next_hop"),
+                origin=_OBSERVED_STATIC,
             )
         planned_routes[identity] = route
 
@@ -1404,11 +1415,11 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
         assigned = () if created else tuple(route.devices.order_by("pk"))
         on_device = created or any(row.pk == device.pk for row in assigned)
         if not on_device and auto_create:
-            m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
+            m2m_writes.append(planned_m2m_add(route, "devices", (device,), origin=_OBSERVED_STATIC))
             operations.append(("m2m_add", route, None, False, (device,)))
             on_device = True
         elif created:
-            m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
+            m2m_writes.append(planned_m2m_add(route, "devices", (device,), origin=_OBSERVED_STATIC))
             operations.append(("m2m_add", route, None, False, (device,)))
 
         reported_matches = (
@@ -1455,7 +1466,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
             continue
         remaining = tuple(row for row in current.static_route.devices.order_by("pk") if row.pk != device.pk)
         if current.static_route.devices.filter(pk=device.pk).exists():
-            m2m_writes.append(planned_m2m_set(current.static_route, "devices", remaining))
+            m2m_writes.append(planned_m2m_set(current.static_route, "devices", remaining, origin=_OBSERVED_STATIC))
             operations.append(("m2m_set", current.static_route, None, False, remaining))
         deletes.append(planned_delete(current))
         operations.append(("delete", current, None, False, None))
@@ -1726,14 +1737,22 @@ def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
     return rf
 
 
-def _isis_device_matches_intent(entry, state, ri=None, ned_id="") -> bool:
-    """Return True when the device (adapter *entry*) has caught up to the owned overlay intent.
+def _isis_interface_matches_intent(entry, state) -> bool:
+    """Compare interface fields with the owned intent, including optional BFD and FRR values."""
+    return (
+        entry.get("metric") == state.metric
+        and (entry.get("network_type") or "") == (state.network_type or "")
+        and (entry.get("circuit_type") or "") == (state.circuit_type or "")
+        and bool(entry.get("passive", False)) == bool(state.passive)
+        # None leaves BFD and FRR unconfigured; explicit values must match.
+        and (state.bfd_enabled is None or entry.get("bfd_enabled") is state.bfd_enabled)
+        and (state.frr_enabled is None or entry.get("frr_enabled") is state.frr_enabled)
+        and (not state.frr_protection or (entry.get("frr_protection") or "") == state.frr_protection)
+    )
 
-    Used for owned IS-IS rows where the clobber guard keeps the overlay == netbox-routing
-    object, so the normal overlay-vs-object match can't tell whether the *device* has the
-    change yet. Mirrors the OSPF device-vs-netbox status semantics.
-    """
-    circuit_matches = (entry.get("circuit_type") or "") == (state.circuit_type or "")
+
+def _isis_device_matches_intent(entry, state, ri=None, ned_id="") -> bool:
+    """Compare device fields and native-only scalars with the owned intent."""
     long_scalar_fields = ("csnp_interval", "retransmit_interval", "lsp_interval")
     long_scalars_match = all(
         entry.get(field) == getattr(ri, field)
@@ -1742,20 +1761,7 @@ def _isis_device_matches_intent(entry, state, ri=None, ned_id="") -> bool:
         for field in long_scalar_fields
         if ri is not None and hasattr(ri, field)
     )
-    return (
-        entry.get("metric") == state.metric
-        and (entry.get("network_type") or "") == (state.network_type or "")
-        and circuit_matches
-        and long_scalars_match
-        and bool(entry.get("passive", False)) == bool(state.passive)
-        # tri-state: a None intent expresses no opinion, so it never blocks in_sync
-        # (we don't own the device's BFD); True/False must match the device verbatim.
-        and (state.bfd_enabled is None or bool(entry.get("bfd_enabled")) == bool(state.bfd_enabled))
-        # FRR (#83): the same tri-state contract as BFD; the protection kind only
-        # blocks in_sync when the intent asserts one.
-        and (state.frr_enabled is None or bool(entry.get("frr_enabled")) == bool(state.frr_enabled))
-        and (not state.frr_protection or (entry.get("frr_protection") or "") == state.frr_protection)
-    )
+    return long_scalars_match and _isis_interface_matches_intent(entry, state)
 
 
 def _device_uses_timos_ned(device) -> bool:

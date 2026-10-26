@@ -21,6 +21,7 @@ from netbox_nso_plugin.models import (
 from netbox_nso_plugin.reconcile import run_device_reconcile
 
 from ._adapter_http import _REAL_SESSION, make_response
+from ._authority_case import concurrent_writer
 from ._outbox_case import make_managed, reset_renderer_audit_rotation, without_commit_drain
 from ._settlement_case import _evidence_generation
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -642,10 +643,12 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             if selected:
                 fired.append(True)
             if selected and before_build:
-                action()
+                with concurrent_writer():
+                    action()
             plan = build(*args, **kwargs)
             if selected and not before_build:
-                action()
+                with concurrent_writer():
+                    action()
             return plan
 
         return patch.object(RendererMutationPlan, "build", new=interleaved)
@@ -731,10 +734,11 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
         def moved_then_select(bundle_state):
             # A reconcile moves the member and publishes both observations, so only the member check sees it.
-            if Interface.objects.filter(pk=self.member_interfaces[0].pk).update(lag=alternate):
-                NSOLACPBundleState.objects.filter(pk=self.bundle_state().pk).update(
-                    observed_members=[self.member_interfaces[1].name]
-                )
+            with concurrent_writer():
+                if Interface.objects.filter(pk=self.member_interfaces[0].pk).update(lag=alternate):
+                    NSOLACPBundleState.objects.filter(pk=self.bundle_state().pk).update(
+                        observed_members=[self.member_interfaces[1].name]
+                    )
             return select(bundle_state)
 
         with without_commit_drain(), patch.object(lacp_topology, "member_states", new=moved_then_select):

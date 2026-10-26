@@ -2,7 +2,6 @@
 # Copyright (C) 2026 Marcin Zieba
 """Read the shipped preview and job envelopes through real HTTP response decoding."""
 
-import json
 from unittest.mock import patch
 
 import pytest
@@ -81,8 +80,9 @@ def test_job_rejects_the_old_two_count_keys():
         adapter_client.get_job(23)
 
 
-def test_job_status_projects_all_four_validated_counts(rf):
-    from netbox_nso_plugin.views import NSOJobStatusView
+def test_job_projection_reports_all_four_validated_counts():
+    from netbox_nso_plugin.refusal_display import job_projection
+    from netbox_nso_plugin.views import _job_with_outcome_counts
 
     result = refused_bgp_result()
     job = {
@@ -95,9 +95,8 @@ def test_job_status_projects_all_four_validated_counts(rf):
     }
     config, transport = _response(job)
     with config, transport:
-        response = NSOJobStatusView().get(rf.get("/"), 23)
-    assert response.status_code == 200
-    assert json.loads(response.content)["outcome_counts"] == [
+        projected = _job_with_outcome_counts(job_projection(adapter_client.get_job(23)))
+    assert projected["outcome_counts"] == [
         {
             "scope": "bgp",
             "in_sync": 0,

@@ -4,9 +4,12 @@ import logging
 
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework import status
-from rest_framework.permissions import BasePermission, IsAuthenticated
+from rest_framework.exceptions import NotFound, ParseError
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.routers import APIRootView
 from rest_framework.views import APIView
+from utilities.exceptions import PermissionsViolation
 
 from ..filters import (
     NSODerivedIntentTemplateFilterSet,
@@ -27,6 +30,18 @@ from ..models import (
     NSOLinkRoleAssignment,
     NSOPlatformNedMapping,
 )
+from ..request_authorization import (
+    ApiOnboarding,
+    AuthorizedAPIView,
+    Collection,
+    EndpointPolicy,
+    IntegrationProvisionAttempt,
+    IntegrationSync,
+    OwnerRow,
+    generic_policy,
+    is_valid_instance_id,
+    permitted_instance,
+)
 from .serializers import (
     NSOBGPRouterStateSerializer,
     NSODerivedIntentTemplateSerializer,
@@ -43,11 +58,6 @@ logger = logging.getLogger(__name__)
 _SYNC_DEFERRED = "Device reconcile is deferred while the deployment gate is active"
 
 
-def _request_body(request):
-    body = request.data
-    return body if isinstance(body, dict) else None
-
-
 class _ProjectedPageMixin:
     """Load the refusal evidence of one list page in batched queries."""
 
@@ -58,8 +68,16 @@ class _ProjectedPageMixin:
         return None if page is None else project_rows(page)
 
 
-class NSOBGPRouterStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
+class NSOAPIRootView(AuthorizedAPIView, APIRootView):
+    """List the plugin API endpoints. The index names routes only."""
+
+    policy = EndpointPolicy(Collection(), "read")
+
+
+class NSOBGPRouterStateViewSet(AuthorizedAPIView, _ProjectedPageMixin, NetBoxModelViewSet):
     """Expose router observations and lifecycle through the overlay API."""
+
+    policy = generic_policy()
 
     queryset = NSOBGPRouterState.objects.select_related("management", "bgp_router")
     serializer_class = NSOBGPRouterStateSerializer
@@ -71,68 +89,68 @@ class NSOBGPRouterStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
         return _visible_bgp_router_states(self.request.user)
 
 
-class OwnerStateView(APIView):
+class OwnerStateView(AuthorizedAPIView, APIView):
     """Read a registered owner's projected state through its model serializer."""
 
     permission_classes = [IsAuthenticated]
+    policy = EndpointPolicy(OwnerRow(), "read")
 
     def get(self, request, model, pk):
-        from django.shortcuts import get_object_or_404
-
-        from ..refusal_registry import OVERLAYS
         from . import serializers
 
-        spec = OVERLAYS.get(f"netbox_nso_plugin.{model}")
-        if spec is None:
-            return Response({"detail": "Unknown owner model."}, status=status.HTTP_404_NOT_FOUND)
-        queryset = spec.model.objects.restrict(request.user, "view")
-        if spec.model is NSOBGPRouterState:
-            from ..views import _visible_bgp_router_states
-
-            queryset = _visible_bgp_router_states(request.user)
-        owner = get_object_or_404(queryset, pk=pk)
-        serializer = getattr(serializers, spec.model.__name__ + "Serializer")
+        owner = self.target.primary
+        serializer = getattr(serializers, type(owner).__name__ + "Serializer")
         return Response(serializer(owner, context={"request": request}).data)
 
 
-class NSODerivedIntentTemplateViewSet(NetBoxModelViewSet):
+class NSODerivedIntentTemplateViewSet(AuthorizedAPIView, NetBoxModelViewSet):
     """REST API for database-managed derived-intent templates."""
+
+    policy = generic_policy()
 
     queryset = NSODerivedIntentTemplate.objects.all()
     serializer_class = NSODerivedIntentTemplateSerializer
     filterset_class = NSODerivedIntentTemplateFilterSet
 
 
-class NSOPlatformNedMappingViewSet(NetBoxModelViewSet):
+class NSOPlatformNedMappingViewSet(AuthorizedAPIView, NetBoxModelViewSet):
     """REST API for NSOPlatformNedMapping — CICD-editable platform→NED map."""
+
+    policy = generic_policy()
 
     queryset = NSOPlatformNedMapping.objects.select_related("platform")
     serializer_class = NSOPlatformNedMappingSerializer
     filterset_class = NSOPlatformNedMappingFilterSet
 
 
-class NSOInstanceViewSet(NetBoxModelViewSet):
+class NSOInstanceViewSet(AuthorizedAPIView, NetBoxModelViewSet):
     """REST API for NSOInstance objects."""
+
+    policy = generic_policy()
 
     queryset = NSOInstance.objects.all()
     serializer_class = NSOInstanceSerializer
     filterset_class = NSOInstanceFilterSet
 
 
-class NSODeviceManagementViewSet(NetBoxModelViewSet):
+class NSODeviceManagementViewSet(AuthorizedAPIView, NetBoxModelViewSet):
     """REST API for NSODeviceManagement — the adapter reads this to reconcile scope."""
+
+    policy = generic_policy()
 
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
     serializer_class = NSODeviceManagementSerializer
     filterset_class = NSODeviceManagementFilterSet
 
 
-class NSOInterfaceStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
+class NSOInterfaceStateViewSet(AuthorizedAPIView, _ProjectedPageMixin, NetBoxModelViewSet):
     """REST API for NSOInterfaceState — per-interface intent status overlay.
 
     The adapter's scope reconciler also reads this to mirror intent (decision L).
     Endpoint: /api/plugins/nso/interface-state/
     """
+
+    policy = generic_policy()
 
     queryset = NSOInterfaceState.objects.select_related("interface")
     serializer_class = NSOInterfaceStateSerializer
@@ -172,23 +190,27 @@ class NSOInterfaceStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
             writer.save_via(candidate, serializer.save)
 
 
-class NSOLinkRoleViewSet(NetBoxModelViewSet):
+class NSOLinkRoleViewSet(AuthorizedAPIView, NetBoxModelViewSet):
     """REST API for NSOLinkRole — the configurable provisioning catalog."""
+
+    policy = generic_policy()
 
     queryset = NSOLinkRole.objects.select_related("ipv4_pool_prefix", "ipv6_pool_prefix")
     serializer_class = NSOLinkRoleSerializer
     filterset_class = NSOLinkRoleFilterSet
 
 
-class NSOLinkRoleAssignmentViewSet(NetBoxModelViewSet):
+class NSOLinkRoleAssignmentViewSet(AuthorizedAPIView, NetBoxModelViewSet):
     """REST API for NSOLinkRoleAssignment — role ← cable or interface."""
+
+    policy = generic_policy()
 
     queryset = NSOLinkRoleAssignment.objects.select_related("role", "cable", "interface")
     serializer_class = NSOLinkRoleAssignmentSerializer
     filterset_class = NSOLinkRoleAssignmentFilterSet
 
 
-class OnboardingCandidatesView(APIView):
+class OnboardingCandidatesView(AuthorizedAPIView, APIView):
     """CICD-facing read of onboarding state for an NSO instance.
 
     ``GET /api/plugins/nso/onboarding-candidates/?instance=<id>``
@@ -198,23 +220,25 @@ class OnboardingCandidatesView(APIView):
     """
 
     permission_classes = [IsAuthenticated]
+    policy = EndpointPolicy(Collection(("netbox_nso_plugin.view_nsoinstance",)), "read")
 
     def get(self, request):
         """Return {instance, error, onboarded, candidates, orphans} for the instance."""
         from ..onboarding import build_onboarding_dashboard
 
         selected = request.query_params.get("instance")
-        instance = None
+        if not is_valid_instance_id(selected):
+            raise ParseError("Invalid NSO instance identity")
         if selected:
-            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
+            instance = NSOInstance.objects.restrict(request.user, "view").filter(adapter_instance_id=selected).first()
             if instance is None:
-                return Response({"detail": f"unknown instance '{selected}'"}, status=status.HTTP_404_NOT_FOUND)
+                raise NotFound(f"unknown instance '{selected}'")
         else:
-            instance = NSOInstance.get_default()
+            instance = permitted_instance(request.user, None)
         if instance is None:
-            return Response({"detail": "no NSO instance configured"}, status=status.HTTP_404_NOT_FOUND)
+            raise NotFound("no NSO instance configured")
 
-        data = build_onboarding_dashboard(instance)
+        data = build_onboarding_dashboard(instance, request.user)
         return Response(
             {
                 "instance": data["instance"],
@@ -250,32 +274,7 @@ class OnboardingCandidatesView(APIView):
         )
 
 
-class HasNSOChangePermission(BasePermission):
-    """Require the NetBox ``change_nsodevicemanagement`` permission (mirrors the UI gate).
-
-    Onboarding provisions a device into NSO (create node → fetch-host-keys → unlock →
-    sync-from), so — like the UI's ``NSOActionPermissionMixin`` — it must not be open to any
-    authenticated API token; a read-only monitoring token must not be able to trigger it.
-    """
-
-    message = "This action requires the netbox_nso_plugin.change_nsodevicemanagement permission."
-
-    def has_permission(self, request, view):  # noqa: D102
-        user = request.user
-        return bool(user and user.is_authenticated and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement"))
-
-
-class HasProvisionTombstoneChangePermission(BasePermission):
-    """Require permission to record terminal provision evidence."""
-
-    message = "This action requires the netbox_nso_plugin.change_nsoprovisiontombstone permission."
-
-    def has_permission(self, request, view):  # noqa: D102
-        user = request.user
-        return bool(user and user.is_authenticated and user.has_perm("netbox_nso_plugin.change_nsoprovisiontombstone"))
-
-
-class OnboardView(APIView):
+class OnboardView(AuthorizedAPIView, APIView):
     """CICD-facing onboard action.
 
     ``POST /api/plugins/nso/onboard/`` body:
@@ -285,37 +284,17 @@ class OnboardView(APIView):
     400 on pre-flight failure (no NED mapping / no primary IP / already managed).
     """
 
-    permission_classes = [HasNSOChangePermission]
+    permission_classes = [IsAuthenticated]
+    # Provisioning calls the adapter after it commits the durable attempt: no operator transaction.
+    policy = EndpointPolicy(ApiOnboarding(), "adapter_action")
 
     def post(self, request):
         """Onboard the posted NetBox device into the selected (or default) NSO instance."""
-        from dcim.models import Device
-
         from ..onboarding import onboard_candidate
 
-        body = _request_body(request)
-        if body is None:
-            return Response({"detail": "request body must be a JSON object"}, status=status.HTTP_400_BAD_REQUEST)
-
-        device_id = body.get("netbox_device_id")
-        if device_id is None:
-            return Response({"detail": "netbox_device_id is required"}, status=status.HTTP_400_BAD_REQUEST)
-        device = Device.objects.filter(pk=device_id).first()
-        if device is None:
-            return Response({"detail": f"device {device_id} not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        selected = body.get("instance")
-        instance = None
-        if selected:
-            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
-            if instance is None:
-                return Response({"detail": f"unknown instance '{selected}'"}, status=status.HTTP_404_NOT_FOUND)
-        else:
-            instance = NSOInstance.get_default()
-        if instance is None:
-            return Response({"detail": "no NSO instance configured"}, status=status.HTTP_404_NOT_FOUND)
-
-        result = onboard_candidate(device, instance)
+        result = onboard_candidate(self.target.device, self.target.related["instance"])
+        if result.get("permission_denied"):
+            raise PermissionsViolation(result["permission_denied"])
         code = result.pop(
             "_http_status",
             status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST,
@@ -323,7 +302,7 @@ class OnboardView(APIView):
         return Response(result, status=code)
 
 
-class SyncCompleteView(APIView):
+class SyncCompleteView(AuthorizedAPIView, APIView):
     """Adapter → plugin callback: a device sync finished, refresh its NSO*State cache.
 
     POSTed by the adapter at the end of each ``sync_device`` so the plugin reconciles
@@ -332,71 +311,36 @@ class SyncCompleteView(APIView):
     deduped background reconcile and returns 202 immediately so the adapter never
     waits on the reconcile.
 
+    The caller needs the ``sync`` action on the reported NSO device management row.
+
     Endpoint: ``POST /api/plugins/nso/sync-complete/``
     Body: ``{"netbox_device_id": <int>}`` (or ``{"adapter_device_id": <int>}``).
     """
 
     permission_classes = [IsAuthenticated]
+    policy = EndpointPolicy(IntegrationSync(), "adapter_action")
 
     def post(self, request):
-        """Resolve the device and enqueue its background reconcile."""
-        from ..reconcile import enqueue_device_reconcile
-
-        body = _request_body(request)
-        if body is None:
-            return Response({"detail": "request body must be a JSON object"}, status=status.HTTP_400_BAD_REQUEST)
-
-        device_id = body.get("netbox_device_id")
-        adapter_device_id = body.get("adapter_device_id")
-
-        if any(
-            value is not None and (type(value) is not int or value <= 0) for value in (device_id, adapter_device_id)
-        ):
-            return Response(
-                {"detail": "device identities must be positive integers"}, status=status.HTTP_400_BAD_REQUEST
-            )
-        if (
-            device_id is not None
-            and adapter_device_id is not None
-            and not NSODeviceManagement.objects.filter(
-                device_id=device_id,
-                adapter_device_id=adapter_device_id,
-            ).exists()
-        ):
-            return Response({"detail": "device identities do not match"}, status=status.HTTP_400_BAD_REQUEST)
-
-        if device_id is None and adapter_device_id is None:
-            return Response(
-                {"detail": "netbox_device_id or adapter_device_id is required"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if device_id is None:
-            mgmt = NSODeviceManagement.objects.filter(adapter_device_id=adapter_device_id).first()
-            if mgmt is None:
-                return Response(
-                    {"detail": f"no managed device for adapter_device_id={adapter_device_id}"},
-                    status=status.HTTP_404_NOT_FOUND,
-                )
-            device_id = mgmt.device_id
-
+        """Enqueue the background reconcile of the authorized management's device."""
         from ..deployment import DeploymentQuiesced, is_quiesced, operation
         from ..deployment_probe import ProbeBlocked, enqueue_probe
         from ..models import NSOApplyAttempt
+        from ..reconcile import enqueue_device_reconcile
 
+        device_id = self.target.management.device_id
         try:
             if is_quiesced():
-                enqueue_probe(int(device_id))
+                enqueue_probe(device_id)
             else:
                 with operation("sync-complete callback"):
-                    enqueue_device_reconcile(int(device_id))
+                    enqueue_device_reconcile(device_id)
         except (ProbeBlocked, DeploymentQuiesced, NSOApplyAttempt.DoesNotExist) as exc:
             logger.info("Deferred the sync-complete callback for device %s: %r", device_id, exc)
             return Response({"detail": _SYNC_DEFERRED}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        return Response({"queued": True, "netbox_device_id": int(device_id)}, status=status.HTTP_202_ACCEPTED)
+        return Response({"queued": True, "netbox_device_id": device_id}, status=status.HTTP_202_ACCEPTED)
 
 
-class ProvisionCompleteView(APIView):
+class ProvisionCompleteView(AuthorizedAPIView, APIView):
     """Adapter callback: record terminal provision evidence for the fenced plugin sweep.
 
     The adapter posts this callback when a provision attempt reaches a terminal state. The
@@ -407,26 +351,18 @@ class ProvisionCompleteView(APIView):
     Body includes ``provision_attempt_id`` and the adapter's terminal evidence.
     """
 
-    permission_classes = [HasProvisionTombstoneChangePermission]
+    permission_classes = [IsAuthenticated]
+    policy = EndpointPolicy(IntegrationProvisionAttempt(), "adapter_action")
 
     def post(self, request):
         """CAS-mark terminal evidence and delegate every completion action to the sweep."""
-        from uuid import UUID
-
         from ..adapter_client import AdapterError
         from ..provision_lifecycle import mark_provision_terminal, validate_provision_evidence
         from ..reconcile import enqueue_provision_tombstone_sweep
 
-        body = _request_body(request)
-        if body is None:
-            return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
-
-        raw_attempt_id = body.get("provision_attempt_id")
-        if raw_attempt_id in (None, ""):
-            return Response({"detail": "provision_attempt_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        attempt_id = self.target.related["attempt_id"]
         try:
-            attempt_id = UUID(str(raw_attempt_id))
-            evidence = validate_provision_evidence(dict(body), terminal_required=True)
+            evidence = validate_provision_evidence(dict(self.target.related["body"]), terminal_required=True)
         except (TypeError, ValueError):
             return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
         try:

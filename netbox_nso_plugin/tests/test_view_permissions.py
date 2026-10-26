@@ -142,11 +142,14 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         response = self.client.post(url)
         self.assertEqual(response.status_code, 403)
 
-    def test_capability_cache_read_allowed_without_permission(self):
-        """A plain cache-only GET (no ?refresh) stays a login-only read (no probe) — not over-gated."""
+    def test_capability_cache_read_needs_view_permissions(self):
+        """A cache-only GET reads one device's data: it needs device and management view (#1709)."""
         url = reverse("plugins:netbox_nso_plugin:route_policy_capabilities", kwargs={"device_pk": self.device.pk})
+        self.assertEqual(self.client.get(url).status_code, 403)
+        self._grant("view", Device)
+        self._grant("view", NSODeviceManagement)
         response = self.client.get(url)
-        self.assertNotEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 200)
 
     # ── add_nsodevicemanagement-gated views (onboard / manage) ────────────────
 
@@ -164,8 +167,9 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_onboard_allowed_with_add_permission(self):
-        """With add_nsodevicemanagement the onboard handler runs (redirects, never 403)."""
+        """With add_nsodevicemanagement and device view the onboard handler runs (redirects, never 403)."""
         self._grant("add", NSODeviceManagement)
+        self._grant("view", Device)
         url = reverse("plugins:netbox_nso_plugin:onboard")
         response = self.client.post(url, {"device": self.device.pk})
         self.assertNotEqual(response.status_code, 403)

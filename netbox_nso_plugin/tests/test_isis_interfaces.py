@@ -9,6 +9,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
 from django.db import OperationalError
 from django.test import TestCase
+from django.test.utils import isolate_apps
 
 from ._adapter_http import make_session
 from ._ownership_case import acquire_overlay, save_overlay_fixture
@@ -909,6 +910,134 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         state.refresh_from_db()
         self.assertEqual(state.status, "in_sync")
 
+    @isolate_apps()
+    def test_owned_intent_matches_when_optional_native_columns_are_absent(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        class NativeInterfaceWithoutOptionalColumns(ISISInterface):
+            class Meta:
+                proxy = True
+                app_label = "netbox_routing"
+
+            def __getattribute__(self, name):
+                if name in {"bfd_enabled", "frr_enabled", "frr_protection"}:
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+
+        management = self._make_mgmt()
+        instance = ISISInstance.objects.create(device=self.device, process_tag="")
+        native = ISISInterface.objects.create(
+            interface=self.iface_ge0,
+            address_family="ipv4",
+            instance=instance,
+            circuit_type="level-1-2",
+            metric=10,
+        )
+        state = acquire_overlay(
+            NSOISISInterfaceState,
+            management=management,
+            interface=self.iface_ge0,
+            af="ipv4",
+            isis_interface=native,
+            status="accepted",
+            circuit_type="level-1-2",
+            metric=10,
+            bfd_enabled=True,
+            frr_enabled=True,
+            frr_protection="node",
+        )
+        payload = {"interfaces": [self._entry(metric=10, bfd_enabled=True, frr_enabled=True, frr_protection="node")]}
+        # The proxy exercises the real ORM with the older dependency's column interface.
+        with patch("netbox_routing.models.ISISInterface", NativeInterfaceWithoutOptionalColumns):
+            reconcile_isis(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        native.refresh_from_db()
+        self.assertIsNone(native.bfd_enabled)
+        self.assertIsNone(native.frr_enabled)
+
+    def test_owned_native_routing_drift_prevents_in_sync(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        from ._outbox_case import without_commit_drain
+        from ._ownership_case import save_overlay_fixture
+
+        management = self._make_mgmt()
+        instance = ISISInstance.objects.create(device=self.device, process_tag="")
+        fields = {
+            "circuit_type": "level-1-2",
+            "network_type": "point-to-point",
+            "metric": 10,
+            "passive": False,
+            "bfd_enabled": True,
+            "frr_enabled": True,
+            "frr_protection": "node",
+        }
+        native = ISISInterface.objects.create(
+            interface=self.iface_ge0, address_family="ipv4", instance=instance, **fields
+        )
+        state = acquire_overlay(
+            NSOISISInterfaceState,
+            management=management,
+            interface=self.iface_ge0,
+            af="ipv4",
+            isis_interface=native,
+            status="accepted",
+            **fields,
+        )
+        payload = {"interfaces": self._payload(self._entry(**fields))}
+        for field, drift in (
+            ("circuit_type", "level-2-only"),
+            ("network_type", ""),
+            ("metric", 20),
+            ("passive", True),
+            ("bfd_enabled", False),
+            ("frr_enabled", False),
+            ("frr_protection", "link"),
+        ):
+            with self.subTest(field=field), without_commit_drain():
+                ISISInterface.objects.filter(pk=native.pk).update(**{**fields, field: drift})
+                NSOISISInterfaceState.objects.filter(pk=state.pk).update(status="accepted")
+                reconcile_isis(self.device, payload)
+                state.refresh_from_db()
+                self.assertEqual(state.status, "accepted")
+        ISISInterface.objects.filter(pk=native.pk).update(**fields)
+        reconcile_isis(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        state.bfd_enabled = None
+        state.frr_enabled = None
+        state.frr_protection = ""
+        state.status = "accepted"
+        save_overlay_fixture(state, update_fields=("bfd_enabled", "frr_enabled", "frr_protection", "status"))
+        reconcile_isis(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        disabled = {**fields, "bfd_enabled": False, "frr_enabled": False}
+        state.bfd_enabled = False
+        state.frr_enabled = False
+        state.frr_protection = "node"
+        state.status = "accepted"
+        save_overlay_fixture(state, update_fields=("bfd_enabled", "frr_enabled", "frr_protection", "status"))
+        payload = {"interfaces": self._payload(self._entry(**disabled))}
+        for field in ("bfd_enabled", "frr_enabled"):
+            with self.subTest(disabled_field=field), without_commit_drain():
+                ISISInterface.objects.filter(pk=native.pk).update(**{**disabled, field: None})
+                NSOISISInterfaceState.objects.filter(pk=state.pk).update(status="accepted")
+                reconcile_isis(self.device, payload)
+                state.refresh_from_db()
+                self.assertEqual(state.status, "accepted")
+        ISISInterface.objects.filter(pk=native.pk).update(**disabled)
+        reconcile_isis(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+
     def test_isis_device_matches_intent_bfd_tri_state(self):
         """The owned-row drift matcher treats bfd_enabled as tri-state: a None intent
         expresses no opinion (never blocks in_sync); True/False must match the device."""
@@ -936,12 +1065,14 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         self.assertFalse(_isis_device_matches_intent({**base, "bfd_enabled": None}, st(True)))
         # False intent: device disabled matches; device enabled does not.
         self.assertTrue(_isis_device_matches_intent({**base, "bfd_enabled": False}, st(False)))
+        self.assertFalse(_isis_device_matches_intent({**base, "bfd_enabled": None}, st(False)))
         self.assertFalse(_isis_device_matches_intent({**base, "bfd_enabled": True}, st(False)))
         # FRR (#83): the same tri-state contract; protection only blocks when asserted.
         self.assertTrue(_isis_device_matches_intent({**base, "frr_enabled": True}, st(None)))
         self.assertTrue(_isis_device_matches_intent({**base, "frr_enabled": True}, st(None, frr=True)))
         self.assertFalse(_isis_device_matches_intent({**base, "frr_enabled": None}, st(None, frr=True)))
         self.assertTrue(_isis_device_matches_intent({**base, "frr_enabled": False}, st(None, frr=False)))
+        self.assertFalse(_isis_device_matches_intent({**base, "frr_enabled": None}, st(None, frr=False)))
         self.assertTrue(
             _isis_device_matches_intent(
                 {**base, "frr_enabled": True, "frr_protection": "node"}, st(None, frr=True, prot="node")

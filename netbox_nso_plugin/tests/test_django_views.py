@@ -30,6 +30,7 @@ from netbox_nso_plugin.models import (
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_response, make_session
+from ._authority_case import concurrent_writer
 from ._outbox_case import (
     ReceiptAdapter,
     content_bulk_update,
@@ -813,7 +814,7 @@ class TestInterfacesPageNoAttrsHint(ViewTestBase):
 
         req = RequestFactory().get("/x?key=interfaces")
         req.user = self.superuser
-        return NSOCategoryView()._render_interfaces_page(req, device).content.decode()
+        return NSOCategoryView()._render_interfaces_page(req, device, device.nso_management).content.decode()
 
     def test_hint_shown_when_master_on_no_leaves(self):
         """Master on, no leaf attrs, no rows → actionable hint, not the sync message."""
@@ -1269,55 +1270,6 @@ class TestNSODeviceNamesView(ViewTestBase):
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:ajax_nso_device_names", args=[self.nso_instance.pk])
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 502)
-
-
-# ── NSO Job Status view ──────────────────────────────────────────────────────────
-
-
-class TestNSOJobStatusView(ViewTestBase):
-    """Tests for NSOJobStatusView."""
-
-    @patch("netbox_nso_plugin.adapter_client._resolve_config")
-    @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_get_job_returns_json(self, mock_session_cls, mock_cfg):
-        """GET returns JSON job status from adapter."""
-        mock_cfg.return_value = {
-            "url": "http://adapter",
-            "token": "tok",
-            "verify_tls": True,
-            "ca_cert_path": None,
-            "timeout": 30,
-        }
-        session = make_session(
-            response=make_response(200, json_data={"id": 42, "type": "apply", "status": "succeeded"})
-        )
-        mock_session_cls.return_value = session
-
-        url = reverse("plugins:netbox_nso_plugin:nsojob_status", args=[42])
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 200)
-        data = json.loads(response.content)
-        self.assertEqual(data["id"], 42)
-
-    @patch("netbox_nso_plugin.adapter_client._resolve_config")
-    @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_get_job_adapter_error(self, mock_session_cls, mock_cfg):
-        """GET returns 502 on adapter error."""
-        mock_cfg.return_value = {
-            "url": "http://adapter",
-            "token": "tok",
-            "verify_tls": True,
-            "ca_cert_path": None,
-            "timeout": 30,
-        }
-        session = make_session(
-            response=make_response(404, json_data={"error": {"code": "not_found", "message": "job gone", "detail": {}}})
-        )
-        mock_session_cls.return_value = session
-
-        url = reverse("plugins:netbox_nso_plugin:nsojob_status", args=[99])
         response = self.client.get(url)
         self.assertEqual(response.status_code, 502)
 
@@ -6067,7 +6019,11 @@ class TestOverlayFieldEditView(ViewTestBase):
 
         def delete_then_load(vlan_model, vlan_id):
             doomed = VLAN.objects.get(pk=vlan_id)
-            with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
+            with (
+                concurrent_writer(),
+                suppress_intent_push(),
+                intent_transaction(deletion_footprint_for_instance(doomed)),
+            ):
                 doomed.delete()
             revisions_after_delete.append(NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision)
             return None, ()
@@ -6278,13 +6234,14 @@ class TestOverlayFieldEditView(ViewTestBase):
 
         def load_then_collide(vlan_model, vlan_id):
             result = original_rows(vlan_model, vlan_id)
-            VLAN.objects.create(
-                group=second_group,
-                vid=122,
-                name="TAKEN-NAME",
-                qinq_role="cvlan",
-                qinq_svlan=service_vlan,
-            )
+            with concurrent_writer():
+                VLAN.objects.create(
+                    group=second_group,
+                    vid=122,
+                    name="TAKEN-NAME",
+                    qinq_role="cvlan",
+                    qinq_svlan=service_vlan,
+                )
             return result
 
         with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):
@@ -6315,7 +6272,8 @@ class TestOverlayFieldEditView(ViewTestBase):
 
         def load_then_collide(vlan_model, vlan_id):
             result = original_rows(vlan_model, vlan_id)
-            VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
+            with concurrent_writer():
+                VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
             return result
 
         with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):
@@ -6587,9 +6545,10 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.l2_mtu, 9214)
 
-    def test_unknown_key_400(self):
+    def test_unknown_key_404(self):
+        """An unknown family key names no target (#1709): the resolver answers 404 before the handler."""
         r = self.client.post(self._url("does_not_exist", 1), {"anything": "x"})
-        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.status_code, 404)
 
 
 class TestOverlayFieldEditStalePlan(ViewTestBase):
@@ -7697,6 +7656,10 @@ class TestBfdGrid(ViewTestBase):
             min_rx=100,
             multiplier=5,
         )
+        from netbox_routing.models import BFDInterface
+
+        # Gi0/3's owned intent has its native BFD interface; Gi0/2's native row is missing (a gap).
+        BFDInterface.objects.create(interface=self.ifaces["Gi0/3"], micro_bfd=False, enabled=True)
 
     def _url(self):
         return reverse(
@@ -7725,9 +7688,11 @@ class TestBfdGrid(ViewTestBase):
         self.assertEqual(by_iface["Gi0/2"]["state"], "pending")
         self.assertEqual(by_iface["Gi0/3"]["state"], "in_sync")
 
-        # Accept shows only for a not-yet-owned row (mirrors _accept_cell.html).
+        # Accept shows for a not-yet-owned row, and for an owned row whose native BFD interface is
+        # missing: that Accept creates it (#1717). An owned row with its native row offers none.
         self.assertTrue(by_iface["Gi0/1"]["accept_url"])
-        self.assertIsNone(by_iface["Gi0/2"]["accept_url"])
+        self.assertTrue(by_iface["Gi0/2"]["accept_url"])
+        self.assertTrue(by_iface["Gi0/2"]["native_gap"])
         self.assertIsNone(by_iface["Gi0/3"]["accept_url"])
 
         # Timers + mode survive the round trip.
@@ -8759,14 +8724,21 @@ class TestReviewRegressionPins(ViewTestBase):
 class TestNSOVLANRescopeView(ViewTestBase):
     """POST-level cover for the rescope refusals the acquisition can raise."""
 
-    def test_rescope_refuses_when_a_device_attaches_before_acquisition(self):
-        """A device that attaches after the membership snapshot must get the refusal redirect."""
+    def test_rescope_returns_conflict_for_ajax_attachment_during_acquisition(self):
+        self.assertRescopeConflict(ajax=True)
+
+    def test_rescope_redirects_with_a_message_for_form_attachment_during_acquisition(self):
+        self.assertRescopeConflict(ajax=False)
+
+    def assertRescopeConflict(self, *, ajax):
         from django.contrib.messages import get_messages
+        from django.db import connection
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state, vlan_reconciler
         from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        from ._authority_case import FakeAdapter, concurrent_writer
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.mgmt, vlan__vid=44)
@@ -8780,59 +8752,51 @@ class TestNSOVLANRescopeView(ViewTestBase):
             site=self.device.site,
         )
         late_mgmt = NSODeviceManagement.objects.create(
-            device=late_device,
-            nso_instance=self.nso_instance,
-            nso_device_name="late-rescope-router",
+            device=late_device, nso_instance=self.nso_instance, nso_device_name="late-rescope-router"
         )
-        original_managed_device_ids = vlan_reconciler._rescope_managed_device_ids
+        before = dict(NSOIntentRevision.objects.values_list("id", "revision"))
         attached = False
-        revisions_after_attach = {}
-        late_state_pk = None
 
-        def attach_before_acquisition(old_vlan):
-            nonlocal attached, late_state_pk
-            device_ids = original_managed_device_ids(old_vlan)
-            if not attached and old_vlan.pk == source_vlan.pk:
+        def attach_before_acquisition(execute, sql, params, many, context):
+            nonlocal attached
+            if not attached and "pg_advisory_xact_lock" in str(sql):
                 attached = True
-                late_state = NSOVLANState(
-                    management=late_mgmt,
-                    vlan=source_vlan,
-                    device_name="MGMT",
-                    status="imported",
-                )
-                with intent_state.intent_transaction(intent_state.footprint_for_instance(late_state)):
-                    late_state.save()
-                late_state_pk = late_state.pk
-                revisions_after_attach.update(
-                    dict(NSOIntentRevision.objects.values_list("id", "revision")),
-                )
-            # The stale membership snapshot is what makes the rescope find the extra device.
-            return device_ids
+                with concurrent_writer():
+                    NSOVLANState.objects.create(
+                        management=late_mgmt, vlan=source_vlan, device_name="MGMT", status="imported"
+                    )
+            return execute(sql, params, many, context)
 
-        with patch(
-            "netbox_nso_plugin.vlan_reconciler._rescope_managed_device_ids",
-            side_effect=attach_before_acquisition,
+        FakeAdapter.calls = []
+        with (
+            connection.execute_wrapper(attach_before_acquisition),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", FakeAdapter),
+            self.captureOnCommitCallbacks() as callbacks,
         ):
             response = self.client.post(
                 reverse("plugins:netbox_nso_plugin:vlan_rescope", kwargs={"pk": state.pk}),
                 {"group": target_group.pk},
+                **({"HTTP_X_REQUESTED_WITH": "XMLHttpRequest"} if ajax else {}),
             )
-
         self.assertTrue(attached)
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
-        self.assertEqual(
-            [str(message) for message in get_messages(response.wsgi_request)],
-            ["The VLAN attachment changed. Refresh the page and try again."],
-        )
+        if ajax:
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.json()["status"], "error")
+        else:
+            self.assertRedirects(
+                response, reverse("dcim:device_nso", kwargs={"pk": self.device.pk}), fetch_redirect_response=False
+            )
+            self.assertTrue(list(get_messages(response.wsgi_request)))
+        self.assertEqual(callbacks, [])
+        self.assertEqual(FakeAdapter.calls, [])
         source_vlan.refresh_from_db()
         target_vlan.refresh_from_db()
         state.refresh_from_db()
         self.assertNotEqual(source_vlan.group_id, target_group.pk)
         self.assertEqual(target_vlan.group_id, target_group.pk)
         self.assertEqual(state.vlan_id, source_vlan.pk)
-        self.assertEqual(NSOVLANState.objects.get(pk=late_state_pk).vlan_id, source_vlan.pk)
-        self.assertEqual(dict(NSOIntentRevision.objects.values_list("id", "revision")), revisions_after_attach)
+        self.assertFalse(NSOVLANState.objects.filter(management=late_mgmt, vlan=source_vlan).exists())
+        self.assertEqual(dict(NSOIntentRevision.objects.values_list("id", "revision")), before)
 
 
 class _ApplyBoundaryAdapter(ReceiptAdapter):

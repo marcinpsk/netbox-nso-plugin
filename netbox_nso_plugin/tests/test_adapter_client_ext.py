@@ -581,8 +581,7 @@ class TestJobBoundaryValidation(unittest.TestCase):
                 self._refuses(self._session(payload), lambda: get_job(7))
 
     def test_an_empty_body_job_is_refused_rather_than_served_as_none(self):
-        """_request returns None on an empty-body 200, which NSOJobStatusView then handed
-        straight to JsonResponse and raised TypeError on. Refuse it at the source."""
+        """_request returns None on an empty-body 200; a caller would serialize that None. Refuse it at the source."""
         from netbox_nso_plugin.adapter_client import get_job
 
         self._refuses(self._session(content=b""), lambda: get_job(7))

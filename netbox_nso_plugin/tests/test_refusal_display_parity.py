@@ -554,19 +554,16 @@ class TestOwnerDisplayParity(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCap
         original = self.adapter._handle
 
         def handle(method, url, **kwargs):
-            if method == "GET" and url.endswith("/jobs/501"):
-                return make_response(200, job)
             if method == "GET" and url.endswith("/jobs"):
                 return make_response(200, [job])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
-        for route, args in (("nsojob_status", (501,)), ("device_nso_jobs", (self.device.pk,))):
-            response = self.client.get(reverse(f"plugins:netbox_nso_plugin:{route}", args=args))
-            self.assertEqual(response.status_code, 200, response.content)
-            self.assertNotIn(CANARY, response.content.decode())
-            data = response.json()
-            projected = data if route == "nsojob_status" else data["last"]
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=(self.device.pk,)))
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertNotIn(CANARY, response.content.decode())
+        data = response.json()
+        for projected in (data["last"], data["jobs"][0]):
             self.assertEqual(projected["refusal_summary"], UNAVAILABLE)
             self.assertIsNone(projected["error"])
 

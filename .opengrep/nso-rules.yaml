@@ -841,3 +841,62 @@ rules:
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**"]
+
+  - id: nso-nullable-isis-intent-bool
+    languages: [python]
+    severity: ERROR
+    message: Keep nullable IS-IS intent flags distinct. Boolean conversion treats unconfigured as disabled.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              def _isis_interface_matches_intent(...):
+                  ...
+          - pattern-inside: |
+              def _isis_device_matches_intent(...):
+                  ...
+      - pattern-either:
+          - pattern: bool($STATE.bfd_enabled)
+          - pattern: bool($STATE.frr_enabled)
+          - pattern: bool($ENTRY.get("bfd_enabled", ...))
+          - pattern: bool($ENTRY.get("frr_enabled", ...))
+
+  - id: nso-request-identity-isdigit
+    languages: [python]
+    severity: ERROR
+    message: Parse request identities through parse_object_id before lookup.
+    pattern-either:
+      - pattern: |
+          if not $TEXT.isdigit():
+              ...
+      - pattern: '[int($VALUE) for $ITEM in $VALUES if $TEXT.isdigit()]'
+      - patterns:
+          - pattern: int(...)
+          - pattern-inside: |
+              class $CLASS(...):
+                  ...
+          - metavariable-regex:
+              metavariable: $CLASS
+              regex: '^(Onboarding|NSOAutoAssignIPView|NSOProvisionLinkRoleView)$'
+    paths:
+      include:
+        - "netbox_nso_plugin/request_authorization.py"
+        - "netbox_nso_plugin/views.py"
+
+  - id: nso-bulk-allocation-failure-isolation
+    languages: [python]
+    severity: ERROR
+    message: Isolate bulk allocation calls in a savepoint and handle validation, database, and missing-object failures.
+    patterns:
+      - pattern-either:
+          - pattern: auto_assign_ip($INTERFACE)
+          - pattern: $MODULE.auto_assign_ip($INTERFACE)
+          - pattern: provision_link_role($INTERFACE)
+          - pattern: $MODULE.provision_link_role($INTERFACE)
+      - pattern-not-inside: |
+          try:
+              with $TRANSACTION.atomic():
+                  ...
+          except (ValidationError, DatabaseError, ObjectDoesNotExist):
+              ...
+    paths:
+      include: ["netbox_nso_plugin/views.py"]

@@ -8,7 +8,10 @@ import contextlib
 import copy
 import logging
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("svi")
 
 
 def svi_values(item):
@@ -95,7 +98,7 @@ def _svi_reconcile_operations(device, payload, planned_at):
             interface._site = device.site
             interface._location = device.location
             interface._rack = device.rack
-            saves.append(planned_save(interface, force_insert=True, natural_key=("device", "name")))
+            saves.append(planned_save(interface, force_insert=True, natural_key=("device", "name"), origin=_OBSERVED))
             operations.append(("save", interface, None, True))
 
         current = states.get(name)

@@ -36,7 +36,7 @@ function mountTab() {
     <form method="post" class="nso-action-form" action="/plugins/nso/device-management/1/actions/apply/"
           data-label="Apply Intent"><button type="submit" class="nso-action-btn"></button></form>
     <div id="nso-job-activity" data-jobs-url="/plugins/nso/devices/1/jobs/"></div>
-    <div id="nso-job-status" class="d-none" data-job-status-url="/plugins/nso/jobs/0/status/">
+    <div id="nso-job-status" class="d-none">
       <div class="alert"><span id="nso-job-spinner"></span><span id="nso-job-message"></span></div>
     </div>`;
   // First-party template code, read from the repo at test time.
@@ -274,4 +274,42 @@ describe("the device tab's Apply generation-chain poller", () => {
     expect(document.querySelector("#nso-job-status .alert-success")).toBeNull();
   });
 
+});
+
+describe("the device tab's single-job poller", () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    vi.useFakeTimers();
+    document.body.innerHTML = "";
+  });
+
+  async function runSync(listing) {
+    const fetched = vi.fn(async (url) => ({
+      ok: true,
+      json: async () => (String(url).includes("/actions/sync/") ? { status: "ok", job_id: 601 } : listing),
+    }));
+    vi.stubGlobal("fetch", fetched);
+    const form = mountTab();
+    form.setAttribute("action", "/plugins/nso/device-management/1/actions/sync/");
+    form.dataset.label = "Sync Now";
+
+    form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+    await vi.advanceTimersByTimeAsync(2000);
+    vi.useRealTimers();
+    return fetched.mock.calls.map(([url]) => String(url));
+  }
+
+  it("reads the job from this device's job collection only", async () => {
+    const urls = await runSync({ jobs: [job({ id: 601, type: "sync" })] });
+
+    expect(message()).toBe("Sync Now completed (Job #601).");
+    expect(urls.filter((url) => !url.includes("/actions/sync/"))).toEqual(["/plugins/nso/devices/1/jobs/"]);
+  });
+
+  it("stops when this device's collection does not list the job", async () => {
+    await runSync({ jobs: [job({ id: 777, type: "sync" })] });
+
+    expect(message()).toBe("Could not retrieve job status.");
+  });
 });
