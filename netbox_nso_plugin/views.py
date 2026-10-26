@@ -4045,11 +4045,21 @@ class NSODeviceJobsView(AuthorizedView):
             return JsonResponse({"error": "since_seq must be an integer"}, status=400)
         if since_seq is not None and since_seq < 0:
             return JsonResponse({"error": "since_seq must be non-negative"}, status=400)
+        raw_job_id = request.GET.get("job_id")
+        polled_job_ids = set()
+        if raw_job_id is not None:
+            polled_job_id = parse_object_id(raw_job_id)
+            if not polled_job_id:
+                return JsonResponse({"error": "job_id must be a positive integer"}, status=400)
+            polled_job_ids.add(polled_job_id)
         try:
             jobs = client.list_jobs(mgmt.adapter_device_id)
             generations = (
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
+            generations = [row for row in generations if row.get("generation_id") in generation_ids]
+            generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
+            unlisted = _unlisted_device_jobs(mgmt.adapter_device_id, jobs, polled_job_ids | generation_job_ids)
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
         apply_state_error = None
@@ -4059,14 +4069,12 @@ class NSODeviceJobsView(AuthorizedView):
             logger.warning("Apply-state poll failed for device %s", pk, exc_info=True)
             apply_state = None
             apply_state_error = public_error_message(exc)
-        generations = [row for row in generations if row.get("generation_id") in generation_ids]
         from .refusal_display import job_projection
 
         jobs = [job_projection(job) for job in jobs]
-        serialized_jobs = jobs
+        serialized_jobs = [*jobs, *(job_projection(job) for job in unlisted)]
         if generation_ids:
-            generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
-            serialized_jobs = [job for job in jobs if job.get("id") in generation_job_ids]
+            serialized_jobs = [job for job in serialized_jobs if job.get("id") in generation_job_ids]
 
         # list_jobs is most-recent-first, so the first match in each bucket is newest.
         running = next((j for j in jobs if j.get("status") in self._ACTIVE), None)
@@ -4084,6 +4092,24 @@ class NSODeviceJobsView(AuthorizedView):
                 "residue_removals": _residue_removals(jobs),
             }
         )
+
+
+def _unlisted_device_jobs(adapter_device_id, listed, wanted):
+    """Fetch each wanted job that the listing page does not hold, and keep only this device's jobs."""
+    from . import adapter_client as client
+
+    listed_ids = {job["id"] for job in listed}
+    found = []
+    for job_id in sorted(wanted - listed_ids):
+        try:
+            job = client.get_job(job_id)
+        except AdapterError as exc:
+            if exc.code == "not_found":
+                continue
+            raise
+        if job.get("device_id") == adapter_device_id:
+            found.append(job)
+    return found
 
 
 def _refresh_state_snapshot(mgmt):

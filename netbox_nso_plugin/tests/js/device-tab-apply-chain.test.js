@@ -304,7 +304,9 @@ describe("the device tab's single-job poller", () => {
     const urls = await runSync({ jobs: [job({ id: 601, type: "sync" })] });
 
     expect(message()).toBe("Sync Now completed (Job #601).");
-    expect(urls.filter((url) => !url.includes("/actions/sync/"))).toEqual(["/plugins/nso/devices/1/jobs/"]);
+    const polled = urls.filter((url) => !url.includes("/actions/sync/")).map((url) => new URL(url));
+    expect(polled.map((url) => url.pathname)).toEqual(["/plugins/nso/devices/1/jobs/"]);
+    expect(polled.map((url) => url.searchParams.getAll("job_id"))).toEqual([["601"]]);
   });
 
   it("stops when this device's collection does not list the job", async () => {
