@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
-from django.db import connection
+from django.db import connection, connections
 from django.test import SimpleTestCase, TestCase
 from utilities.exceptions import PermissionsViolation
 
@@ -305,6 +305,20 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
                 cursor.execute("UPDATE dcim_interface SET description = %s WHERE id = %s", ["raw", self.first.pk])
 
         self.assertRefused(raw)
+
+    def test_the_sql_backstop_wraps_every_database_alias(self):
+        # A test may not connect to a second alias; the wrapper list proves the backstop sees its SQL.
+        alias = "nso_backstop_second"
+        connections.settings[alias] = dict(connections.settings["default"])
+        try:
+            for effects in ("read", "native_mutation"):
+                with self.subTest(effects=effects), authority_scope(effects, self.admin):
+                    self.assertIn(native._backstop, connections[alias].execute_wrappers)
+            self.assertNotIn(native._backstop, connections[alias].execute_wrappers)
+        finally:
+            connections[alias].close()
+            del connections[alias]
+            del connections.settings[alias]
         self.first.refresh_from_db()
         self.assertEqual(self.first.description, "one")
 

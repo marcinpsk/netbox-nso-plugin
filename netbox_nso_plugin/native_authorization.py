@@ -419,7 +419,9 @@ def _entered(scope):
     scope.parent = _SCOPE.get()
     token = _SCOPE.set(scope)
     try:
-        with connections["default"].execute_wrapper(_backstop):
+        with contextlib.ExitStack() as wrappers:
+            for alias in connections:
+                wrappers.enter_context(connections[alias].execute_wrapper(_backstop))
             yield scope
             if scope.refused and scope.mode in _GUARDED_MODES:
                 raise NativeWriteRefused(f"{scope.refused} (a helper swallowed this refusal)")
