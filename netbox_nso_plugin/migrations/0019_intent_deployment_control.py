@@ -31,18 +31,23 @@ def backfill_active_claim_flags(apps, schema_editor):
     """Preserve active 0018 claims when the validated flag shape takes effect."""
     management_model = apps.get_model("netbox_nso_plugin", "NSODeviceManagement")
     state_model = apps.get_model("netbox_nso_plugin", "NSOIntentOutboxState")
-    for state in state_model.objects.filter(push_seq__isnull=False).iterator():
+    alias = schema_editor.connection.alias
+    for state in state_model.objects.using(alias).filter(push_seq__isnull=False).iterator():
         if not isinstance(state.claim_flags, dict) or set(state.claim_flags) != LEGACY_CLAIM_FIELDS:
             continue
         flags = {**state.claim_flags, "marking_mode": LEGACY_MARKING_MODE}
         updates = {"claim_flags": flags}
-        management = management_model.objects.filter(
-            device_id=state.device_id,
-            adapter_device_id__isnull=False,
-        ).first()
+        management = (
+            management_model.objects.using(alias)
+            .filter(
+                device_id=state.device_id,
+                adapter_device_id__isnull=False,
+            )
+            .first()
+        )
         if management is not None:
             updates["claim_identity"] = _identity(state, management, flags)
-        state_model.objects.filter(pk=state.pk).update(**updates)
+        state_model.objects.using(alias).filter(pk=state.pk).update(**updates)
 
 
 class Migration(migrations.Migration):

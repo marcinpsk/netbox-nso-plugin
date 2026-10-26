@@ -2451,9 +2451,9 @@ def content_mutation(keys, **footprint_fields):
 
 
 @contextlib.contextmanager
-def offline_mutation():
-    """Permit migration DML while the exclusive deployment procedure owns Apply."""
-    if not transaction.get_connection().in_atomic_block:
+def offline_mutation(using=None):
+    """Permit migration DML on database *using* while the exclusive deployment procedure owns Apply."""
+    if not transaction.get_connection(using).in_atomic_block:
         raise IntentMutationProtocolError("offline mutation requires transaction.atomic()")
     permit = _Permit(footprint=MutationFootprint(), dml_kind="offline")
     token = _ACTIVE_PERMIT.set(permit)

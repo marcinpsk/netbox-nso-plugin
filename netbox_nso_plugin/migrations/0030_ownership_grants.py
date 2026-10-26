@@ -5,7 +5,8 @@ from django.db import migrations, models
 
 def refuse_existing_manifests(apps, schema_editor):
     # A manifest without grant evidence has no valid grant_kind: remove old rows first (#1758).
-    if apps.get_model("netbox_nso_plugin", "NSOOwnershipManifest").objects.exists():
+    manifests = apps.get_model("netbox_nso_plugin", "NSOOwnershipManifest").objects
+    if manifests.using(schema_editor.connection.alias).exists():
         raise RuntimeError(
             "NSOOwnershipManifest rows exist: delete them before migrating, they carry no grant evidence"
         )

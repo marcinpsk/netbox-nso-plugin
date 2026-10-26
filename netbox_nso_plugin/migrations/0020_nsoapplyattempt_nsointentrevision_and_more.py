@@ -21,25 +21,27 @@ PROMOTED_MODEL_NAMES = (
 )
 
 
-def backfill_allocation_kinds(apps, _schema_editor):
+def backfill_allocation_kinds(apps, schema_editor):
     """Classify addresses created by the pre-allocation-kind auto-assigner."""
     from netbox_nso_plugin.intent_state import offline_mutation
 
+    alias = schema_editor.connection.alias
     state = apps.get_model("netbox_nso_plugin", "NSOInterfaceIPState")
-    with offline_mutation():
-        auto_assigned = state.objects.filter(auto_assigned=True)
+    with offline_mutation(alias):
+        auto_assigned = state.objects.using(alias).filter(auto_assigned=True)
         auto_assigned.filter(peer_state__isnull=True).update(allocation_kind="single")
         auto_assigned.filter(peer_state__isnull=False).update(allocation_kind="p2p")
 
 
-def normalize_deploying_rows(apps, _schema_editor):
+def normalize_deploying_rows(apps, schema_editor):
     """Return rows with no durable Apply identity to operator-pending state."""
     from netbox_nso_plugin.intent_state import offline_mutation
 
-    with offline_mutation():
+    alias = schema_editor.connection.alias
+    with offline_mutation(alias):
         for model_name in PROMOTED_MODEL_NAMES:
             model = apps.get_model("netbox_nso_plugin", model_name)
-            model.objects.filter(status="deploying").update(
+            model.objects.using(alias).filter(status="deploying").update(
                 status="accepted",
                 apply_attempt_id=None,
                 last_apply_error="",
