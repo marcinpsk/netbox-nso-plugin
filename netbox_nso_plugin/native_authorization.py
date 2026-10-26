@@ -693,7 +693,9 @@ def require_operator_add(row) -> None:
     model = type(row)
     if not (user.has_perm(_permission(model, "add")) and _restricted(model, user, "add").filter(pk=row.pk).exists()):
         message = f"You cannot add this {model._meta.verbose_name}."
-        scope.latched = scope.latched or message
+        # Latch on every enclosing scope: inside a system entry the operator scope is a parent.
+        for link in scope.chain():
+            link.latched = link.latched or message
         raise permissions_violation(message)
 
 
