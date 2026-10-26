@@ -3147,7 +3147,11 @@ def _isis_device_matches_intent(entry, state):
     bfd = bool(entry.get("bfd_enabled", None))
     # ruleid: nso-nullable-isis-intent-bool
     frr = bool(state.frr_enabled)
-    return bfd, frr
+    # ruleid: nso-nullable-isis-intent-bool
+    bfd_value = bool(entry["bfd_enabled"])
+    # ruleid: nso-nullable-isis-intent-bool
+    frr_value = bool(entry["frr_enabled"])
+    return bfd, frr, bfd_value, frr_value
 
 
 def show_isis_bfd(state):
@@ -3192,6 +3196,24 @@ def bulk_allocation_with_failure_isolation(interfaces):
                 provision_link_role(interface)
         except (ValidationError, DatabaseError, ObjectDoesNotExist):
             report_failure(interface)
+
+
+def bulk_allocation_after_the_savepoint(interfaces):
+    for interface in interfaces:
+        try:
+            with transaction.atomic():
+                prepare(interface)
+            # ruleid: nso-bulk-allocation-failure-isolation
+            auto_assign_ip(interface)
+        except (ValidationError, DatabaseError, ObjectDoesNotExist):
+            report_failure(interface)
+
+
+def bulk_allocation_in_a_savepoint_without_failure_handling(interfaces):
+    for interface in interfaces:
+        with transaction.atomic():
+            # ruleid: nso-bulk-allocation-failure-isolation
+            provision_link_role(interface)
 
 
 def qualified_bulk_allocation_without_failure_isolation(interfaces):

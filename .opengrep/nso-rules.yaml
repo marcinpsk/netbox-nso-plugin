@@ -863,6 +863,8 @@ rules:
           - pattern: bool($STATE.frr_enabled)
           - pattern: bool($ENTRY.get("bfd_enabled", ...))
           - pattern: bool($ENTRY.get("frr_enabled", ...))
+          - pattern: bool($ENTRY["bfd_enabled"])
+          - pattern: bool($ENTRY["frr_enabled"])
 
   - id: nso-request-identity-isdigit
     languages: [python]
