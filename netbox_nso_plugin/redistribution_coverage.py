@@ -97,15 +97,14 @@ def covered_by_management(states):
     }
 
 
-def require_covered_component(state, covered=None):
+def require_covered_component(state, covered):
     """Require current applied coverage before acquiring a redistribution row.
 
-    *covered* is the admission of the row's management from :func:`covered_by_management`.
+    *covered* is the admission of the row's management from :func:`covered_by_management`. It has
+    no default, so a per-row caller cannot read the coverage again for each row.
     """
     from .ownership_planner import OwnershipNotQualified
 
-    if covered is None:
-        covered = applied_covered_protocols(state.management_id)
     if state.dest_protocol in covered:
         return
     raise OwnershipNotQualified(

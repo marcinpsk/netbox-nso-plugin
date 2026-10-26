@@ -6672,10 +6672,10 @@ class NSOProvisionLinkRoleView(AuthorizedView):
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 
-def _owned_native_gap(state, user, covered=None):
+def _owned_native_gap(state, user, covered):
     """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it.
 
-    *covered* is the redistribution admission of the row's management, else it is read here.
+    *covered* is the redistribution admission of the row's management (None for another overlay).
     """
     from netbox_routing.models import BFDInterface
 
@@ -7719,7 +7719,7 @@ class NSOOSPFInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     policy = _accept_policy(NSOOSPFInterfaceState)
 
 
-def _redistribution_accept_blocker(state, covered=None):
+def _redistribution_accept_blocker(state, covered):
     from .ownership_planner import OwnershipNotQualified, require_bgp_redistribution_destination
     from .redistribution_coverage import require_covered_component
 
@@ -7769,7 +7769,7 @@ def _redistribution_native_writes(candidate, user):
     return (save,), ((native, None, True),), ("redistribution",), (("redistribution", native),)
 
 
-def _redistribution_materialization_blocker(state, user, covered=None):
+def _redistribution_materialization_blocker(state, user, covered):
     """Return the shared refusal for a native-gap offer and its Accept request."""
     from netbox_routing.models import RouteMap
 
@@ -7788,7 +7788,11 @@ class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
     policy = _accept_policy(NSORedistributionState)
 
     def _accept_blocker(self, state):
-        return _redistribution_materialization_blocker(state, self.request.user)
+        from .redistribution_coverage import applied_covered_protocols
+
+        return _redistribution_materialization_blocker(
+            state, self.request.user, applied_covered_protocols(state.management_id)
+        )
 
     def _native_writes(self, candidate):  # noqa: D102
         return _redistribution_native_writes(candidate, self.request.user)
