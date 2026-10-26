@@ -1902,11 +1902,14 @@ class NSOCategoryView(AuthorizedView):
 
     def _grid_section(self, states, accept_route, fields, related=None):
         """Serialize projected owners and count the same buckets the grid filters."""
+        from .redistribution_coverage import covered_by_management
         from .refusal_display import group_projection, project_rows, row_projection
 
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
         owners = project_rows(states)
+        # A native-gap check reads redistribution coverage: read it once per management, not per row.
+        covered = covered_by_management([st for st in owners if isinstance(st, NSORedistributionState)])
         related_rows = {id(st): list(related(st)) if related else [] for st in owners}
         project_rows([row for rows_of in related_rows.values() for row in rows_of])
         for st in owners:
@@ -1927,7 +1930,7 @@ class NSOCategoryView(AuthorizedView):
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
                 "native_gap": bool(accept_route)
                 and st.status != "deploying"
-                and _owned_native_gap(st, self.request.user),
+                and _owned_native_gap(st, self.request.user, covered.get(st.management_id)),
             }
             row["accept_url"] = (
                 reverse(accept_route, args=[st.pk])
@@ -6643,8 +6646,11 @@ class NSOProvisionLinkRoleView(AuthorizedView):
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 
-def _owned_native_gap(state, user):
-    """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it."""
+def _owned_native_gap(state, user, covered=None):
+    """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it.
+
+    *covered* is the redistribution admission of the row's management, else it is read here.
+    """
     from netbox_routing.models import BFDInterface
 
     from .status_machine import is_owned
@@ -6663,7 +6669,7 @@ def _owned_native_gap(state, user):
 
         return _resolve_redist_destination(
             state.management.device, state.dest_protocol, state.dest_ref
-        ) is not None and not _redistribution_materialization_blocker(state, user)
+        ) is not None and not _redistribution_materialization_blocker(state, user, covered)
     return False
 
 
@@ -7737,7 +7743,7 @@ def _redistribution_native_writes(candidate, user):
     return (save,), ((native, None, True),), ("redistribution",), (("redistribution", native),)
 
 
-def _redistribution_materialization_blocker(state, user):
+def _redistribution_materialization_blocker(state, user, covered=None):
     """Return the shared refusal for a native-gap offer and its Accept request."""
     from netbox_routing.models import RouteMap
 
@@ -7747,7 +7753,7 @@ def _redistribution_materialization_blocker(state, user):
         and not RouteMap.objects.restrict(user, "view").filter(name=state.route_map).exists()
     ):
         return f"Route map {state.route_map!r} does not exist in NetBox."
-    return _redistribution_accept_blocker(state)
+    return _redistribution_accept_blocker(state, covered)
 
 
 class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):

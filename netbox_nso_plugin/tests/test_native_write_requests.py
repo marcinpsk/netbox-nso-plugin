@@ -449,6 +449,34 @@ class TestRedistributionConversion(AdapterCase):
         self.overlay.refresh_from_db()
         self.assertEqual(self.overlay.redistribution_id, native_row.pk)
 
+    def test_the_grid_reads_redistribution_coverage_once_per_management(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import redistribution_coverage
+
+        with without_commit_drain():
+            for source in ("connected", "bgp"):
+                acquire_overlay(
+                    NSORedistributionState,
+                    management=self.management,
+                    dest_protocol="ospf",
+                    dest_ref="7",
+                    source_protocol=source,
+                    source_ref="",
+                    metric=70,
+                    metric_type="type-1",
+                    status="accepted",
+                )
+        with patch.object(
+            redistribution_coverage,
+            "applied_covered_protocols",
+            autospec=True,
+            side_effect=redistribution_coverage.applied_covered_protocols,
+        ) as read:
+            row = _grid_row(self, self.admin, self.device, "redistribution", self.overlay)
+        self.assertEqual(read.call_count, 1)
+        self.assertTrue(row["native_gap"])
+
     def test_a_missing_destination_does_not_offer_native_gap_accept(self):
         with without_commit_drain():
             self.ospf.delete()
