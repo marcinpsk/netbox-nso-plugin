@@ -768,6 +768,10 @@ rules:
               - metavariable-regex:
                   metavariable: $FORM
                   regex: ^(?!self$)
+          - pattern: 'JsonResponse({..., $KEY: $RAW, ...}, ...)'
+          - pattern: 'Response({..., $KEY: $RAW, ...}, ...)'
+          - pattern: messages.$LEVEL($REQUEST, $RAW, ...)
+          - pattern: PermissionDenied($RAW)
       - metavariable-pattern:
           metavariable: $RAW
           pattern-either:

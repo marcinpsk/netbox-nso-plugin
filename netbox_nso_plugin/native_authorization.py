@@ -41,11 +41,18 @@ class OwnedIntentRefused(NativeWriteRefused):
 class SharedOperationConflict(RuntimeError):
     """The affected management set changed before the mutation acquired its locks."""
 
+    def __init__(self, public_message):
+        super().__init__(public_message)
+        self.public_message = public_message
 
-def _permissions_violation(message):
+
+def permissions_violation(message):
+    """Return a PermissionsViolation whose ``message`` is the authored operator text."""
     from utilities.exceptions import PermissionsViolation
 
-    return PermissionsViolation(message)
+    exc = PermissionsViolation(message)
+    exc.message = message
+    return exc
 
 
 # ── Value sources of a system-scope native effect ──
@@ -431,7 +438,7 @@ def _operator_scope(user, target=None):
             raise SharedOperationConflict(scope.conflict)
         # A denial latches: a helper that swallowed it still refuses the request.
         if scope.latched:
-            raise _permissions_violation(scope.latched)
+            raise permissions_violation(scope.latched)
         if not transaction.get_rollback():
             scope.writer.verify()
 
@@ -685,7 +692,7 @@ def require_operator_add(row) -> None:
     if not (user.has_perm(_permission(model, "add")) and _restricted(model, user, "add").filter(pk=row.pk).exists()):
         message = f"You cannot add this {model._meta.verbose_name}."
         scope.latched = scope.latched or message
-        raise _permissions_violation(message)
+        raise permissions_violation(message)
 
 
 def refuse_adapter_call_in_mutation_phase(method: str) -> None:
@@ -788,7 +795,7 @@ class NativeWriter:
 
     def _deny(self, message):
         self._scope.latched = self._scope.latched or message
-        raise _permissions_violation(message)
+        raise permissions_violation(message)
 
     def _require_permission(self, model, action):
         if not self._scope.user.has_perm(_permission(model, action)):

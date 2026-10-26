@@ -97,7 +97,7 @@ from .models import (
     NSOVaultSettings,
     NSOVLANState,
 )
-from .native_authorization import shared_operation
+from .native_authorization import permissions_violation, shared_operation
 from .native_lookup import operator_lookup, require_operator_view
 from .ownership_grants import OwnershipGrant
 from .ownership_planner import OwnershipNotQualified
@@ -2631,7 +2631,7 @@ class NSOOnboardView(AuthorizedView):
             messages.error(request, f"Onboarding {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
         if result.get("permission_denied"):
-            raise PermissionsViolation(result["permission_denied"])
+            raise permissions_violation(result["permission_denied"])
 
         if result["ok"]:
             messages.success(

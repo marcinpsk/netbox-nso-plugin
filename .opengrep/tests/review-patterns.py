@@ -3000,6 +3000,32 @@ def caught_exception_text_to_operator(form, row, ownership_planner, signals_modu
     return blocked
 
 
+def caught_exception_text_in_responses(request):
+    try:
+        mutate(request)
+    except SharedOperationConflict as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        messages.error(request, str(exc))
+        # ruleid: nso-caught-exception-text-to-operator
+        return JsonResponse({"status": "error", "message": str(exc)}, status=409)
+    except PermissionsViolation as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise PermissionDenied(str(exc)) from None
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        return Response({"detail": exc.args}, status=409)
+    try:
+        mutate(request)
+    except SharedOperationConflict as exc:
+        # ok: nso-caught-exception-text-to-operator
+        messages.error(request, exc.public_message)
+        # ok: nso-caught-exception-text-to-operator
+        return JsonResponse({"status": "error", "message": exc.public_message}, status=409)
+    except PermissionsViolation as exc:
+        # ok: nso-caught-exception-text-to-operator
+        return Response({"detail": exc.message}, status=403)
+
+
 class CaughtExceptionTextForm:
     def clean(self, ref):
         try:

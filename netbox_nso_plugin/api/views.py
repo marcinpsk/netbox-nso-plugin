@@ -9,7 +9,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.routers import APIRootView
 from rest_framework.views import APIView
-from utilities.exceptions import PermissionsViolation
 
 from ..filters import (
     NSODerivedIntentTemplateFilterSet,
@@ -30,6 +29,7 @@ from ..models import (
     NSOLinkRoleAssignment,
     NSOPlatformNedMapping,
 )
+from ..native_authorization import permissions_violation
 from ..request_authorization import (
     ApiOnboarding,
     AuthorizedAPIView,
@@ -294,7 +294,7 @@ class OnboardView(AuthorizedAPIView, APIView):
 
         result = onboard_candidate(self.target.device, self.target.related["instance"])
         if result.get("permission_denied"):
-            raise PermissionsViolation(result["permission_denied"])
+            raise permissions_violation(result["permission_denied"])
         code = result.pop(
             "_http_status",
             status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST,

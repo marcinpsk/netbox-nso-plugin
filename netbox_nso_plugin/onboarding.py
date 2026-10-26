@@ -423,7 +423,7 @@ def _refused_management_add(device, instance, nso_name, onboarded_at):
             try:
                 require_operator_add(probe)
             except PermissionsViolation as exc:
-                return str(exc)
+                return exc.message
             finally:
                 transaction.set_rollback(True)
     except IntegrityError:
@@ -487,7 +487,7 @@ def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new, onb
                 # Only a constraint on adapter evidence (job id) or the row key reaches here; the
                 # sweep settles the admitted attempt without a management row (tombstone path).
                 transaction.savepoint_rollback(row_savepoint)
-                result["permission_denied"] = str(exc)
+                result["permission_denied"] = exc.message
                 return result
             transaction.savepoint_commit(row_savepoint)
 

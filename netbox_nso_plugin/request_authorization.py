@@ -749,14 +749,14 @@ class AuthorizedView(_PolicyEnforced, LoginRequiredMixin, View):
                     return redirect(_device_nso_tab_url(exc.device_id))
         except SharedOperationConflict as exc:
             if is_ajax or self.target.device is None:
-                return JsonResponse({"status": "error", "message": str(exc)}, status=409)
-            messages.error(request, str(exc))
+                return JsonResponse({"status": "error", "message": exc.public_message}, status=409)
+            messages.error(request, exc.public_message)
             return redirect(_device_nso_tab_url(self.target.device.pk))
         except PermissionsViolation as exc:
             # The operator scope rolled back every write of the request.
             if is_ajax:
-                return JsonResponse({"status": "error", "message": str(exc)}, status=403)
-            raise PermissionDenied(str(exc)) from None
+                return JsonResponse({"status": "error", "message": exc.message}, status=403)
+            raise PermissionDenied(exc.message) from None
 
 
 class AuthorizedGenericView(_PolicyEnforced):
@@ -794,10 +794,12 @@ class AuthorizedAPIView(_PolicyEnforced):
                 self._authz_scope = stack
                 return super().dispatch(request, *args, **kwargs)
         except SharedOperationConflict as exc:
-            return self.finalize_response(self.request, Response({"detail": str(exc)}, status=409), *args, **kwargs)
+            return self.finalize_response(
+                self.request, Response({"detail": exc.public_message}, status=409), *args, **kwargs
+            )
         except PermissionsViolation as exc:
             # The operator scope rolled back every write of the request.
-            return self.finalize_response(self.request, Response({"detail": str(exc)}, status=403), *args, **kwargs)
+            return self.finalize_response(self.request, Response({"detail": exc.message}, status=403), *args, **kwargs)
 
     def initial(self, request, *args, **kwargs):
         """Authenticate (DRF), then run the endpoint policy and open its authority scope."""
