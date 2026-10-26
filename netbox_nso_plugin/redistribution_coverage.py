@@ -90,11 +90,23 @@ def applied_covered_protocols(management_id):
     return frozenset()
 
 
-def require_covered_component(state):
-    """Require current applied coverage before acquiring a redistribution row."""
+def covered_by_management(states):
+    """Return the current applied admission of each management of *states*, read once per management."""
+    return {
+        management_id: applied_covered_protocols(management_id) for management_id in {s.management_id for s in states}
+    }
+
+
+def require_covered_component(state, covered=None):
+    """Require current applied coverage before acquiring a redistribution row.
+
+    *covered* is the admission of the row's management from :func:`covered_by_management`.
+    """
     from .ownership_planner import OwnershipNotQualified
 
-    if state.dest_protocol in applied_covered_protocols(state.management_id):
+    if covered is None:
+        covered = applied_covered_protocols(state.management_id)
+    if state.dest_protocol in covered:
         return
     raise OwnershipNotQualified(
         f"{state.dest_protocol.upper()} redistribution coverage is unavailable. Refresh redistribution before accepting it.",

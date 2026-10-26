@@ -10,7 +10,9 @@ from uuid import uuid4
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.messages import get_messages
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from ipam.models import ASN, RIR
 from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, OSPFInstance, Redistribution
@@ -481,3 +483,20 @@ class TestRedistributionCoverage(TestCase):
         ospf = NSORedistributionState.objects.get(management=self.management, dest_protocol="ospf")
         self.assertEqual(ospf.status, "in_sync")
         self.assertIsNotNone(ospf.accepted_at)
+
+    def test_bulk_accept_reads_coverage_once_per_phase(self):
+        self.prime()
+        rows = NSORedistributionState.objects.filter(management=self.management)
+        self.assertEqual(rows.count(), 4)
+        table = NSOFamilyObservation._meta.db_table
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:routing_bulk_accept_redistribution", args=[self.device.pk])
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(set(rows.values_list("status", flat=True)), {"in_sync"})
+        lookups = [query for query in queries if f'FROM "{table}"' in query["sql"]]
+        # Before the writer locks, after it locks, and for the intent push.
+        self.assertEqual(len(lookups), 3)

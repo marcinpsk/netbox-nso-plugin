@@ -7687,13 +7687,13 @@ class NSOOSPFInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     policy = _accept_policy(NSOOSPFInterfaceState)
 
 
-def _redistribution_accept_blocker(state):
+def _redistribution_accept_blocker(state, covered=None):
     from .ownership_planner import OwnershipNotQualified, require_bgp_redistribution_destination
     from .redistribution_coverage import require_covered_component
 
     try:
         require_bgp_redistribution_destination(state)
-        require_covered_component(state)
+        require_covered_component(state, covered)
     except OwnershipNotQualified as exc:
         return exc.public_message
     return ""
@@ -7766,10 +7766,11 @@ class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
 
 
 def _validate_redistribution_accept(states):
-    from .redistribution_coverage import require_covered_component
+    from .redistribution_coverage import covered_by_management, require_covered_component
 
+    covered = covered_by_management(states)
     for state in states:
-        require_covered_component(state)
+        require_covered_component(state, covered[state.management_id])
 
 
 # ── Routing bulk accept views (Track A) ───────────────────────────────────────
@@ -7793,6 +7794,10 @@ class RoutingBulkAcceptMixin(AuthorizedView, abstract=True):
     def _accept_blocker(self, state) -> str:
         """Return why *state* cannot become owned, or an empty string."""
         return ""
+
+    def _first_accept_blocker(self, candidates):
+        """Return the first (row, reason) of *candidates* that cannot become owned, or None."""
+        return next(((row, reason) for row in candidates if (reason := self._accept_blocker(row))), None)
 
     def _validate_accept(self, states):
         """Check family coverage again after the writer acquires its locks."""
@@ -7830,7 +7835,7 @@ class RoutingBulkAcceptMixin(AuthorizedView, abstract=True):
                 .select_related("management")
                 .order_by("pk")
             )
-            blocked = next(((row, reason) for row in candidates if (reason := self._accept_blocker(row))), None)
+            blocked = self._first_accept_blocker(candidates)
             if blocked is not None:
                 row, reason = blocked
                 messages.error(request, f"Cannot accept {row}: {reason}")
@@ -7967,8 +7972,18 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     policy = _BULK_ACCEPT_POLICY
     model_class = NSORedistributionState
 
-    def _accept_blocker(self, state):
-        return _redistribution_accept_blocker(state)
+    def _first_accept_blocker(self, candidates):
+        from .redistribution_coverage import covered_by_management
+
+        covered = covered_by_management(candidates)
+        return next(
+            (
+                (row, reason)
+                for row in candidates
+                if (reason := _redistribution_accept_blocker(row, covered[row.management_id]))
+            ),
+            None,
+        )
 
     def _validate_accept(self, states):
         _validate_redistribution_accept(states)
