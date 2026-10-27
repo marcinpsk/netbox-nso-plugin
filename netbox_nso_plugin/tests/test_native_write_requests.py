@@ -807,6 +807,63 @@ class TestBulkAllocationFailures(AdapterCase):
     def test_auto_assignment_continues_after_an_allocation_failure(self):
         self._post_with_rejected_address("device_auto_assign_ip")
 
+    def test_shared_conflict_on_second_interface_rolls_back_the_whole_request(self):
+        from dcim.models import Cable, CableTermination
+        from django.contrib import messages
+        from django.contrib.messages import get_messages
+        from django.db import connection
+        from extras.models import Tag
+        from ipam.models import IPAddress, Prefix, Role
+
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._authority_case import concurrent_writer
+
+        first, second = self.interfaces[:2]
+        peer_device, _peer_management = make_managed("bulk-peer", 17192)
+        replacement, _replacement_management = make_managed("bulk-new-peer", 17193)
+        peer = Interface.objects.create(device=peer_device, name="Ethernet1", type="1000base-t")
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=second)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=peer)
+        second.tags.add(Tag.objects.create(name="Bulk P2P", slug="p2p-core"))
+        role = Role.objects.create(name="Bulk P2P pool", slug="p2p-core")
+        pool = Prefix.objects.create(prefix="198.18.241.0/24", role=role)
+        Prefix.objects.create(prefix="2001:db8:241::/120", role=role)
+        pool_locked = False
+        moved = False
+
+        def move_peer_before_acquisition(execute, sql, params, many, context):
+            nonlocal pool_locked, moved
+            sql = str(sql)
+            if pool_locked and not moved and "pg_advisory_xact_lock" in sql:
+                moved = True
+                self.assertEqual(IPAddress.objects.filter(assigned_object_id=first.pk).count(), 2)
+                self.assertEqual(NSOInterfaceIPState.objects.filter(interface=first).count(), 2)
+                self.assertFalse(NSOInterfaceIPState.objects.filter(interface=second).exists())
+                with concurrent_writer(), offline_mutation():
+                    Interface.objects.filter(pk=peer.pk).update(device=replacement)
+            result = execute(sql, params, many, context)
+            if 'FROM "ipam_prefix"' in sql and "FOR UPDATE" in sql.upper() and pool.pk in params:
+                pool_locked = True
+            return result
+
+        with connection.execute_wrapper(move_peer_before_acquisition), self.assert_refused_whole():
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:device_auto_assign_ip", kwargs={"device_pk": self.device.pk}),
+                {"interface_pks": [first.pk, second.pk]},
+            )
+
+        self.assertTrue(moved)
+        self.assertRedirects(
+            response, reverse("dcim:device_nso", kwargs={"pk": self.device.pk}), fetch_redirect_response=False
+        )
+        errors = [str(message) for message in get_messages(response.wsgi_request) if message.level == messages.ERROR]
+        self.assertEqual(errors, ["The shared object membership changed. Refresh the page and try again."])
+        self.assertFalse(IPAddress.objects.exists())
+        self.assertFalse(NSOInterfaceIPState.objects.exists())
+
     def _assign_link_role(self):
         from netbox_nso_plugin.models import NSOLinkRole, NSOLinkRoleAssignment
 

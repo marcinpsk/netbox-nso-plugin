@@ -8732,8 +8732,26 @@ class TestReviewRegressionPins(ViewTestBase):
         self.assertIsNotNone(row.accepted_at)
 
 
-class TestNSOVLANRescopeView(ViewTestBase):
+class TestNSOVLANRescopeView(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """POST-level cover for the rescope refusals the acquisition can raise."""
+
+    def setUp(self):
+        super().setUp()
+        from ._outbox_case import make_device
+
+        self.superuser = User.objects.create_superuser(
+            username="viewtestnsoadmin", password=TEST_PASSWORD, email="nsoadmin@test.example"
+        )
+        with without_commit_drain(), transaction.atomic():
+            self.device = make_device("rescope")
+            self.nso_instance = NSOInstance.objects.create(name="view-nso", adapter_instance_id="view-nso-id")
+            self.mgmt = NSODeviceManagement.objects.create(
+                device=self.device,
+                nso_instance=self.nso_instance,
+                nso_device_name=self.device.name,
+                manage_description=True,
+            )
+        self.client.force_login(self.superuser)
 
     def test_rescope_returns_conflict_for_ajax_attachment_during_acquisition(self):
         self.assertRescopeConflict(ajax=True)
@@ -8754,6 +8772,7 @@ class TestNSOVLANRescopeView(ViewTestBase):
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.mgmt, vlan__vid=44)
         source_vlan = state.vlan
+        source_group_id = source_vlan.group_id
         target_group = VLANGroup.objects.create(name="Rescope Target", slug="rescope-target")
         target_vlan = VLAN.objects.create(group=target_group, vid=44, name="MGMT")
         late_device = Device.objects.create(
@@ -8768,21 +8787,24 @@ class TestNSOVLANRescopeView(ViewTestBase):
         before = dict(NSOIntentRevision.objects.values_list("id", "revision"))
         attached = False
 
+        def attach():
+            with concurrent_writer(), transaction.atomic():
+                NSOVLANState.objects.create(
+                    management=late_mgmt, vlan=source_vlan, device_name="MGMT", status="imported"
+                )
+
         def attach_before_acquisition(execute, sql, params, many, context):
             nonlocal attached
             if not attached and "pg_advisory_xact_lock" in str(sql):
                 attached = True
-                with concurrent_writer():
-                    NSOVLANState.objects.create(
-                        management=late_mgmt, vlan=source_vlan, device_name="MGMT", status="imported"
-                    )
+                in_thread(attach)
             return execute(sql, params, many, context)
 
         FakeAdapter.calls = []
         with (
             connection.execute_wrapper(attach_before_acquisition),
             patch("netbox_nso_plugin.adapter_client.requests.Session", FakeAdapter),
-            self.captureOnCommitCallbacks() as callbacks,
+            patch.object(connection, "on_commit", wraps=connection.on_commit, spec=connection.on_commit) as on_commit,
         ):
             response = self.client.post(
                 reverse("plugins:netbox_nso_plugin:vlan_rescope", kwargs={"pk": state.pk}),
@@ -8798,15 +8820,15 @@ class TestNSOVLANRescopeView(ViewTestBase):
                 response, reverse("dcim:device_nso", kwargs={"pk": self.device.pk}), fetch_redirect_response=False
             )
             self.assertTrue(list(get_messages(response.wsgi_request)))
-        self.assertEqual(callbacks, [])
+        on_commit.assert_not_called()
         self.assertEqual(FakeAdapter.calls, [])
         source_vlan.refresh_from_db()
         target_vlan.refresh_from_db()
         state.refresh_from_db()
-        self.assertNotEqual(source_vlan.group_id, target_group.pk)
+        self.assertEqual(source_vlan.group_id, source_group_id)
         self.assertEqual(target_vlan.group_id, target_group.pk)
         self.assertEqual(state.vlan_id, source_vlan.pk)
-        self.assertFalse(NSOVLANState.objects.filter(management=late_mgmt, vlan=source_vlan).exists())
+        self.assertTrue(NSOVLANState.objects.filter(management=late_mgmt, vlan=source_vlan).exists())
         self.assertEqual(dict(NSOIntentRevision.objects.values_list("id", "revision")), before)
 
 
