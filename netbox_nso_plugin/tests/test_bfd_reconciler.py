@@ -483,6 +483,54 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(native.bfd_profile_id, device_profile.pk)
         self.assertFalse(BFDProfile.objects.filter(name="bfd-333-444-x5").exists())
 
+    def _settle_owned_against_native(self, *, profile_values, micro_bfd):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        tx, rx, multiplier = profile_values
+        native_profile = BFDProfile.objects.create(
+            name=f"native-{tx}-{rx}-{multiplier}", min_tx_int=tx, min_rx_int=rx, multiplier=multiplier
+        )
+        native = BFDInterface.objects.create(
+            interface=self.iface, bfd_profile=native_profile, micro_bfd=micro_bfd, enabled=True
+        )
+        acquire_overlay(
+            NSOBFDInterfaceState,
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            micro_bfd=False,
+            status="accepted",
+        )
+        device_entry = {
+            "interface_name": "Port-channel1",
+            "micro_bfd": False,
+            "enabled": True,
+            "min_tx": 300,
+            "min_rx": 300,
+            "multiplier": 3,
+        }
+
+        reconcile_bfd(self.device, [device_entry])
+
+        native.refresh_from_db()
+        self.assertEqual(native.bfd_profile_id, native_profile.pk)
+        self.assertEqual(native.micro_bfd, micro_bfd)
+        return NSOBFDInterfaceState.objects.get(interface=self.iface).status
+
+    def test_owned_row_settles_when_device_and_native_match_the_intent(self):
+        self.assertEqual(self._settle_owned_against_native(profile_values=(300, 300, 3), micro_bfd=False), "in_sync")
+
+    def test_owned_row_stays_open_while_the_native_profile_differs_from_the_intent(self):
+        self.assertEqual(self._settle_owned_against_native(profile_values=(100, 100, 5), micro_bfd=False), "accepted")
+
+    def test_owned_row_stays_open_while_the_native_micro_bfd_differs_from_the_intent(self):
+        self.assertEqual(self._settle_owned_against_native(profile_values=(300, 300, 3), micro_bfd=True), "accepted")
+
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned BFD overlay must NOT be hard-deleted when the device stops reporting it.
 
