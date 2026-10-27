@@ -441,6 +441,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
     def test_a_polled_job_the_adapter_does_not_know_is_absent(self):
         data = self._get_jobs([], job_id=42)
 
+        self.assertEqual(self.job_lookups, [42])
         self.assertEqual(data["jobs"], [])
 
     def test_an_apply_chain_job_past_the_listing_page_is_served(self):
