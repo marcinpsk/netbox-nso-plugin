@@ -6,10 +6,9 @@ from django.contrib.auth import get_user_model
 from django.contrib.messages import get_messages
 from django.test import TestCase, override_settings
 from django.urls import include, path, reverse
-from django.views import View
 
 from netbox_nso_plugin.ownership_planner import OwnershipNotQualified
-from netbox_nso_plugin.views import NSOActionPermissionMixin
+from netbox_nso_plugin.request_authorization import AuthorizedView, Collection, EndpointPolicy
 
 from ._outbox_case import make_device
 
@@ -17,7 +16,9 @@ _PUBLIC_MESSAGE = "The binding does not qualify for ownership."
 _DIAGNOSTIC_MESSAGE = "Internal exception diagnostic placeholder."
 
 
-class _RefusalAction(NSOActionPermissionMixin, View):
+class _RefusalAction(AuthorizedView):
+    policy = EndpointPolicy(Collection(("netbox_nso_plugin.change_nsodevicemanagement",)), "adapter_action")
+
     def post(self, request, device_id):
         refusal = OwnershipNotQualified(_PUBLIC_MESSAGE, device_id=device_id)
         refusal.args = (_DIAGNOSTIC_MESSAGE,)

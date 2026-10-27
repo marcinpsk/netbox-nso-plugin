@@ -5,10 +5,11 @@ from django.db import migrations, models
 
 def copy_applied_to_admitted(apps, schema_editor):
     State = apps.get_model("netbox_nso_plugin", "NSOFamilyReadState")
-    for row in State.objects.all().iterator():
+    alias = schema_editor.connection.alias
+    for row in State.objects.using(alias).iterator():
         row.admitted_attempt_id = row.applied_attempt_id
         row.admitted_incarnation = row.applied_incarnation
-        row.save(update_fields=["admitted_attempt_id", "admitted_incarnation"])
+        row.save(using=alias, update_fields=["admitted_attempt_id", "admitted_incarnation"])
 
 
 class Migration(migrations.Migration):

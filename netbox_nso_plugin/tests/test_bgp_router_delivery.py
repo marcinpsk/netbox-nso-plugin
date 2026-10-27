@@ -577,9 +577,12 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             ObjectType.objects.get_for_model(BGPRouter), ObjectType.objects.get_for_model(type(state))
         )
         view_permission.users.add(limited)
-        management_permission = ObjectPermission.objects.create(name="Router management", actions=["change"])
+        management_permission = ObjectPermission.objects.create(name="Router management", actions=["view", "change"])
         management_permission.object_types.add(ObjectType.objects.get_for_model(type(self.management)))
         management_permission.users.add(limited)
+        device_permission = ObjectPermission.objects.create(name="Router device", actions=["view"])
+        device_permission.object_types.add(ObjectType.objects.get_for_model(type(self.device)))
+        device_permission.users.add(limited)
         native_permission = ObjectPermission.objects.create(
             name="Other router change", actions=["change"], constraints={"pk": self.router.pk + 1}
         )

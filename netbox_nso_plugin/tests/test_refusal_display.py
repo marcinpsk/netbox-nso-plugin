@@ -270,7 +270,8 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         token = Token.objects.create(user=user)
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {TOKEN_PREFIX}{token.key}.{token.token}")
         with override_settings(EXEMPT_VIEW_PERMISSIONS=[]):
-            self.assertEqual(api.get(url).status_code, 404)
+            # A missing model permission is 403; an excluded row is 404 (#1709).
+            self.assertEqual(api.get(url).status_code, 403)
 
     def test_preview_refusal_keeps_diffs_and_identity_fields(self):
         cause = self.refused_bgp()
@@ -893,15 +894,15 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         original = self.adapter._handle
 
         def handle(method, url, **kwargs):
-            if method == "GET" and url.endswith("/jobs/501"):
-                return make_response(200, job)
+            if method == "GET" and url.endswith("/jobs"):
+                return make_response(200, [job])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
-        response = self.client.get(reverse("plugins:netbox_nso_plugin:nsojob_status", args=(501,)))
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=(self.device.pk,)))
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(canary, response.content.decode())
-        self.assertIn("nothing committed", response.json()["refusal_summary"])
+        self.assertIn("nothing committed", response.json()["jobs"][0]["refusal_summary"])
 
     def test_all_category_grids_project_safe_refusal(self):
         from netbox_routing.models import ISISInstance, OSPFInstance

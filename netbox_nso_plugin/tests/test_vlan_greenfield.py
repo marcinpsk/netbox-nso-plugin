@@ -15,6 +15,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._authority_case import concurrent_writer
 from ._outbox_case import in_thread
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
@@ -98,7 +99,11 @@ class TestVlanAttachView(_VlanGreenfieldBase):
                 return plan
             deleted = True
             doomed = type(vlan).objects.get(pk=vlan.pk)
-            with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
+            with (
+                concurrent_writer(),
+                suppress_intent_push(),
+                intent_transaction(deletion_footprint_for_instance(doomed)),
+            ):
                 doomed.delete()
             return plan
 

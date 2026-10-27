@@ -105,3 +105,26 @@ The ownership refusal check rejects `str`, `repr`, and `.args` reads inside
 bare and module-qualified `OwnershipNotQualified` handlers. Use the authored
 `public_message` field. This check covers direct reads, not aliases or helper
 functions. CodeQL still checks exception diagnostics in HTTP responses.
+
+The `nso-nullable-isis-intent-bool` rule rejects direct Boolean conversion of
+BFD and FRR intent fields in the shared IS-IS interface and device comparisons.
+It also rejects conversion of their dictionary values. Display conversions
+outside those comparisons remain valid. The rule does not follow aliases or
+detect comparisons under other function names.
+
+The `nso-request-identity-isdigit` rule rejects negative `isdigit()` guards
+and `isdigit()` filters on integer list comprehensions in request authorization
+and UI views. It also rejects raw `int()` calls in `Onboarding`,
+`NSOAutoAssignIPView`, and `NSOProvisionLinkRoleView`. These boundaries use
+`parse_object_id`, which rejects non-ASCII digits and conversion failures from
+Python's integer digit limit. The rule recognizes the three literal class names.
+It does not follow renamed classes or validators in other modules. Real request
+tests cover Unicode and oversized identities on all four routes.
+
+The `nso-bulk-allocation-failure-isolation` rule requires direct bulk allocation
+and link-role calls in UI views to use a savepoint with the known allocation
+failure handler. The rule recognizes bare and module-qualified call names,
+an `atomic()` context, and the literal exception tuple. It does not follow
+renamed functions, validate the context receiver, or prove loop continuation.
+Real request tests verify rollback, continuation, public warnings, and whole-request
+permission refusal. Unexpected protocol errors still propagate.

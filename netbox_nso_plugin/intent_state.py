@@ -2259,6 +2259,9 @@ def _acquire(
         NSODeviceManagement.objects.select_for_update(of=("self",)).filter(pk__in=management_ids).order_by("pk")
     )
     _lock_rows(footprint.source_rows, level=6, ranks=SOURCE_MODEL_RANKS)
+    from .native_authorization import verify_shared_operations
+
+    verify_shared_operations()
     _revalidate_sources(footprint)
     scopes_by_device: dict[int, list[str]] = {}
     for device_id, scope in footprint.revision_keys:
@@ -2448,9 +2451,9 @@ def content_mutation(keys, **footprint_fields):
 
 
 @contextlib.contextmanager
-def offline_mutation():
-    """Permit migration DML while the exclusive deployment procedure owns Apply."""
-    if not transaction.get_connection().in_atomic_block:
+def offline_mutation(using=None):
+    """Permit migration DML on database *using* while the exclusive deployment procedure owns Apply."""
+    if not transaction.get_connection(using).in_atomic_block:
         raise IntentMutationProtocolError("offline mutation requires transaction.atomic()")
     permit = _Permit(footprint=MutationFootprint(), dml_kind="offline")
     token = _ACTIVE_PERMIT.set(permit)

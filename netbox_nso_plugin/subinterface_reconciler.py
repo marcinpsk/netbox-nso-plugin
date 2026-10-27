@@ -18,7 +18,10 @@ import contextlib
 import copy
 import logging
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("subinterface")
 
 
 def subinterface_values(item):
@@ -103,10 +106,10 @@ def _subinterface_reconcile_operations(device, payload, planned_at):
         state.last_sync_at = planned_at
 
         if current_interface is None:
-            saves.append(planned_save(interface, force_insert=True, natural_key=("device", "name")))
+            saves.append(planned_save(interface, force_insert=True, natural_key=("device", "name"), origin=_OBSERVED))
             operations.append(("save", interface, None, True))
         elif not owned and stored_parent_id != interface.parent_id:
-            saves.append(planned_save(interface, update_fields=("parent",)))
+            saves.append(planned_save(interface, update_fields=("parent",), origin=_OBSERVED))
             operations.append(("save", interface, ("parent",), False))
         created = current is None
         update_fields = (

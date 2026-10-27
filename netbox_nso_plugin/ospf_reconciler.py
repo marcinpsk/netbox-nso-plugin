@@ -8,7 +8,10 @@ import contextlib
 import copy
 import logging
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("ospf")
 
 
 def ospf_reconcile_plan(device, payload):
@@ -115,13 +118,14 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
     deletes = []
     operations = []
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), origin=None):
         saves.append(
             planned_save(
                 instance,
                 update_fields=update_fields,
                 force_insert=force_insert,
                 natural_key=natural_key,
+                origin=origin,
             )
         )
         operations.append(("save", instance, update_fields, force_insert))
@@ -170,7 +174,7 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             continue
         area = OSPFArea(area_id=area_id, area_type="standard")
         area_by_canonical[area_id] = area
-        save(area, force_insert=True, natural_key=("area_id",))
+        save(area, force_insert=True, natural_key=("area_id",), origin=_OBSERVED)
 
     vrf_by_name = {row.name: row for row in VRF.objects.all().order_by("pk")}
     native_instances = {
@@ -212,7 +216,7 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             if vrf_name and vrf is None and _adapter_setting("vrf_auto_create"):
                 vrf = VRF(name=vrf_name)
                 vrf_by_name[vrf_name] = vrf
-                save(vrf, force_insert=True, natural_key=("name",))
+                save(vrf, force_insert=True, natural_key=("name",), origin=_OBSERVED)
 
             current_native = native_instances.get(process_id)
             native = (
@@ -236,11 +240,11 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                 dev_hash=device_hash,
             )
             if created_native:
-                save(native, force_insert=True, natural_key=("device", "process_id"))
+                save(native, force_insert=True, natural_key=("device", "process_id"), origin=_OBSERVED)
             elif action in {"seed", "mirror"}:
                 native.router_id = router_id
                 native.vrf = vrf
-                save(native, update_fields=("router_id", "vrf"))
+                save(native, update_fields=("router_id", "vrf"), origin=_OBSERVED)
             if action in {"seed", "mirror", "insync"}:
                 matches = True
                 new_base = device_hash
@@ -357,14 +361,14 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                 dev_hash=device_hash,
             )
             if created_native:
-                save(native, force_insert=True, natural_key=("interface",))
+                save(native, force_insert=True, natural_key=("interface",), origin=_OBSERVED)
             elif action in {"seed", "mirror"}:
                 for name, value in fields.items():
                     setattr(native, name, value)
-                save(native, update_fields=tuple(fields))
+                save(native, update_fields=tuple(fields), origin=_OBSERVED)
             elif current_native.passive is None:
                 native.passive = fields["passive"]
-                save(native, update_fields=("passive",))
+                save(native, update_fields=("passive",), origin=_OBSERVED)
             if action in {"seed", "mirror", "insync"}:
                 matches = True
                 new_base = device_hash

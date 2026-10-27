@@ -23,6 +23,8 @@ class TestApplyPreviewHTTP(blocked.BlockedRemovalTestBase):
         from django.urls import reverse
         from users.models import ObjectPermission, User
 
+        from netbox_nso_plugin.models import NSODeviceManagement
+
         from ._outbox_case import make_device
 
         other = make_device("preview-hidden")
@@ -32,6 +34,10 @@ class TestApplyPreviewHTTP(blocked.BlockedRemovalTestBase):
         )
         permission.object_types.add(ObjectType.objects.get_for_model(Device))
         permission.users.add(user)
+        # The preview reads management data too: the management must be visible (#1709).
+        management_view = ObjectPermission.objects.create(name="View preview managements", actions=["view"])
+        management_view.object_types.add(ObjectType.objects.get_for_model(NSODeviceManagement))
+        management_view.users.add(user)
         self.client.force_login(user)
         self.assertEqual(
             self.client.get(reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[other.pk])).status_code,

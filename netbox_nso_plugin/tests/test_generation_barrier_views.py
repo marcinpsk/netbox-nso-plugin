@@ -126,7 +126,7 @@ class TestGenerationBarrierViews(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 session.request.reset_mock()
                 url = reverse(f"plugins:netbox_nso_plugin:generation_{action}", args=[other_device.pk])
                 response = self.client.post(url, {"generation_id": 73})
-                self.assertEqual(response.status_code, 403, session.request.call_args_list)
+                self.assertEqual(response.status_code, 404, session.request.call_args_list)
                 session.request.assert_not_called()
             with self.subTest(action=action, permitted=True):
                 session.request.reset_mock()

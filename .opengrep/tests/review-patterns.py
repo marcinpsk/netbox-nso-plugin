@@ -3000,6 +3000,43 @@ def caught_exception_text_to_operator(form, row, ownership_planner, signals_modu
     return blocked
 
 
+def caught_exception_text_in_responses(request):
+    try:
+        mutate(request)
+    except SharedOperationConflict as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        messages.error(request, str(exc))
+        # ruleid: nso-caught-exception-text-to-operator
+        return JsonResponse({"status": "error", "message": str(exc)}, status=409)
+    except PermissionsViolation as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise PermissionDenied(str(exc)) from None
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        return Response({"detail": exc.args}, status=409)
+    except TypeError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        contrib.messages.warning(request, repr(exc))
+        # ruleid: nso-caught-exception-text-to-operator
+        return http.JsonResponse({"message": str(exc)}, status=400)
+    except KeyError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise exceptions.PermissionDenied(str(exc)) from None
+    except LookupError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        return response.Response({"detail": str(exc)}, status=400)
+    try:
+        mutate(request)
+    except SharedOperationConflict as exc:
+        # ok: nso-caught-exception-text-to-operator
+        messages.error(request, exc.public_message)
+        # ok: nso-caught-exception-text-to-operator
+        return JsonResponse({"status": "error", "message": exc.public_message}, status=409)
+    except PermissionsViolation as exc:
+        # ok: nso-caught-exception-text-to-operator
+        return Response({"detail": exc.message}, status=403)
+
+
 class CaughtExceptionTextForm:
     def clean(self, ref):
         try:
@@ -3102,3 +3139,139 @@ def digits_in_object_repr(self, rows):
     self.assertNotIn("200", shown_fields(rows))
     # ok: nso-test-hex-literal-in-object-repr
     self.assertNotIn("Ethernet1:200", repr(rows))
+
+
+def _isis_interface_matches_intent(entry, state):
+    # ruleid: nso-nullable-isis-intent-bool
+    bfd = bool(state.bfd_enabled)
+    # ruleid: nso-nullable-isis-intent-bool
+    frr = bool(entry.get("frr_enabled"))
+    # ok: nso-nullable-isis-intent-bool
+    exact_bfd = entry.get("bfd_enabled") is state.bfd_enabled
+    # ok: nso-nullable-isis-intent-bool
+    exact_frr = state.frr_enabled is None or entry.get("frr_enabled") is state.frr_enabled
+    return bfd, frr, exact_bfd, exact_frr
+
+
+def _isis_device_matches_intent(entry, state):
+    # ruleid: nso-nullable-isis-intent-bool
+    bfd = bool(entry.get("bfd_enabled", None))
+    # ruleid: nso-nullable-isis-intent-bool
+    frr = bool(state.frr_enabled)
+    # ruleid: nso-nullable-isis-intent-bool
+    bfd_value = bool(entry["bfd_enabled"])
+    # ruleid: nso-nullable-isis-intent-bool
+    frr_value = bool(entry["frr_enabled"])
+    return bfd, frr, bfd_value, frr_value
+
+
+def show_isis_bfd(state):
+    # ok: nso-nullable-isis-intent-bool
+    return bool(state.bfd_enabled)
+
+
+def onboarding_numeric_identity(raw):
+    # ruleid: nso-request-identity-isdigit
+    if not str(raw or "").isdigit():
+        return None
+    return int(raw)
+
+
+def bulk_numeric_identities(values):
+    # ruleid: nso-request-identity-isdigit
+    return [int(value.strip()) for value in values if value.strip().isdigit()]
+
+
+def decimal_numeric_identity(raw):
+    # ok: nso-request-identity-isdigit
+    if not (raw.isascii() and raw.isdecimal()):
+        return None
+    return int(raw)
+
+
+def bulk_allocation_without_failure_isolation(interfaces):
+    for interface in interfaces:
+        # ruleid: nso-bulk-allocation-failure-isolation
+        auto_assign_ip(interface)
+        # ruleid: nso-bulk-allocation-failure-isolation
+        provision_link_role(interface)
+
+
+def bulk_allocation_with_failure_isolation(interfaces):
+    for interface in interfaces:
+        try:
+            with transaction.atomic():
+                # ok: nso-bulk-allocation-failure-isolation
+                auto_assign_ip(interface)
+                # ok: nso-bulk-allocation-failure-isolation
+                provision_link_role(interface)
+        except (ValidationError, DatabaseError, ObjectDoesNotExist):
+            report_failure(interface)
+
+
+def bulk_allocation_after_the_savepoint(interfaces):
+    for interface in interfaces:
+        try:
+            with transaction.atomic():
+                prepare(interface)
+            # ruleid: nso-bulk-allocation-failure-isolation
+            auto_assign_ip(interface)
+        except (ValidationError, DatabaseError, ObjectDoesNotExist):
+            report_failure(interface)
+
+
+def bulk_allocation_in_a_savepoint_without_failure_handling(interfaces):
+    for interface in interfaces:
+        with transaction.atomic():
+            # ruleid: nso-bulk-allocation-failure-isolation
+            provision_link_role(interface)
+
+
+def qualified_bulk_allocation_without_failure_isolation(interfaces):
+    for interface in interfaces:
+        # ruleid: nso-bulk-allocation-failure-isolation
+        allocations.auto_assign_ip(interface)
+        # ruleid: nso-bulk-allocation-failure-isolation
+        roles.provision_link_role(interface)
+
+
+def qualified_bulk_allocation_with_failure_isolation(interfaces):
+    for interface in interfaces:
+        try:
+            with db.transaction.atomic():
+                # ok: nso-bulk-allocation-failure-isolation
+                allocations.auto_assign_ip(interface)
+                # ok: nso-bulk-allocation-failure-isolation
+                roles.provision_link_role(interface)
+        except (ValidationError, DatabaseError, ObjectDoesNotExist):
+            report_failure(interface)
+
+
+class Onboarding:
+    def parse_raw_identity(self, raw):
+        # ruleid: nso-request-identity-isdigit
+        return int(raw)
+
+    def parse_checked_identity(self, raw):
+        # ok: nso-request-identity-isdigit
+        return parse_object_id(raw)
+
+
+class NSOAutoAssignIPView:
+    def parse_raw_identity(self, raw):
+        # ruleid: nso-request-identity-isdigit
+        return int(raw)
+
+    def parse_checked_identity(self, raw):
+        # ok: nso-request-identity-isdigit
+        return parse_object_id(raw)
+
+
+class NSOProvisionLinkRoleView:
+    def parse_raw_identity(self, raw):
+        # ruleid: nso-request-identity-isdigit
+        return int(raw)
+
+    def parse_checked_identity(self, raw):
+        # ok: nso-request-identity-isdigit
+        return parse_object_id(raw)

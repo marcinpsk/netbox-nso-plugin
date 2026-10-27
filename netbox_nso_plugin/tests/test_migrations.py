@@ -272,7 +272,8 @@ class TestDeploymentControlMigration(TestCase):
             claim_mark=False,
         )
 
-        deployment_control.backfill_active_claim_flags(apps, None)
+        with connection.schema_editor() as schema_editor:
+            deployment_control.backfill_active_claim_flags(apps, schema_editor)
 
         state.refresh_from_db()
         self.assertEqual(

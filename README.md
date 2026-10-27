@@ -71,14 +71,30 @@ Run migrations:
 python manage.py migrate netbox_nso_plugin
 ```
 
-Give the adapter's NetBox callback token to a service user with an `ObjectPermission`
-for the `change` action on **NSO Provision Tombstone**. The adapter uses this token
-when it posts to `POST /api/plugins/nso/provision-complete/`. An authenticated token
-without `netbox_nso_plugin.change_nsoprovisiontombstone` receives HTTP 403. The
-periodic tombstone sweep still checks jobs when a callback cannot be delivered.
+Give the adapter's NetBox callback token to a service user with two `ObjectPermission`
+rows:
+
+- the `change` action on **NSO Provision Tombstone**, for
+  `POST /api/plugins/nso/provision-complete/`;
+- the custom action `sync` on **NSO Device Management** (enter it under additional
+  actions), for `POST /api/plugins/nso/sync-complete/`.
+
+An authenticated token without the permission receives HTTP 403. A callback for a row
+outside the permission's constraints receives HTTP 404. The periodic tombstone sweep
+still checks jobs when a callback cannot be delivered.
 
 The `adapter_token` setting above authenticates requests from NetBox to the adapter.
 The callback token authenticates requests from the adapter to NetBox.
+
+An operator action that writes native NetBox objects (for example Accept or an inline edit
+that sets an interface description, MTU, switchport VLANs, a BFD interface, an IS-IS
+interface process or a redistribution) also needs the NetBox permission on each object it
+writes: `add` for a new object, `change` for an existing one (checked on the stored object
+and on the result), `delete` for a removed one, with the permission's constraints. A refusal
+answers HTTP 403 and the action writes nothing. Onboarding (UI and API) needs `add` on
+**NSO Device Management**, and its constraints must admit the new row. The operator also
+needs `view` on the target device and on the NSO instance used for onboarding, whether
+selected explicitly or taken from the default.
 
 Programmatic writers must wrap each create, save, or delete of a managed intent model in
 `intent_transaction()`. The renderer write, revision bump, and intent outbox entry must

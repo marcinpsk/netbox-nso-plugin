@@ -24,7 +24,7 @@ from dcim.models import (
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.test import TestCase, TransactionTestCase
-from ipam.models import Prefix, Role
+from ipam.models import IPAddress, Prefix, Role
 from users.models import ObjectPermission
 
 from netbox_nso_plugin.link_role import apply_description_for_role, provision_link_role
@@ -38,6 +38,7 @@ from netbox_nso_plugin.models import (
     NSOLinkRoleAssignment,
 )
 
+from ._authority_case import grant
 from ._outbox_case import ReceiptAdapter, without_commit_drain
 from ._ownership_case import update_or_acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -414,6 +415,8 @@ class TestProvisionActionView(_Base):
         perm = ObjectPermission.objects.create(name="change-mgmt", actions=["change"])
         perm.object_types.add(ObjectType.objects.get_for_model(NSODeviceManagement))
         perm.users.add(user)
+        grant(user, ("add",), Prefix, {"status": "reserved"})
+        grant(user, ("add",), IPAddress, {"status": "reserved"})
         self.client.force_login(user)
         url = reverse("plugins:netbox_nso_plugin:device_provision_link_role", args=[self.dev_a.pk])
         with patch(_PUSH):

@@ -852,12 +852,8 @@ def confirm_sync(management, user, selection, digest):
                     continue
                 if op.permission is not None and (failure := validation_failure(op.instance)):
                     raise SyncRowFailed(op.label, failure)
+                # The operator NativeWriter checks the stored and the completed row of each write.
                 writer.save(op.instance, update_fields=op.update_fields, force_insert=op.create)
-                if (
-                    op.permission in ("add", "change")
-                    and not type(op.instance).objects.restrict(user, op.permission).filter(pk=op.instance.pk).exists()
-                ):
-                    raise SyncRowFailed(op.label, f"permission denied: you cannot {op.permission} this object")
     except (IntentPlanStaleError, RendererTargetsChanged):
         raise SyncStale from None
     return plan

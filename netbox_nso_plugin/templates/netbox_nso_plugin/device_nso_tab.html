@@ -649,8 +649,7 @@
   </script>
 
   {# ── Job status (populated by JS polling; hidden until an action fires) ── #}
-  <div id="nso-job-status" class="mb-3 d-none"
-       data-job-status-url="{% url 'plugins:netbox_nso_plugin:nsojob_status' job_id=0 %}">
+  <div id="nso-job-status" class="mb-3 d-none">
     <div class="alert alert-info d-flex align-items-center mb-0" role="alert">
       <span class="spinner-border spinner-border-sm me-2" id="nso-job-spinner" role="status"
             aria-hidden="true"></span>
@@ -681,13 +680,10 @@
     "use strict";
     var csrfToken = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
     var statusArea = document.getElementById('nso-job-status');
-    var jobUrlTemplate = statusArea.dataset.jobStatusUrl;
     var spinner = document.getElementById('nso-job-spinner');
     var messageEl = document.getElementById('nso-job-message');
     var jobsArea = document.getElementById('nso-job-activity');
     var deviceJobsUrl = jobsArea ? jobsArea.dataset.jobsUrl : null;
-
-    function jobStatusUrl(jobId) { return jobUrlTemplate.replace('/0/', '/' + jobId + '/'); }
 
     function setStatus(msg, type, busy) {
       var alertEl = statusArea.querySelector('.alert');
@@ -723,12 +719,20 @@
       return msg;
     }
 
+    // The device job collection is the only job surface: a job id from another device is never fetched.
     function pollJob(jobId, label) {
+      var jobUrl = null;
+      if (deviceJobsUrl) {
+        jobUrl = new URL(deviceJobsUrl, window.location.href);
+        // The collection serves this job even when it is older than the listing page.
+        jobUrl.searchParams.set('job_id', String(jobId));
+      }
       var interval = setInterval(async function () {
         try {
-          var r = await fetch(jobStatusUrl(jobId));
-          if (!r.ok) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }
-          var job = await r.json();
+          var r = jobUrl ? await fetch(jobUrl.toString()) : null;
+          var payload = r && r.ok ? await r.json() : null;
+          var job = payload && (payload.jobs || []).find(function (item) { return String(item.id) === String(jobId); });
+          if (!job) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }
           if (job.refusal_summary) { clearInterval(interval); setStatus(job.refusal_summary, 'warning', false); setButtons(false); return; }
           if (job.error && job.status !== 'failed') { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
           if (job.status === 'succeeded') {

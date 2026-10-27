@@ -8,7 +8,10 @@ import contextlib
 import copy
 import logging
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("isis")
 
 
 class _Operations:
@@ -27,6 +30,7 @@ class _Operations:
         force_insert=False,
         natural_key=(),
         references=(),
+        origin=None,
     ):
         from .renderer_writer import planned_save
 
@@ -38,14 +42,15 @@ class _Operations:
                 force_insert=force_insert,
                 natural_key=natural_key,
                 references=references,
+                origin=origin,
             )
         )
         self.operations.append(("save", instance, update_fields, force_insert, references))
 
-    def delete(self, instance):
+    def delete(self, instance, *, origin=None):
         from .renderer_writer import planned_delete
 
-        self.deletes.append(planned_delete(instance))
+        self.deletes.append(planned_delete(instance, origin=origin))
         self.operations.append(("delete", instance, None, False, ()))
 
     def extend(self, other):
@@ -138,13 +143,14 @@ def _settings_plan(parent, settings):
                 force_insert=True,
                 natural_key=("assigned_object_type", "assigned_object_id", "key"),
                 references=references,
+                origin=_OBSERVED,
             )
         elif row.value != value:
             row.value = value
-            operations.save(row, update_fields=("value",))
+            operations.save(row, update_fields=("value",), origin=_OBSERVED)
     for key, row in existing.items():
         if key not in wanted:
-            operations.delete(row)
+            operations.delete(row, origin=_OBSERVED)
     return operations, wanted
 
 
@@ -184,13 +190,14 @@ def _levels_plan(model, parent_field, parent, columns, levels):
                 row,
                 force_insert=True,
                 natural_key=(parent_field, "level"),
+                origin=_OBSERVED,
             )
         elif changed:
-            operations.save(row, update_fields=changed)
+            operations.save(row, update_fields=changed, origin=_OBSERVED)
         desired.append({"level": row.level, **{column: getattr(row, column, None) for column in columns}})
     for level, row in existing.items():
         if level not in incoming:
-            operations.delete(row)
+            operations.delete(row, origin=_OBSERVED)
     return operations, sorted(desired, key=lambda item: item["level"])
 
 
@@ -212,7 +219,7 @@ def _segment_routing_plan(instance, entry):
     values = entry.get("segment_routing")
     if reported is True and configured is False:
         if current is not None:
-            operations.delete(current)
+            operations.delete(current, origin=_OBSERVED)
         return operations, None
     if values is None and not (reported is True and configured is True):
         if current is None:
@@ -228,9 +235,9 @@ def _segment_routing_plan(instance, entry):
         desired_values[column] = _absent_value(row, column) if value is None else value
     changed = _changed_fields(row, desired_values)
     if created:
-        operations.save(row, force_insert=True, natural_key=("instance",))
+        operations.save(row, force_insert=True, natural_key=("instance",), origin=_OBSERVED)
     elif changed:
-        operations.save(row, update_fields=changed)
+        operations.save(row, update_fields=changed, origin=_OBSERVED)
     return operations, {column: getattr(row, column, None) for column in columns}
 
 
@@ -272,13 +279,14 @@ def _flex_algo_plan(instance, entries):
                 row,
                 force_insert=True,
                 natural_key=("instance", "algo_id"),
+                origin=_OBSERVED,
             )
         elif changed:
-            operations.save(row, update_fields=changed)
+            operations.save(row, update_fields=changed, origin=_OBSERVED)
         desired.append({"algo_id": algo_id, **{column: getattr(row, column, None) for column in _ISIS_FLEX_COLS}})
     for algo_id, row in existing.items():
         if algo_id not in incoming:
-            operations.delete(row)
+            operations.delete(row, origin=_OBSERVED)
     return operations, sorted(desired, key=lambda item: item["algo_id"])
 
 
@@ -330,9 +338,10 @@ def _srv6_locator_plan(instance, entries):
                 row,
                 force_insert=True,
                 natural_key=("instance", "name"),
+                origin=_OBSERVED,
             )
         elif changed:
-            operations.save(row, update_fields=changed)
+            operations.save(row, update_fields=changed, origin=_OBSERVED)
         desired.append(
             {
                 "name": name,
@@ -344,7 +353,7 @@ def _srv6_locator_plan(instance, entries):
         )
     for name, row in existing.items():
         if name not in incoming:
-            operations.delete(row)
+            operations.delete(row, origin=_OBSERVED)
     return operations, sorted(desired, key=lambda item: item["name"])
 
 
@@ -383,9 +392,10 @@ def _prefix_sid_plan(interface, entries):
                 row,
                 force_insert=True,
                 natural_key=("interface", "algorithm"),
+                origin=_OBSERVED,
             )
         elif changed:
-            operations.save(row, update_fields=changed)
+            operations.save(row, update_fields=changed, origin=_OBSERVED)
         desired.append(
             {
                 "algorithm": algorithm,
@@ -394,7 +404,7 @@ def _prefix_sid_plan(interface, entries):
         )
     for algorithm, row in existing.items():
         if algorithm not in incoming:
-            operations.delete(row)
+            operations.delete(row, origin=_OBSERVED)
     return operations, sorted(desired, key=lambda item: item["algorithm"])
 
 
@@ -534,10 +544,12 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
     from .template_content import (
+        _ISIS_IFACE_SCALAR_ATTRS,
         _device_ned_id,
         _isis_device_matches_intent,
         _isis_instance_object_hash,
         _isis_interface_children_match,
+        _isis_interface_matches_intent,
         _isis_interface_object_hash,
         _isis_process_device_matches_intent,
     )
@@ -617,9 +629,10 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                     native,
                     force_insert=True,
                     natural_key=("device", "process_tag"),
+                    origin=_OBSERVED,
                 )
             elif changed:
-                native_ops.save(native, update_fields=changed)
+                native_ops.save(native, update_fields=changed, origin=_OBSERVED)
             for child_ops in child_operations:
                 native_ops.extend(child_ops)
             operations.extend(native_ops)
@@ -729,6 +742,27 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                     ("management", "interface", "af"),
                 )
                 continue
+            if owned:
+                # Owned intent reaches the native rows only through the operator Accept or Edit.
+                current_native = native_interfaces.get(identity)
+                state.isis_interface = current_native
+                # A native interface on another process is a gap the status must show.
+                matches = (
+                    current_native is not None
+                    and current_native.instance.process_tag == state.process_tag
+                    and _isis_device_matches_intent(entry, state, current_native, ned_id)
+                    and _isis_interface_children_match(entry, current_native)
+                    and _isis_interface_matches_intent(
+                        {
+                            field: getattr(current_native, field, getattr(state, field, None))
+                            for field in _ISIS_IFACE_SCALAR_ATTRS
+                        },
+                        state,
+                    )
+                )
+                state.status = sm.on_reconcile(state.status, matches=matches)
+                _state_save(operations, state, created_state, ("management", "interface", "af"))
+                continue
             if native_instance is None:
                 native_instance = ISISInstance(device=device, process_tag=process_tag)
                 prospective_instances[process_tag] = native_instance
@@ -736,6 +770,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                     native_instance,
                     force_insert=True,
                     natural_key=("device", "process_tag"),
+                    origin=_OBSERVED,
                 )
             current_native = native_interfaces.get(identity)
             native, created_native = _copy_or_new(
@@ -757,20 +792,12 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                 obj_hash=object_hash,
                 dev_hash=device_hash,
             )
-            if owned:
-                if structural_change:
-                    operations.save(
-                        native,
-                        update_fields=("instance",),
-                        references=structural_references,
-                    )
-                matches = False
-                native = current_native if not structural_change else native
-            elif created_native:
+            if created_native:
                 operations.save(
                     native,
                     force_insert=True,
                     natural_key=("interface", "address_family"),
+                    origin=_OBSERVED,
                 )
                 for child_ops in child_operations:
                     operations.extend(child_ops)
@@ -784,6 +811,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                         native,
                         update_fields=fields,
                         references=structural_references,
+                        origin=_OBSERVED,
                     )
                 for child_ops in child_operations:
                     operations.extend(child_ops)
@@ -795,6 +823,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                         native,
                         update_fields=("instance",),
                         references=structural_references,
+                        origin=_OBSERVED,
                     )
                 matches = True
                 state.device_base_hash = device_hash
@@ -805,21 +834,12 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                         native,
                         update_fields=("instance",),
                         references=structural_references,
+                        origin=_OBSERVED,
                     )
                 matches = False
                 native = current_native if not structural_change else native
             native_interfaces[identity] = native
             state.isis_interface = native
-            if owned:
-                matches = current_native is not None and (
-                    _isis_device_matches_intent(
-                        entry,
-                        state,
-                        current_native,
-                        ned_id,
-                    )
-                    and _isis_interface_children_match(entry, current_native)
-                )
             state.status = sm.on_reconcile(state.status, matches=matches)
             _state_save(
                 operations,
