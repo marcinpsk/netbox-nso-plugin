@@ -173,6 +173,8 @@ class TestDeviceDifferencesView(TestCase):
         )
         logging_state = NSOFamilyReadState.objects.create(management=self.management, family="logging")
         NSOFamilyObservation.objects.create(read_state=logging_state, **observation_defaults("logging", 1, 1, logging))
+        _other_device, other_management = _make(f"panel{uuid4().hex[:8]}")
+        unobserved = NSOFamilyReadState.objects.create(management=other_management, family="interface_ip")
         # Store the interface and redistribution documents in their shape before #1833.
         for stored in NSOFamilyObservation.objects.filter(read_state__management=self.management):
             document = stored.document
@@ -216,6 +218,8 @@ class TestDeviceDifferencesView(TestCase):
             ),
             {family: value + (family != "logging") for family, value in sequences.items()},
         )
+        unobserved.refresh_from_db()
+        self.assertEqual(unobserved.publication_sequence, 0)
 
     def _candidate_page(self):
         from ipam.models import IPAddress
