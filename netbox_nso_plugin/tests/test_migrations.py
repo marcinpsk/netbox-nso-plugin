@@ -96,7 +96,7 @@ class TestMigrationGraph(SimpleTestCase):
         loader = MigrationLoader(None, ignore_no_migrations=True)
         leaves = sorted(name for app, name in loader.graph.leaf_nodes() if app == APP)
 
-        assert leaves == ["0037_delete_stale_observations"]
+        assert leaves == ["0038_settlement_evidence_error"]
         assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
         state = loader.project_state([(APP, leaves[0])])
         for name in (

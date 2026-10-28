@@ -416,10 +416,11 @@ class TestTheClockDoesNotJudgeAnOrphanAttempt(_CarrierCase):
                 self._tick()
                 state.refresh_from_db()
                 assert state.status == "deploying", "uncorrelated evidence changed the owner"
-                assert self._cursor(mgmt).settle_cursor_seq == 0
+                assert self._cursor(mgmt).settle_cursor_seq is None
+                assert self._cursor(mgmt).settle_evidence_error["reason"] == "missing structured execution evidence"
 
         state.refresh_from_db()
-        assert self._cursor(mgmt).settle_cursor_seq == 0, "unconsumed evidence was discarded"
+        assert self._cursor(mgmt).settle_cursor_seq is None, "invalid evidence advanced the cursor"
         assert state.status == "deploying", "an exact Apply-attempt identity was invented from unrelated evidence"
 
     def test_the_tick_does_not_escalate_while_an_apply_is_in_flight(self):

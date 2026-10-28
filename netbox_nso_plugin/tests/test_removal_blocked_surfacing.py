@@ -38,6 +38,7 @@ _ADAPTER_CFG = {
     "ca_cert_path": None,
     "timeout": 30,
 }
+_EMPTY_REFUSAL_PROJECTION = {"refusal": None, "refusal_text": "", "summary": "", "refusal_summary": ""}
 
 
 def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T06:00:00Z"):
@@ -47,7 +48,14 @@ def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T0
         "type": "removal",
         "device_id": 10,
         "status": status,
-        "result": None,
+        "result": {
+            "row_outcomes": [],
+            "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": False,
+        },
+        "row_outcomes": [],
+        "refusals": [],
         "context": {"scope": scope},
         "error": {
             "code": "removal_blocked_collateral",
@@ -67,12 +75,23 @@ def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T0
 
 def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=True):
     """A generic removal job in *status*; scope attributed via context and/or result."""
+    terminal = status in {"succeeded", "failed"}
     return {
         "id": job_id,
         "type": "removal",
         "device_id": 10,
         "status": status,
-        "result": {"scope": scope} if status == "succeeded" else None,
+        "result": {
+            **({"scope": scope} if status == "succeeded" else {}),
+            "row_outcomes": [],
+            "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": status == "succeeded",
+        }
+        if terminal
+        else None,
+        "row_outcomes": [] if terminal else None,
+        "refusals": [] if terminal else None,
         "context": {"scope": scope} if context else None,
         "error": None,
         "created_at": updated,
@@ -84,7 +103,14 @@ def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=
 
 def _served(jobs):
     """The device-jobs listing adds each job's per-scope outcome counts."""
-    return [{**job, "outcome_counts": []} for job in jobs]
+    return [
+        {
+            **job,
+            "outcome_counts": [],
+            **(_EMPTY_REFUSAL_PROJECTION if job.get("row_outcomes") is not None else {}),
+        }
+        for job in jobs
+    ]
 
 
 def _device_generations():
@@ -312,7 +338,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
                 )
                 self.assertEqual(data["jobs"], _served(jobs))
                 self.assertEqual(data["running"], running)
-                self.assertEqual(data["last"], blocked)
+                self.assertEqual(data["last"], {**blocked, **_EMPTY_REFUSAL_PROJECTION})
                 self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
                 self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
@@ -328,7 +354,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         self.assertEqual(data["apply_state_error"], "The NSO adapter request failed. See the server log.")
         self.assertEqual(data["jobs"], _served(jobs))
         self.assertEqual(data["running"], running)
-        self.assertEqual(data["last"], blocked)
+        self.assertEqual(data["last"], {**blocked, **_EMPTY_REFUSAL_PROJECTION})
         self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
         self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
@@ -355,7 +381,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         )
         self.assertEqual(data["jobs"], _served(jobs))
         self.assertEqual(data["running"], running)
-        self.assertEqual(data["last"], blocked)
+        self.assertEqual(data["last"], {**blocked, **_EMPTY_REFUSAL_PROJECTION})
         self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
         self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
@@ -656,10 +682,16 @@ def _residue_job(job_id=60, scope="svi", residue=None, updated="2026-07-11T20:00
         "device_id": 10,
         "status": "succeeded",
         "result": {
+            "row_outcomes": [],
+            "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": True,
             "scope": scope,
             "residue_check": "found",
             "residue": residue or {"interface": [["Vlan987"]]},
         },
+        "row_outcomes": [],
+        "refusals": [],
         "context": {"scope": scope, "removed": {"interface": [["Vlan987"]]}},
         "error": None,
         "created_at": "2026-07-11T19:59:00Z",
@@ -689,19 +721,19 @@ class TestDeviceJobsResidueRemovals(BlockedRemovalTestBase):
 
     def test_clean_removal_yields_no_entry(self):
         job = _residue_job()
-        job["result"] = {"scope": "svi", "residue_check": "clean"}
+        job["result"].update(scope="svi", residue_check="clean", residue={})
         data = self._get_jobs([job])
         self.assertEqual(data["residue_removals"], [])
 
     def test_newer_clean_removal_masks_stale_residue(self):
         newer = _residue_job(job_id=61)
-        newer["result"] = {"scope": "svi", "residue_check": "clean"}
+        newer["result"].update(scope="svi", residue_check="clean", residue={})
         data = self._get_jobs([newer, _residue_job(job_id=60)])  # most-recent-first
         self.assertEqual(data["residue_removals"], [])
 
     def test_other_scope_clean_removal_keeps_residue(self):
         clean_static = _residue_job(job_id=62, scope="static_route")
-        clean_static["result"] = {"scope": "static_route", "residue_check": "clean"}
+        clean_static["result"].update(scope="static_route", residue_check="clean", residue={})
         data = self._get_jobs([clean_static, _residue_job(job_id=60)])
         self.assertEqual(len(data["residue_removals"]), 1)
         self.assertEqual(data["residue_removals"][0]["scope"], "svi")
@@ -955,7 +987,7 @@ class TestFreeFormResidue(TestCase):
         from netbox_nso_plugin.views import _annotate_residue_rows
 
         job = _removal_job(90, "vlan", "succeeded")
-        job["result"] = {"scope": "vlan", "residue": residue}
+        job["result"].update(scope="vlan", residue=residue)
         mgmt = NSODeviceManagement(adapter_device_id=10)
         row = SimpleNamespace(vlan=SimpleNamespace(vid="b"))
         ctx = {"vlan_states": [row]}

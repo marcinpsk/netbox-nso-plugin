@@ -90,8 +90,9 @@ class TestTheCarrier(_CarrierCase):
 
         state.refresh_from_db()
         assert state.status == "deploying"
-        assert self._cursor(mgmt).settle_cursor_seq == 0
-        assert self._cursor(mgmt).settle_stall_attempts == 1
+        assert self._cursor(mgmt).settle_cursor_seq is None
+        assert self._cursor(mgmt).settle_evidence_error["reason"] == "missing structured execution evidence"
+        assert self._cursor(mgmt).settle_stall_attempts == 0
 
 
 class TestOrderingAndIsolation(_CarrierCase):
@@ -228,7 +229,7 @@ class TestIncompleteFeedPreservesIntent(_CarrierCase):
         sr = _route("10.34.0.0/16", "10.34.0.1", devices=[device])
         state = _own(sr, mgmt, generation=110, expected=False)
         _stale_clock(state)
-        self.adapter.store.terminal_job(40, results=[_result(sr.pk, 110)])
+        self.adapter.store.terminal_job(40, results=[_result(sr.pk, 110)], extra=_execution_result())
 
         self._notify(device.pk)
         self._drain()
@@ -248,7 +249,7 @@ class TestIncompleteFeedPreservesIntent(_CarrierCase):
         # A full first page of jobs that decide nothing, then THIS row's result behind it.
         for _ in range(SETTLE_FEED_PAGE):
             self.adapter.store.terminal_job(41, job_type="sync")
-        self.adapter.store.terminal_job(41, results=[_result(sr.pk, 111)])
+        self.adapter.store.terminal_job(41, results=[_result(sr.pk, 111)], extra=_execution_result())
 
         self._notify(device.pk)
         self._drain()
@@ -330,5 +331,6 @@ class TestRawRouteResultsRemainUnconsumed(_CarrierCase):
             "a raw route result or the age clock judged intent without structured execution evidence"
         )
         assert state.last_apply_error == ""
-        assert self._cursor(mgmt).settle_cursor_seq == 0
-        assert self._cursor(mgmt).settle_stall_attempts == 1
+        assert self._cursor(mgmt).settle_cursor_seq is None
+        assert self._cursor(mgmt).settle_evidence_error["reason"] == "missing structured execution evidence"
+        assert self._cursor(mgmt).settle_stall_attempts == 0
