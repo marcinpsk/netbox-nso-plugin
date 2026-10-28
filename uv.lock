@@ -544,7 +544,7 @@ wheels = [
 
 [[package]]
 name = "netbox-nso-plugin"
-version = "1.14.0"
+version = "1.15.0"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },
