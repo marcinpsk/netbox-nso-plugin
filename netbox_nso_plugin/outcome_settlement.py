@@ -155,11 +155,12 @@ def _join(management, generation, incarnation, attempt, authorities=None, receip
         bindings[key] = binding
         actual[key] = outcome
     _require(set(actual) == set(expected), "incomplete_frozen_outcomes")
+    attempted = [
+        refusal_contract._logical_identity(outcome) for outcome in generation["carrier_job_result"]["row_outcomes"]
+    ]
     for cause in generation["refusals"]:
-        if cause["provenance"] != "current":
-            continue
         for logical in cause["logical_rows"]:
-            if logical["generation_id"] != generation["generation_id"]:
+            if logical not in attempted or logical["generation_id"] != generation["generation_id"]:
                 continue
             key = _logical(logical)
             _require(key in expected, "cause_unknown_logical_owner")

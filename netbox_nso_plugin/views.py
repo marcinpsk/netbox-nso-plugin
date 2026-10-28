@@ -223,6 +223,7 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
         connection / last-sync banner and is the only adapter touch here.
         """
         from .adapter_client import AdapterError
+        from .refusal_display import settlement_stall_projection
         from .summary import category_summaries, execution_summaries
         from .template_content import _STATUS_BADGE
 
@@ -306,6 +307,7 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
             "execution_summaries": execution_summaries(mgmt),
+            "settlement_stall": settlement_stall_projection(mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,

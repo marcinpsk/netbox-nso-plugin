@@ -454,7 +454,9 @@ _JOB_OUT = {
     "type": "apply",
     "device_id": 10,
     "status": "succeeded",
-    "result": {"ok": True},
+    "result": {"row_outcomes": [], "refusals": [], "settlement_owners": [], "commit_acknowledged": True},
+    "row_outcomes": [],
+    "refusals": [],
     "error": None,
     "context": {"scope": "vlan"},
     "created_at": "2026-07-10T05:59:00Z",
@@ -1036,7 +1038,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     def test_get_job(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import get_job
 
-        session = self._make_session(200, {"id": 99, "type": "apply", "status": "succeeded"})
+        session = self._make_session(200, {**_JOB_OUT, "id": 99})
         mock_s.return_value = session
         result = get_job(99)
         self.assertEqual(result["status"], "succeeded")

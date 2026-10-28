@@ -44,6 +44,33 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         evidence.settlement_sequences = {501: 1}
         settle_apply_attempts(self.management, evidence)
 
+    def test_foreign_current_cause_adds_no_frozen_owner(self):
+        from netbox_nso_plugin.outcome_settlement import _join
+
+        self.prepare()
+        generation = self.terminal(refused=None)
+        original = self.terminal()["refusals"][0]
+        foreign = copy.deepcopy(original)
+        foreign["logical_rows"][0]["row"]["key"] = "f" * 64
+        generation["refusals"] = [foreign]
+        generation["carrier_job_result"]["refusals"] = [foreign]
+        joined = _join(self.management, generation, "placeholder-store", self.attempt)
+        self.assertEqual(len(joined[-1]), len(self.owners))
+
+    def test_intersecting_historical_cause_requires_a_frozen_emitted_ref(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.outcome_settlement import _join
+
+        self.prepare()
+        generation = self.terminal()
+        cause = generation["refusals"][0]
+        cause["provenance"] = "retained"
+        cause["row"]["key"] = "f" * 64
+        failed = next(row for row in generation["row_outcomes"] if row["disposition"] == "refused")
+        failed["refusals"][0]["row"]["key"] = "f" * 64
+        with self.assertRaisesRegex(EvidenceInvariantError, "cause_not_in_frozen_contribution"):
+            _join(self.management, generation, "placeholder-store", self.attempt)
+
     def test_child_refusal_restores_unnamed_peer(self):
         self.prepare()
         self.settle(self.terminal())

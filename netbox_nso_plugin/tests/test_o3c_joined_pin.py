@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "6ebcdd76d0b0be57f373b0a9f6d2bf402a42a0664e0839c0f5654ee2537a0c53"
+_ADAPTER_RUNTIME_DIGEST = "fe177d567cfe1deb4a28b24524909e067d63336c62df995375eedfa33c3f98f9"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )

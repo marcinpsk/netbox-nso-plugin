@@ -52,10 +52,13 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     pk = getattr(mgmt, "pk", mgmt)
     management = NSODeviceManagement.objects.get(pk=pk)
     epoch = mapping_epoch(management)
+    cursor_epoch = (management.settle_cursor_device_id, management.settle_cursor_incarnation)
     evidence = None
     if management.adapter_device_id is not None:
         try:
             evidence = settle_device_apply_attempts(management)
+        except adapter_client.InvalidJobEvidence as exc:
+            return _invalid_evidence_stall(management, epoch, cursor_epoch, exc)
         except EvidenceInvariantError as exc:
             logger.warning("Settlement evidence remains unresolved for management %s", pk)
             # A backlog too long to bind still drains page by page; _settle_job stays fail-closed.
@@ -74,11 +77,55 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
             ):
                 return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
             return result
+    except adapter_client.InvalidJobEvidence as exc:
+        return _invalid_evidence_stall(management, epoch, cursor_epoch, exc)
     except EvidenceInvariantError as exc:
         # The rolled-back page stalls like an invariant from the evidence read above.
         logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
         management.refresh_from_db()
         return ConsumeResult(management.adapter_device_id, 0, True, False, management.settle_cursor_seq, False)
+
+
+def _invalid_evidence_stall(management, epoch, cursor_epoch, error):
+    """Retain one identified invalid job without advancing its settlement cursor."""
+    from .durable_capture import mapping_epoch
+    from .intent_state import mirror_refresh
+    from .models import NSODeviceManagement
+    from .signals import suppress_intent_push
+
+    with transaction.atomic():
+        row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
+        identity_valid = (
+            mapping_epoch(row) == epoch
+            and (row.settle_cursor_device_id, row.settle_cursor_incarnation) == cursor_epoch
+            and type(error.device_id) is int
+            and error.device_id == row.adapter_device_id
+            and type(error.job_id) is int
+            and error.job_id > 0
+            and type(error.settle_seq) is int
+            and error.settle_seq > 0
+            and bool(error.store_incarnation)
+        )
+        already_consumed = (
+            identity_valid
+            and row.settle_cursor_device_id == error.device_id
+            and row.settle_cursor_incarnation == error.store_incarnation
+            and (row.settle_cursor_seq or 0) >= error.settle_seq
+        )
+        if identity_valid and not already_consumed:
+            issue = {
+                "job_id": error.job_id,
+                "settle_seq": error.settle_seq,
+                "reason": error.reason,
+                "mapping_epoch": epoch,
+                "store_incarnation": error.store_incarnation,
+                "cursor_device_id": cursor_epoch[0],
+                "cursor_incarnation": cursor_epoch[1],
+            }
+            with suppress_intent_push(), mirror_refresh(row, ("settle_evidence_error",)) as locked:
+                locked.settle_evidence_error = issue
+                locked.save(update_fields=("settle_evidence_error",))
+        return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
 
 
 def settle_static_routes(mgmt) -> ConsumeResult:
@@ -187,6 +234,11 @@ def _consume_locked(row) -> ConsumeResult:
         stalled = True
         break
 
+    from .durable_capture import mapping_epoch
+
+    issue = row.settle_evidence_error
+    if issue and (issue.get("store_incarnation") != incarnation or issue.get("mapping_epoch") != mapping_epoch(row)):
+        row.settle_evidence_error = {}
     _persist(row, cursor, device_id, incarnation)
     # A full page can leave more executions pending. A short page proves the walk drained.
     drained = not stalled and len(jobs) < SETTLE_FEED_PAGE
@@ -208,6 +260,7 @@ def _clear_stall(row) -> None:
     row.settle_stall_seq = None
     row.settle_stall_attempts = 0
     row.settle_stall_first_seen_at = None
+    row.settle_evidence_error = {}
 
 
 def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
@@ -227,6 +280,7 @@ def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
         "settle_stall_seq": row.settle_stall_seq,
         "settle_stall_attempts": row.settle_stall_attempts,
         "settle_stall_first_seen_at": row.settle_stall_first_seen_at,
+        "settle_evidence_error": row.settle_evidence_error,
     }
     with transaction.atomic(), suppress_intent_push(), mirror_refresh(row, values) as locked:
         for field_name, value in values.items():

@@ -395,16 +395,28 @@ def document_projection(result):
         summary = UNAVAILABLE if unavailable else UNAPPLIED if unapplied else ""
         return {"refusal": None, "refusal_text": "", "summary": summary}
     projected = attributed_projection(attributed)
-    rollback = (
-        result["commit_acknowledged"] is False
-        and all(row["disposition"] in {"refused", "not_applied"} for row in result["row_outcomes"])
-        and any(row["disposition"] == "refused" for row in result["row_outcomes"])
-        and all(
-            cause["provenance"] == "current" and cause["sender_phase"] in {"pre_commit_dry_run", "commit"}
-            for cause in attributed
-        )
+    identities = [refusal_contract._logical_identity(row) for row in result["row_outcomes"]]
+    phrases = set()
+    for cause, catalog in zip(attributed, projected["causes"], strict=True):
+        if any(logical in identities for logical in cause["logical_rows"]):
+            phrases.add(f"{catalog['reason']}: {catalog['message']}")
+        else:
+            row = catalog["row"]
+            phrases.add(
+                f"Blocked by {catalog['family']} {row['subject']} {row['key']} "
+                f"(not part of this Apply): {catalog['message']}"
+            )
+    projected["text"] = " | ".join(sorted(phrases))
+    rollback = result["commit_acknowledged"] is False and all(
+        cause["sender_phase"] in {"pre_commit_dry_run", "commit"} for cause in attributed
     )
-    summary = "Refused; nothing committed. " if rollback else "Execution evidence. "
+    summary = "Execution evidence. "
+    if rollback:
+        summary = (
+            "Refused; commit not attempted. "
+            if all(cause["sender_phase"] == "pre_commit_dry_run" for cause in attributed)
+            else "Refused; nothing committed. "
+        )
     return {"refusal": projected, "refusal_text": projected["text"], "summary": summary + projected["text"]}
 
 
@@ -427,7 +439,8 @@ def job_projection(job):
 
 
 def device_execution_summaries(management):
-    """Summarize only executions named by current projected owners."""
+    """Summarize current owners and executions with no local owner snapshots."""
+    from .durable_capture import mapping_epoch
     from .refusal_registry import OVERLAYS
 
     if management is None:
@@ -443,7 +456,15 @@ def device_execution_summaries(management):
                 related
             )
         )
-    executions = {}
+    executions = {
+        execution.pk: (execution, False)
+        for execution in management.apply_executions.filter(
+            mapping_epoch=mapping_epoch(management),
+            adapter_device_id=management.adapter_device_id,
+            overlay_snapshots__isnull=True,
+            consumption_state="consumed",
+        )
+    }
     for row in project_rows(rows):
         current = _current_snapshot(row)
         if current is not None:
@@ -462,6 +483,27 @@ def device_execution_summaries(management):
         if projected["summary"]:
             summaries.append(projected)
     return summaries
+
+
+def settlement_stall_projection(management):
+    """Show an invalid feed job only for the mapping that fetched it."""
+    from .durable_capture import mapping_epoch
+
+    if management is None:
+        return None
+    issue = management.settle_evidence_error
+    cursor_epoch = (management.settle_cursor_device_id, management.settle_cursor_incarnation)
+    if (
+        issue
+        and issue.get("mapping_epoch") == mapping_epoch(management)
+        and cursor_epoch
+        in (
+            (management.adapter_device_id, issue.get("store_incarnation")),
+            (issue.get("cursor_device_id"), issue.get("cursor_incarnation")),
+        )
+    ):
+        return issue
+    return None
 
 
 def validate_interface_errors(interfaces):

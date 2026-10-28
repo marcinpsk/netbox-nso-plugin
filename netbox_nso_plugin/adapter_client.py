@@ -336,6 +336,18 @@ class AdapterError(Exception):
         return {"error": {"code": self.code, "message": public_error_message(self)}}
 
 
+class InvalidJobEvidence(AdapterError):
+    """Keep feed identity and a closed contract reason without response diagnostics."""
+
+    def __init__(self, job, reason):
+        super().__init__("Adapter returned invalid execution evidence.", code="invalid_response")
+        self.reason = reason
+        self.job_id = job.get("id") if isinstance(job, dict) else None
+        self.settle_seq = job.get("settle_seq") if isinstance(job, dict) else None
+        self.device_id = job.get("device_id") if isinstance(job, dict) else None
+        self.store_incarnation = None
+
+
 def _document(data, what: str) -> dict:
     if isinstance(data, dict):
         return data
@@ -1267,8 +1279,10 @@ def _validated_job(job, what):
                 code="invalid_response",
             )
     result = job.get("result")
-    if isinstance(result, dict) and (
-        "row_outcomes" in result or any(key.endswith("_count_by_outcome") for key in result)
+    execution_expected = job.get("type") in {"apply", "removal"} and job.get("status") in {"succeeded", "failed"}
+    if execution_expected or (
+        isinstance(result, dict)
+        and ("row_outcomes" in result or any(key.endswith("_count_by_outcome") for key in result))
     ):
         from .refusal_contract import ContractError, validate_result
 
@@ -1276,10 +1290,10 @@ def _validated_job(job, what):
             validate_result(result)
             if any(key not in job or job[key] != result[key] for key in ("row_outcomes", "refusals")):
                 raise ContractError("job projection mismatch")
-        except ContractError:
-            raise AdapterError("Adapter returned invalid execution evidence.", code="invalid_response") from None
+        except ContractError as exc:
+            raise InvalidJobEvidence(job, str(exc)) from None
     elif any(job.get(key) is not None for key in ("row_outcomes", "refusals")):
-        raise AdapterError("Adapter returned invalid execution evidence.", code="invalid_response")
+        raise InvalidJobEvidence(job, "projection without execution result")
     return job
 
 
@@ -1288,7 +1302,12 @@ def _validated_jobs(jobs, what):
     if not isinstance(jobs, list):
         raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
     for job in jobs:
-        _validated_job(job, what)
+        try:
+            _validated_job(job, what)
+        except InvalidJobEvidence:
+            raise
+        except AdapterError:
+            raise InvalidJobEvidence(job, "invalid job envelope") from None
     return jobs
 
 
@@ -1464,7 +1483,12 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
         raise AdapterError(
             "Adapter returned a settlement feed that is not valid JSON.", code="invalid_response"
         ) from exc
-    return _validated_jobs(page, "settlement feed"), incarnation
+    try:
+        jobs = _validated_jobs(page, "settlement feed")
+    except InvalidJobEvidence as exc:
+        exc.store_incarnation = incarnation
+        raise
+    return jobs, incarnation
 
 
 def get_static_route_intent(adapter_device_id):

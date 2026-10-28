@@ -584,6 +584,7 @@ class NSODeviceManagement(NetBoxModel):
     settle_stall_seq = models.BigIntegerField(null=True, blank=True)
     settle_stall_attempts = models.PositiveIntegerField(default=0)
     settle_stall_first_seen_at = models.DateTimeField(null=True, blank=True)
+    settle_evidence_error = models.JSONField(default=dict, blank=True)
     # Per-scope record of what an intent push was rejected with. ``intent_push_attempts``
     # is the never-cleared per-scope high-water mark: clearing the error entry on success
     # would take the attempt token with it, and a delayed failure from an earlier attempt
@@ -676,6 +677,7 @@ class NSODeviceManagement(NetBoxModel):
         "settle_stall_seq",
         "settle_stall_attempts",
         "settle_stall_first_seen_at",
+        "settle_evidence_error",
         "adapter_link_attempted_at",
     )
     # One authority for the refresh, so a column protected in one group cannot be missed.
