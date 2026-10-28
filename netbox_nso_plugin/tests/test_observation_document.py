@@ -51,14 +51,22 @@ def test_authoritative_empty_is_valid_and_has_an_aware_timestamp():
         ("coverage", {"attributes": [False]}),
         ("revision", True),
         ("document", None),
-        ("document", {"interfaces": [{"name": None}], "unprojectable": []}),
-        ("document", {"interfaces": [], "unprojectable": [{"index": True, "reason": "missing name"}]}),
+        ("document", {"interfaces": [{"name": None}], "present": ["interfaces"], "unprojectable": []}),
+        (
+            "document",
+            {"interfaces": [], "present": ["interfaces"], "unprojectable": [{"index": True, "reason": "missing name"}]},
+        ),
     ],
 )
 def test_invalid_observation_is_a_protocol_error(field, value):
     validator = _validator()
     snapshot = _observation()
     snapshot[field] = value
+    if field == "document" and value is not None:
+        # A matching digest leaves the invalid value as the only failure cause.
+        snapshot["digest"] = hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
     with pytest.raises(validator.ObservationProtocolError):
         validator.observation_defaults("interface_attributes", 3, 2, snapshot)
 
