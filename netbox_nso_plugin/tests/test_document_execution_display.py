@@ -15,6 +15,38 @@ from .test_durable_bgp_capture import BGPCaptureCase
 
 
 class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
+    def serve_preceding_sync_jobs(self, generation, *, full_page=False):
+        from ._adapter_http import make_response
+
+        self.serve_terminal_evidence(generation, settle_seq=42)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs"):
+                after = int(kwargs["params"]["after_settle_seq"])
+                params = {**kwargs["params"], "after_settle_seq": 0}
+                job = original(method, url, **{**kwargs, "params": params}).json()[0]
+                sequences = range(1, 101) if full_page else [41]
+                preceding = [
+                    {
+                        **job,
+                        "id": 300 + sequence if full_page else 500,
+                        "type": "sync",
+                        "result": None,
+                        "row_outcomes": None,
+                        "refusals": None,
+                        "settle_seq": sequence,
+                    }
+                    for sequence in sequences
+                ]
+                if after == 0:
+                    return make_response(200, [*preceding, job][:100])
+                if full_page and after == 100:
+                    return make_response(200, [job])
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+
     def ownerless(self, *, provenance="prior", phase="pre_commit_dry_run"):
         self.prepare()
         generation = self.terminal()
@@ -139,7 +171,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             for linked in outcome["refusals"]:
                 linked["row"]["key"] = "f" * 64
         validate_generation(generation)
-        self.serve_terminal_evidence(generation, settle_seq=42)
+        self.serve_preceding_sync_jobs(generation)
         result = consume_static_route_settlements(self.management)
         self.assertTrue(result.stalled)
         self.management.refresh_from_db()
@@ -147,8 +179,9 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         execution = NSOApplyExecution.objects.get(management=self.management, carrier_job_id=501)
         self.assertEqual(execution.invariant_code, "invalid_terminal_batch")
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
-        self.assertContains(response, "Settlement is paused")
+        self.assertContains(response, "Settlement is paused", count=1)
         self.assertContains(response, "Adapter job 501")
+        self.assertNotContains(response, "Adapter job 500")
         self.assertContains(response, "settle_seq 42")
         self.assertContains(response, "invalid settlement evidence")
         self.assertEqual(self.management.settle_evidence_error["reason"], "invalid settlement evidence")
@@ -158,6 +191,22 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(self.management.settle_evidence_error, {})
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertNotContains(response, "Settlement is paused")
+
+    def test_invalid_order_on_second_feed_page_names_the_failing_job(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        self.prepare()
+        self.serve_preceding_sync_jobs(self.terminal(), full_page=True)
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertNotContains(response, "Adapter job 301")
+        self.assertContains(response, "settle_seq 42")
+        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+        self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
 
     def test_invalid_evidence_banner_does_not_follow_a_mapping_change(self):
         from netbox_nso_plugin.models import NSODeviceManagement

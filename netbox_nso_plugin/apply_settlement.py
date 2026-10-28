@@ -411,16 +411,22 @@ def settle_apply_attempts(
     receipt_recoveries = getattr(deployment_evidence, "receipt_recoveries", {})
     for generation, _local in generations:
         authorities.setdefault(generation["carrier_job_id"], {})[generation["generation_id"]] = generation
-    for generation, local in generations:
-        validate_terminal_generation(
-            management,
-            generation,
-            incarnation,
-            attempt=local,
-            authorities=authorities[generation["carrier_job_id"]],
-            receipt_recoveries=receipt_recoveries,
-        )
     sequences = getattr(deployment_evidence, "settlement_sequences", {})
+    for generation, local in generations:
+        job = {
+            "id": generation["carrier_job_id"],
+            "device_id": management.adapter_device_id,
+            "settle_seq": sequences.get(generation["carrier_job_id"]),
+        }
+        with identify_evidence_stall(job, incarnation):
+            validate_terminal_generation(
+                management,
+                generation,
+                incarnation,
+                attempt=local,
+                authorities=authorities[generation["carrier_job_id"]],
+                receipt_recoveries=receipt_recoveries,
+            )
     settle_terminal_generations(
         management,
         [item[0] for item in sorted(generations, key=lambda item: sequences.get(item[0]["carrier_job_id"], 0))],
@@ -610,7 +616,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         feed, incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=cursor, limit=100)
     with identify_evidence_stall(feed[0] if feed else {}, incarnation):
         seen_jobs = set()
-        last_sequence = _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs)
+        last_sequence = _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs, incarnation)
         page = feed
         while len(page) == 100:
             page, next_incarnation = client.get_settlement_feed(
@@ -618,7 +624,9 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             )
             if next_incarnation != incarnation:
                 raise EvidenceInvariantError("evidence_epoch_changed")
-            last_sequence = _validate_feed_page(page, management.adapter_device_id, last_sequence, seen_jobs)
+            last_sequence = _validate_feed_page(
+                page, management.adapter_device_id, last_sequence, seen_jobs, incarnation
+            )
             feed.extend(page)
             if len(feed) > 10000:
                 raise EvidenceInvariantError("settlement_feed_not_bounded")
@@ -672,7 +680,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         _last_page, final_incarnation = client.get_settlement_feed(
             management.adapter_device_id, after_settle_seq=last_sequence, limit=1
         )
-        _validate_feed_page(_last_page, management.adapter_device_id, last_sequence, set())
+        _validate_feed_page(_last_page, management.adapter_device_id, last_sequence, set(), final_incarnation)
         management.refresh_from_db()
         if incarnation != final_incarnation or mapping_epoch(management) != epoch:
             raise EvidenceInvariantError("evidence_epoch_changed")
@@ -1101,18 +1109,19 @@ def _generation_from_carrier(generation, carrier):
     }
 
 
-def _validate_feed_page(jobs, adapter_device_id, after, seen):
+def _validate_feed_page(jobs, adapter_device_id, after, seen, incarnation):
     """Require ordered terminal carriers before any local settlement mutation."""
     for job in jobs:
-        sequence = job["settle_seq"]
-        if (
-            type(sequence) is not int
-            or sequence <= after
-            or job["device_id"] != adapter_device_id
-            or job["id"] in seen
-            or job["status"] not in {"succeeded", "failed"}
-        ):
-            raise EvidenceInvariantError("invalid_settlement_order")
-        seen.add(job["id"])
-        after = sequence
+        with identify_evidence_stall(job, incarnation):
+            sequence = job["settle_seq"]
+            if (
+                type(sequence) is not int
+                or sequence <= after
+                or job["device_id"] != adapter_device_id
+                or job["id"] in seen
+                or job["status"] not in {"succeeded", "failed"}
+            ):
+                raise EvidenceInvariantError("invalid_settlement_order")
+            seen.add(job["id"])
+            after = sequence
     return after
