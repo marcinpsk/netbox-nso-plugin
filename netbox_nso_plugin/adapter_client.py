@@ -1279,10 +1279,8 @@ def _validated_job(job, what):
                 code="invalid_response",
             )
     result = job.get("result")
-    execution_expected = job.get("type") in {"apply", "removal"} and job.get("status") in {"succeeded", "failed"}
-    if execution_expected or (
-        isinstance(result, dict)
-        and ("row_outcomes" in result or any(key.endswith("_count_by_outcome") for key in result))
+    if isinstance(result, dict) and (
+        "row_outcomes" in result or any(key.endswith("_count_by_outcome") for key in result)
     ):
         from .refusal_contract import ContractError, validate_result
 

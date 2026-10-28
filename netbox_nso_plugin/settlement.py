@@ -63,7 +63,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
             logger.warning("Settlement evidence remains unresolved for management %s", pk)
             # A backlog too long to bind still drains page by page; _settle_job stays fail-closed.
             if str(exc) != "settlement_feed_not_bounded":
-                return ConsumeResult(management.adapter_device_id, 0, True, False, management.settle_cursor_seq, False)
+                return _invariant_evidence_stall(management, epoch, cursor_epoch, exc)
     try:
         with transaction.atomic():
             row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
@@ -82,8 +82,13 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     except EvidenceInvariantError as exc:
         # The rolled-back page stalls like an invariant from the evidence read above.
         logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
-        management.refresh_from_db()
-        return ConsumeResult(management.adapter_device_id, 0, True, False, management.settle_cursor_seq, False)
+        return _invariant_evidence_stall(management, epoch, cursor_epoch, exc)
+
+
+def _invariant_evidence_stall(management, epoch, cursor_epoch, error):
+    """Persist the identified invariant through the existing diagnostic fence."""
+    invalid_job = getattr(error, "invalid_job", adapter_client.InvalidJobEvidence({}, "invalid settlement evidence"))
+    return _invalid_evidence_stall(management, epoch, cursor_epoch, invalid_job)
 
 
 def _invalid_evidence_stall(management, epoch, cursor_epoch, error):
@@ -215,24 +220,27 @@ def _consume_locked(row) -> ConsumeResult:
 
     consumed = 0
     stalled = False
+    from .apply_settlement import identify_evidence_stall
+
     for job in jobs:
-        seq = job.get("settle_seq")
-        if type(seq) is not int or seq <= cursor:
-            from .apply_settlement import EvidenceInvariantError
+        with identify_evidence_stall(job, incarnation):
+            seq = job.get("settle_seq")
+            if type(seq) is not int or seq <= cursor:
+                from .apply_settlement import EvidenceInvariantError
 
-            raise EvidenceInvariantError("invalid_settlement_order")
-        if _settle_job(row, job, incarnation):
-            cursor = max(cursor, seq)
-            _clear_stall(row)
-            consumed += 1
-            continue
+                raise EvidenceInvariantError("invalid_settlement_order")
+            if _settle_job(row, job, incarnation):
+                cursor = max(cursor, seq)
+                _clear_stall(row)
+                consumed += 1
+                continue
 
-        _record_stall(row, seq)
+            _record_stall(row, seq)
 
-        # Head-of-line: nothing behind an unresolved settlement may be consumed, or the
-        # cursor would advance past a result still owed to an overlay.
-        stalled = True
-        break
+            # Head-of-line: nothing behind an unresolved settlement may be consumed, or the
+            # cursor would advance past a result still owed to an overlay.
+            stalled = True
+            break
 
     from .durable_capture import mapping_epoch
 

@@ -126,6 +126,39 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(self.management.settle_evidence_error, {})
         self.assertEqual(self.management.settle_cursor_seq, 42)
 
+    def test_retained_cause_outside_frozen_contribution_stalls_with_device_banner(self):
+        from netbox_nso_plugin.refusal_contract import validate_generation
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        self.prepare()
+        generation = self.terminal()
+        cause = generation["refusals"][0]
+        cause["provenance"] = "retained"
+        cause["row"]["key"] = "f" * 64
+        for outcome in generation["row_outcomes"]:
+            for linked in outcome["refusals"]:
+                linked["row"]["key"] = "f" * 64
+        validate_generation(generation)
+        self.serve_terminal_evidence(generation, settle_seq=42)
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        execution = NSOApplyExecution.objects.get(management=self.management, carrier_job_id=501)
+        self.assertEqual(execution.invariant_code, "invalid_terminal_batch")
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused")
+        self.assertContains(response, "Adapter job 501")
+        self.assertContains(response, "settle_seq 42")
+        self.assertContains(response, "invalid settlement evidence")
+        self.assertEqual(self.management.settle_evidence_error["reason"], "invalid settlement evidence")
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42)
+        self.assertFalse(consume_static_route_settlements(self.management).stalled)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertNotContains(response, "Settlement is paused")
+
     def test_invalid_evidence_banner_does_not_follow_a_mapping_change(self):
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.settlement import consume_static_route_settlements

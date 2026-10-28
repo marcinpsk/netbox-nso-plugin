@@ -72,21 +72,18 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
         self.adapter._handle = handle
         adapter_client.reset_session()
 
-    def test_terminal_apply_without_execution_keys_records_the_contract_reason(self):
-        self.serve_feed([self.job(result={})])
-        result = consume_static_route_settlements(self.management)
-        self.assertTrue(result.stalled)
-        self.management.refresh_from_db()
-        self.assertEqual(self.management.settle_evidence_error.get("reason"), "missing structured execution evidence")
-        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
-        self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
-
-    def test_terminal_removal_without_result_records_the_contract_reason(self):
-        self.serve_feed([self.job(kind="removal")])
-        result = consume_static_route_settlements(self.management)
-        self.assertTrue(result.stalled)
-        self.management.refresh_from_db()
-        self.assertEqual(self.management.settle_evidence_error.get("reason"), "invalid execution result")
+    def test_terminal_jobs_without_execution_markers_pass_the_feed_validator(self):
+        for kind in ("apply", "removal"):
+            for status in ("succeeded", "failed"):
+                for result in (None, {}, {"pre_execution_failure": True}):
+                    with self.subTest(kind=kind, status=status, result=result):
+                        job = self.job(kind=kind, status=status, result=result)
+                        self.serve_feed([job])
+                        served, incarnation = adapter_client.get_settlement_feed(
+                            self.management.adapter_device_id, after_settle_seq=0, limit=100
+                        )
+                        self.assertEqual(served, [job])
+                        self.assertEqual(incarnation, "placeholder-store-a")
 
     def test_nonterminal_and_unrelated_jobs_do_not_require_execution_results(self):
         jobs = [
@@ -102,6 +99,17 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
         )
         self.assertEqual(served, jobs)
         self.assertEqual(incarnation, "placeholder-store-a")
+
+    def test_out_of_order_feed_records_a_closed_evidence_reason(self):
+        first = self.job(kind="sync")
+        second = {**first, "id": 502, "settle_seq": 41}
+        self.serve_feed([first, second])
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        self.management.refresh_from_db()
+        self.assertEqual(
+            {key: self.management.settle_evidence_error.get(key) for key in ("job_id", "settle_seq", "reason")},
+            {"job_id": 501, "settle_seq": 42, "reason": "invalid settlement evidence"},
+        )
 
     def test_first_invalid_response_from_a_new_store_remains_visible(self):
         mirror_update(

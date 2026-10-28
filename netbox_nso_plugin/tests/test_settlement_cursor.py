@@ -457,6 +457,33 @@ class TestUnresolvedExecution(_SettlementCase):
         row = self._cursor(mgmt)
         assert (row.settle_cursor_seq, row.settle_stall_seq, row.settle_stall_attempts) == (None, None, 0)
 
+    def test_consumer_invariant_records_the_job_after_page_rollback(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("backloginvariant")
+        mgmt = _make_mgmt(device, "backloginvariant", 84, adapter=self.adapter)
+        store = self.adapter.store
+        jobs = [store.terminal_job(84, job_type="sync") for _ in range(10_001)]
+        serve = store.feed
+        heads = 0
+
+        def feed(device_id, after, limit):
+            nonlocal heads
+            heads += after == 0
+            page = serve(device_id, after, limit)
+            if after == 0 and heads == 2:
+                page[1] = {**page[1], "settle_seq": page[0]["settle_seq"]}
+            return page
+
+        store.feed = feed
+        result = consume_static_route_settlements(mgmt)
+        assert result.stalled
+        row = self._cursor(mgmt)
+        assert row.settle_cursor_seq is None
+        assert row.settle_evidence_error.get("job_id") == jobs[1]["id"]
+        assert row.settle_evidence_error.get("settle_seq") == 1
+        assert row.settle_evidence_error.get("reason") == "invalid settlement evidence"
+
 
 class TestMalformedFeedPreservesCursor(_SettlementCase):
     """An invalid feed page cannot certify or discard any ordered execution."""

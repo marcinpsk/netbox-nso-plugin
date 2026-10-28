@@ -90,9 +90,9 @@ class TestTheCarrier(_CarrierCase):
 
         state.refresh_from_db()
         assert state.status == "deploying"
-        assert self._cursor(mgmt).settle_cursor_seq is None
-        assert self._cursor(mgmt).settle_evidence_error["reason"] == "missing structured execution evidence"
-        assert self._cursor(mgmt).settle_stall_attempts == 0
+        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert self._cursor(mgmt).settle_evidence_error == {}
+        assert self._cursor(mgmt).settle_stall_attempts > 0
 
 
 class TestOrderingAndIsolation(_CarrierCase):
@@ -331,6 +331,6 @@ class TestRawRouteResultsRemainUnconsumed(_CarrierCase):
             "a raw route result or the age clock judged intent without structured execution evidence"
         )
         assert state.last_apply_error == ""
-        assert self._cursor(mgmt).settle_cursor_seq is None
-        assert self._cursor(mgmt).settle_evidence_error["reason"] == "missing structured execution evidence"
-        assert self._cursor(mgmt).settle_stall_attempts == 0
+        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert self._cursor(mgmt).settle_evidence_error == {}
+        assert self._cursor(mgmt).settle_stall_attempts > 0

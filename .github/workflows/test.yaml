@@ -82,7 +82,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: 66ea94636ade1bc820464e936d99c9191fb260ba
+          ref: a61c2b1f2a5ca9a14913b6722dacba08b49ed176
           path: .o3c-adapter
           persist-credentials: false
 
@@ -276,7 +276,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: 66ea94636ade1bc820464e936d99c9191fb260ba
+          ref: a61c2b1f2a5ca9a14913b6722dacba08b49ed176
           path: refusal-adapter
           persist-credentials: false
 

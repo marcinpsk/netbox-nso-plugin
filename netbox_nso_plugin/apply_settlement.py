@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -38,6 +39,20 @@ _CARRIER_EVIDENCE_FIELDS = (
 
 class EvidenceInvariantError(RuntimeError):
     """The adapter evidence cannot truthfully judge local Apply rows."""
+
+
+@contextmanager
+def identify_evidence_stall(job, incarnation):
+    """Keep the blocked feed identity when local evidence validation fails."""
+    from .adapter_client import InvalidJobEvidence
+
+    try:
+        yield
+    except EvidenceInvariantError as exc:
+        if not hasattr(exc, "invalid_job"):
+            exc.invalid_job = InvalidJobEvidence(job, "invalid settlement evidence")
+            exc.invalid_job.store_incarnation = incarnation
+        raise
 
 
 def _positive_int(value) -> bool:
@@ -593,89 +608,90 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     if cursor and incarnation != management.settle_cursor_incarnation:
         cursor = 0
         feed, incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=cursor, limit=100)
-    seen_jobs = set()
-    last_sequence = _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs)
-    page = feed
-    while len(page) == 100:
-        page, next_incarnation = client.get_settlement_feed(
-            management.adapter_device_id, after_settle_seq=page[-1]["settle_seq"], limit=100
-        )
-        if next_incarnation != incarnation:
-            raise EvidenceInvariantError("evidence_epoch_changed")
-        last_sequence = _validate_feed_page(page, management.adapter_device_id, last_sequence, seen_jobs)
-        feed.extend(page)
-        if len(feed) > 10000:
-            raise EvidenceInvariantError("settlement_feed_not_bounded")
-    evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
-    snapshots = [evidence]
-    _reject_unrequested_attempts(evidence, attempt_ids)
-    unknown = _validated_unknown_attempt_ids(evidence, attempt_ids)
-    replayed = False
-    replay_answers = []
-    for attempt in NSOApplyAttempt.objects.filter(
-        pk__in=unknown,
-        management=management,
-        adapter_device_id=management.adapter_device_id,
-        trigger_kind="manual",
-        adapter_apply_attempt_id__isnull=False,
-    ):
-        # A retained overlay reference or explicit selection cannot reopen a refusal.
-        if attempt.response is not None and attempt.http_status not in (200, 202):
-            continue
-        if (
-            attempt.overlay_snapshots.filter(selection__binding_state="invalidated").exists()
-            or attempt.overlay_snapshots.filter(selection__store_incarnation__isnull=False)
-            .exclude(selection__store_incarnation=incarnation)
-            .exists()
-        ):
-            continue
-        try:
-            result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
-        except client.AdapterError as exc:
-            if exc.status_code == 409 and exc.code == "conflict":
-                job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
-                logger.info(
-                    "Apply replay for adapter device %s attempt %s is waiting for adapter job %s",
-                    management.adapter_device_id,
-                    attempt.pk,
-                    job_id,
-                )
-            else:
-                replay_answers.append((attempt, None, exc))
-        else:
-            replay_answers.append((attempt, result, None))
-        replayed = True
-    if replayed:
+    with identify_evidence_stall(feed[0] if feed else {}, incarnation):
+        seen_jobs = set()
+        last_sequence = _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs)
+        page = feed
+        while len(page) == 100:
+            page, next_incarnation = client.get_settlement_feed(
+                management.adapter_device_id, after_settle_seq=page[-1]["settle_seq"], limit=100
+            )
+            if next_incarnation != incarnation:
+                raise EvidenceInvariantError("evidence_epoch_changed")
+            last_sequence = _validate_feed_page(page, management.adapter_device_id, last_sequence, seen_jobs)
+            feed.extend(page)
+            if len(feed) > 10000:
+                raise EvidenceInvariantError("settlement_feed_not_bounded")
         evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+        snapshots = [evidence]
         _reject_unrequested_attempts(evidence, attempt_ids)
-        _validated_unknown_attempt_ids(evidence, attempt_ids)
-        snapshots.append(evidence)
-    generations = client.list_device_generations(management.adapter_device_id)
-    _reconcile_admissions(management, attempt_ids, snapshots, replay_answers, generations)
-    unacknowledged, receipt_document = _load_pending_receipts(management, evidence, generations)
-    _last_page, final_incarnation = client.get_settlement_feed(
-        management.adapter_device_id, after_settle_seq=last_sequence, limit=1
-    )
-    _validate_feed_page(_last_page, management.adapter_device_id, last_sequence, set())
-    management.refresh_from_db()
-    if incarnation != final_incarnation or mapping_epoch(management) != epoch:
-        raise EvidenceInvariantError("evidence_epoch_changed")
-    bound = _bound_evidence(evidence, feed, generations, incarnation, management=management)
-    _restore_consumed_sequences(bound, management, incarnation)
-    bound.receipt_recoveries = _prepare_receipt_recoveries(
-        management, bound, unacknowledged, receipt_document, incarnation
-    )
-    from .intent_state import MutationFootprint, mirror_transaction
-
-    with mirror_transaction(MutationFootprint(device_ids=(management.device_id,))):
+        unknown = _validated_unknown_attempt_ids(evidence, attempt_ids)
+        replayed = False
+        replay_answers = []
+        for attempt in NSOApplyAttempt.objects.filter(
+            pk__in=unknown,
+            management=management,
+            adapter_device_id=management.adapter_device_id,
+            trigger_kind="manual",
+            adapter_apply_attempt_id__isnull=False,
+        ):
+            # A retained overlay reference or explicit selection cannot reopen a refusal.
+            if attempt.response is not None and attempt.http_status not in (200, 202):
+                continue
+            if (
+                attempt.overlay_snapshots.filter(selection__binding_state="invalidated").exists()
+                or attempt.overlay_snapshots.filter(selection__store_incarnation__isnull=False)
+                .exclude(selection__store_incarnation=incarnation)
+                .exists()
+            ):
+                continue
+            try:
+                result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
+            except client.AdapterError as exc:
+                if exc.status_code == 409 and exc.code == "conflict":
+                    job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
+                    logger.info(
+                        "Apply replay for adapter device %s attempt %s is waiting for adapter job %s",
+                        management.adapter_device_id,
+                        attempt.pk,
+                        job_id,
+                    )
+                else:
+                    replay_answers.append((attempt, None, exc))
+            else:
+                replay_answers.append((attempt, result, None))
+            replayed = True
+        if replayed:
+            evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+            _reject_unrequested_attempts(evidence, attempt_ids)
+            _validated_unknown_attempt_ids(evidence, attempt_ids)
+            snapshots.append(evidence)
+        generations = client.list_device_generations(management.adapter_device_id)
+        _reconcile_admissions(management, attempt_ids, snapshots, replay_answers, generations)
+        unacknowledged, receipt_document = _load_pending_receipts(management, evidence, generations)
+        _last_page, final_incarnation = client.get_settlement_feed(
+            management.adapter_device_id, after_settle_seq=last_sequence, limit=1
+        )
+        _validate_feed_page(_last_page, management.adapter_device_id, last_sequence, set())
         management.refresh_from_db()
-        if mapping_epoch(management) != epoch:
+        if incarnation != final_incarnation or mapping_epoch(management) != epoch:
             raise EvidenceInvariantError("evidence_epoch_changed")
-        NSOAcceptedSelection.objects.filter(management=management, binding_state="bound").exclude(
-            store_incarnation=incarnation
-        ).update(binding_state="invalidated")
-        bound.replay_restorations = _record_replay_answers(replay_answers)
-    return bound
+        bound = _bound_evidence(evidence, feed, generations, incarnation, management=management)
+        _restore_consumed_sequences(bound, management, incarnation)
+        bound.receipt_recoveries = _prepare_receipt_recoveries(
+            management, bound, unacknowledged, receipt_document, incarnation
+        )
+        from .intent_state import MutationFootprint, mirror_transaction
+
+        with mirror_transaction(MutationFootprint(device_ids=(management.device_id,))):
+            management.refresh_from_db()
+            if mapping_epoch(management) != epoch:
+                raise EvidenceInvariantError("evidence_epoch_changed")
+            NSOAcceptedSelection.objects.filter(management=management, binding_state="bound").exclude(
+                store_incarnation=incarnation
+            ).update(binding_state="invalidated")
+            bound.replay_restorations = _record_replay_answers(replay_answers)
+        return bound
 
 
 def _restore_consumed_sequences(bound, management, incarnation):
@@ -748,10 +764,11 @@ def settle_device_apply_attempts(management):
     """Fetch one evidence snapshot and settle this device's currently referenced attempts."""
     evidence = load_deployment_evidence(management)
     if evidence is not None:
-        settle_apply_attempts(
-            management,
-            evidence,
-        )
+        with identify_evidence_stall(evidence.settlement_head, evidence.store_incarnation):
+            settle_apply_attempts(
+                management,
+                evidence,
+            )
     return evidence
 
 
@@ -803,6 +820,7 @@ def _bound_evidence(evidence, jobs, generations, incarnation, *, management):
     """Join jobs to authoritative generation sequences, including automatic heads."""
     bound = _BoundEvidence(evidence)
     bound.store_incarnation = incarnation
+    bound.settlement_head = jobs[0] if jobs else {}
     bound.settlement_sequences = {job["id"]: job["settle_seq"] for job in jobs}
     bound.automatic_generations = []
     bound.generation_modes = {row["generation_id"]: row["mode"] for row in generations}
