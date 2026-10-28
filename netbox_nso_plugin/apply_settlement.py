@@ -42,7 +42,7 @@ class EvidenceInvariantError(RuntimeError):
 
 
 @contextmanager
-def identify_evidence_stall(job, incarnation):
+def identify_evidence_stall(job, incarnation, *, sequences=None):
     """Keep the blocked feed identity when local evidence validation fails."""
     from .adapter_client import InvalidJobEvidence
 
@@ -50,12 +50,27 @@ def identify_evidence_stall(job, incarnation):
         yield
     except (EvidenceInvariantError, ContractError) as exc:
         error = exc if isinstance(exc, EvidenceInvariantError) else EvidenceInvariantError("invalid_terminal_batch")
-        if not hasattr(error, "invalid_job"):
+        if not hasattr(error, "invalid_job") and (_positive_int(job.get("id")) or job.get("device_id") is not None):
             error.invalid_job = InvalidJobEvidence(job, "invalid settlement evidence")
-            error.invalid_job.store_incarnation = incarnation
+        if hasattr(error, "invalid_job"):
+            _complete_evidence_identity(error.invalid_job, job, incarnation, sequences or {})
         if error is exc:
             raise
         raise error from exc
+
+
+def _complete_evidence_identity(error, job, incarnation, sequences):
+    """Complete missing fences without replacing the innermost carrier."""
+    if error.device_id is None:
+        error.device_id = job.get("device_id")
+    if error.store_incarnation is None:
+        error.store_incarnation = incarnation
+    if error.settle_seq is None and _positive_int(error.job_id):
+        sequence = sequences.get(error.job_id)
+        if sequence is None and error.job_id == job.get("id"):
+            sequence = job.get("settle_seq")
+        if _positive_int(sequence):
+            error.settle_seq = sequence
 
 
 def _positive_int(value) -> bool:
@@ -63,12 +78,25 @@ def _positive_int(value) -> bool:
 
 
 def _carrier_job(adapter_device_id, carrier_id, sequences):
-    """Return a complete carrier identity when its settlement order is known."""
+    """Keep the carrier identity until its settlement order is known."""
     job = {"device_id": adapter_device_id}
+    if _positive_int(carrier_id):
+        job["id"] = carrier_id
     sequence = sequences.get(carrier_id) if _positive_int(carrier_id) else None
     if _positive_int(sequence):
-        job.update(id=carrier_id, settle_seq=sequence)
+        job["settle_seq"] = sequence
     return job
+
+
+@contextmanager
+def identify_generation_stall(generation, *, settle_seq=None):
+    """Keep the generation's carrier when validation precedes the feed join."""
+    carrier_id = generation.get("carrier_job_id") if isinstance(generation, dict) else None
+    job = _carrier_job(None, carrier_id, {})
+    if _positive_int(settle_seq):
+        job["settle_seq"] = settle_seq
+    with identify_evidence_stall(job, None):
+        yield
 
 
 def _parse_time(value):
@@ -82,12 +110,10 @@ def _parse_time(value):
 
 
 def _validate_generation(raw) -> dict:
-    from .refusal_contract import ContractError, validate_generation
+    from .refusal_contract import validate_generation
 
-    try:
+    with identify_generation_stall(raw):
         return validate_generation(raw)
-    except ContractError as exc:
-        raise EvidenceInvariantError("invalid_terminal_batch") from exc
 
 
 def _response_generation_ids(response) -> set[int]:
@@ -302,11 +328,12 @@ def reconcile_admission_links(responses, generations):
         _response_generation_ids(response)
         for link in response.get("generations") or ():
             generation = by_id.get(link["generation_id"])
-            if generation is None:
-                raise EvidenceInvariantError("admission_generation_mismatch")
-            for key in _ADMISSION_GENERATION_METADATA:
-                if key not in link or link[key] != generation[key]:
-                    raise EvidenceInvariantError(f"admission_generation_mismatch: {key}")
+            with identify_generation_stall(generation):
+                if generation is None:
+                    raise EvidenceInvariantError("admission_generation_mismatch")
+                for key in _ADMISSION_GENERATION_METADATA:
+                    if key not in link or link[key] != generation[key]:
+                        raise EvidenceInvariantError(f"admission_generation_mismatch: {key}")
 
 
 def _reconcile_admissions(management, attempt_ids, snapshots, answers, generations, incarnation, settlement_sequences):
@@ -641,7 +668,8 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         feed, incarnation = client.get_settlement_feed(
             management.adapter_device_id, after_settle_seq=cursor, limit=SETTLE_FEED_PAGE
         )
-    with identify_evidence_stall({"device_id": management.adapter_device_id}, incarnation):
+    sequences = {}
+    with identify_evidence_stall({"device_id": management.adapter_device_id}, incarnation, sequences=sequences):
         seen_jobs = set()
         last_sequence = _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs, incarnation)
         page = feed
@@ -657,6 +685,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             feed.extend(page)
             if len(feed) > 10000:
                 raise EvidenceInvariantError("settlement_feed_not_bounded")
+        sequences.update({job["id"]: job["settle_seq"] for job in feed})
         evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
         snapshots = [evidence]
         _reject_unrequested_attempts(evidence, attempt_ids)
@@ -709,7 +738,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             replay_answers,
             generations,
             incarnation,
-            {job["id"]: job["settle_seq"] for job in feed},
+            sequences,
         )
         unacknowledged, receipt_document = _load_pending_receipts(management, evidence, generations)
         _last_page, final_incarnation = client.get_settlement_feed(

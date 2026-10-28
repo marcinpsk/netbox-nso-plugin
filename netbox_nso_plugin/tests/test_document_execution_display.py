@@ -315,6 +315,104 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.adapter._handle = handle
         self.assert_carrier_stall_banner()
 
+    def serve_invalid_receipt_generation(self, *, pruned=False):
+        from ._adapter_http import make_response
+
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42, manual=True, pruned=pruned)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                evidence = response.json()
+                evidence["attempts"][0]["generations"][0]["source_push_seq"] = {}
+                return make_response(200, evidence)
+            return response
+
+        self.adapter._handle = handle
+
+    def test_invalid_receipt_generation_names_its_carrier(self):
+        self.serve_invalid_receipt_generation()
+        self.assert_carrier_stall_banner()
+
+    def test_invalid_receipt_generation_keeps_a_carrier_without_feed_order(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        self.serve_invalid_receipt_generation(pruned=True)
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertNotContains(response, "settle_seq")
+        self.assertContains(response, "invalid settlement evidence")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+        self.assertIsNone(self.management.settle_evidence_error.get("settle_seq"))
+
+    def test_generation_admission_mismatch_names_its_carrier(self):
+        from ._adapter_http import make_response
+
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42, manual=True)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                generations = response.json()
+                generations[0]["digest"] = "b" * 64
+                return make_response(200, generations)
+            return response
+
+        self.adapter._handle = handle
+        self.assert_carrier_stall_banner()
+
+    def test_generation_validation_keeps_its_carrier_until_order_is_known(self):
+        from netbox_nso_plugin.apply_settlement import (
+            EvidenceInvariantError,
+            _carrier_job,
+            _validate_generation,
+            identify_evidence_stall,
+        )
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation, validate_terminal_generation
+        from netbox_nso_plugin.selection_receipts import _source_pairs
+
+        self.prepare()
+        generation = self.terminal()
+        generation["source_push_seq"] = {}
+        validators = (
+            _validate_generation,
+            _source_pairs,
+            lambda row: validate_terminal_generation(self.management, row, "placeholder-store"),
+            lambda row: settle_terminal_generation(self.management, row, "placeholder-store"),
+        )
+        for validate in validators:
+            with self.subTest(validate=validate, ordered=False):
+                with self.assertRaises(EvidenceInvariantError) as caught:
+                    validate(generation)
+                error = getattr(caught.exception, "invalid_job", None)
+                self.assertIsNotNone(error)
+                self.assertEqual(error.job_id, 501)
+                self.assertIsNone(error.settle_seq)
+            with self.subTest(validate=validate, ordered=True):
+                job = _carrier_job(self.management.adapter_device_id, 501, {501: 42})
+                preceding = {**job, "id": 500, "settle_seq": 41}
+                with self.assertRaises(EvidenceInvariantError) as caught:
+                    with identify_evidence_stall(job, "placeholder-store"):
+                        with identify_evidence_stall(preceding, "placeholder-store"):
+                            validate(generation)
+                error = caught.exception.invalid_job
+                self.assertEqual(error.job_id, 501)
+                self.assertEqual(error.settle_seq, 42)
+                self.assertEqual(error.device_id, self.management.adapter_device_id)
+                self.assertEqual(error.store_incarnation, "placeholder-store")
+                with self.assertRaises(EvidenceInvariantError) as caught:
+                    with identify_evidence_stall(job, "placeholder-store"):
+                        validate({**generation, "carrier_job_id": None})
+                self.assertEqual(caught.exception.invalid_job.job_id, 501)
+                self.assertEqual(caught.exception.invalid_job.settle_seq, 42)
+
     def test_invalid_head_admission_names_its_carrier(self):
         from ._adapter_http import make_response
 

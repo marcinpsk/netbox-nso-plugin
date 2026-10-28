@@ -10,7 +10,14 @@ from django.utils import timezone
 
 from . import delivery, refusal_contract
 from . import durable_capture as capture
-from .apply_settlement import EvidenceInvariantError, _carrier_job, _parse_time, identify_evidence_stall
+from .apply_settlement import (
+    EvidenceInvariantError,
+    _carrier_job,
+    _parse_time,
+    _validate_generation,
+    identify_evidence_stall,
+    identify_generation_stall,
+)
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
 from .refusal_registry import OVERLAYS
 
@@ -294,16 +301,20 @@ def validate_terminal_generation(
     management, generation, store_incarnation, *, attempt=None, authorities=None, receipt_recoveries=None
 ):
     """Prove complete ownership without binding selections or writing overlays."""
-    try:
-        return _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
-    except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
-        code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
-        _record_invariant(management, generation, store_incarnation, attempt, code)
-        raise EvidenceInvariantError(code) from exc
+    with identify_generation_stall(generation):
+        try:
+            return _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
+        except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
+            code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
+            _record_invariant(management, generation, store_incarnation, attempt, code)
+            error = EvidenceInvariantError(code)
+            if hasattr(exc, "invalid_job"):
+                error.invalid_job = exc.invalid_job
+            raise error from exc
 
 
 def _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries):
-    refusal_contract.validate_generation(generation)
+    _validate_generation(generation)
     _require(isinstance(store_incarnation, str) and 0 < len(store_incarnation) <= 64, "missing_store_incarnation")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
         return None
@@ -321,11 +332,12 @@ def settle_terminal_generation(
     management, generation, store_incarnation, *, attempt=None, settle_seq=None, mode="networked"
 ):
     """Validate a complete terminal batch, then commit owner CAS decisions together."""
-    try:
-        refusal_contract.validate_generation(generation)
-    except refusal_contract.ContractError as exc:
-        _record_invariant(management, generation, store_incarnation, attempt, "invalid_terminal_batch")
-        raise EvidenceInvariantError("invalid_terminal_batch") from exc
+    with identify_generation_stall(generation, settle_seq=settle_seq):
+        try:
+            _validate_generation(generation)
+        except EvidenceInvariantError:
+            _record_invariant(management, generation, store_incarnation, attempt, "invalid_terminal_batch")
+            raise
     return settle_terminal_generations(
         management,
         [generation],
@@ -342,7 +354,7 @@ def _validated_carrier_authorities(adapter_device_id, generations, incarnation, 
         carrier_id = generation.get("carrier_job_id") if isinstance(generation, dict) else None
         job = _carrier_job(adapter_device_id, carrier_id, sequences)
         with identify_evidence_stall(job, incarnation):
-            refusal_contract.validate_generation(generation)
+            _validate_generation(generation)
             groups.setdefault(carrier_id, []).append(generation)
             authorities.setdefault(carrier_id, {})[generation["generation_id"]] = generation
     for carrier_id, group in groups.items():
@@ -445,7 +457,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
     from .lifecycle_fence import authoritative_bookkeeping, fence_for
     from .models import NSODeviceManagement
 
-    refusal_contract.validate_generation(generation)
+    _validate_generation(generation)
     _require(isinstance(incarnation, str) and 0 < len(incarnation) <= 64, "missing_store_incarnation")
     _require(settle_seq is None or type(settle_seq) is int and settle_seq > 0, "invalid_settlement_sequence")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:

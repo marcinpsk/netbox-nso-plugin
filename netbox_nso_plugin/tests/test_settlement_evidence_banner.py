@@ -112,6 +112,27 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
             {"job_id": 502, "settle_seq": 41, "reason": "invalid settlement evidence"},
         )
 
+    def test_current_ordering_failure_at_the_cursor_keeps_a_rendered_banner(self):
+        mirror_update(
+            self.management,
+            settle_cursor_seq=42,
+            settle_cursor_device_id=self.management.adapter_device_id,
+            settle_cursor_incarnation="placeholder-store-a",
+        )
+        first = self.job(kind="sync", status="succeeded")
+        self.serve_feed([first, {**first, "id": 502, "settle_seq": 43}])
+        for _retry in range(2):
+            self.assertTrue(consume_static_route_settlements(self.management).stalled)
+            response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+            self.assertContains(response, "Settlement is paused", count=1)
+            self.assertContains(response, "Adapter job 501")
+            self.assertContains(response, "settle_seq 42")
+            self.assertContains(response, "invalid settlement evidence")
+            self.management.refresh_from_db()
+            self.assertEqual(self.management.settle_cursor_seq, 42)
+            self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+            self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
+
     def test_first_invalid_response_from_a_new_store_remains_visible(self):
         mirror_update(
             self.management,

@@ -105,21 +105,27 @@ def _invalid_evidence_stall(management, epoch, cursor_epoch, error):
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
-        identified = (
-            type(error.job_id) is int and error.job_id > 0 and type(error.settle_seq) is int and error.settle_seq > 0
-        )
+        identified = type(error.job_id) is int and error.job_id > 0
+        sequence_known = type(error.settle_seq) is int and error.settle_seq > 0
         identity_valid = (
             mapping_epoch(row) == epoch
             and (row.settle_cursor_device_id, row.settle_cursor_incarnation) == cursor_epoch[:2]
             and type(error.device_id) is int
             and error.device_id == row.adapter_device_id
-            and (identified or error.job_id is None and error.settle_seq is None)
-            and (identified or row.settle_cursor_seq == cursor_epoch[2])
+            and (
+                identified
+                and (sequence_known or error.settle_seq is None)
+                or error.job_id is None
+                and error.settle_seq is None
+            )
+            and (sequence_known or row.settle_cursor_seq == cursor_epoch[2])
             and bool(error.store_incarnation)
         )
         already_consumed = (
             identity_valid
             and identified
+            and sequence_known
+            and row.settle_cursor_seq != cursor_epoch[2]
             and row.settle_cursor_device_id == error.device_id
             and row.settle_cursor_incarnation == error.store_incarnation
             and (row.settle_cursor_seq or 0) >= error.settle_seq
@@ -133,7 +139,9 @@ def _invalid_evidence_stall(management, epoch, cursor_epoch, error):
                 "cursor_incarnation": cursor_epoch[1],
             }
             if identified:
-                issue.update(job_id=error.job_id, settle_seq=error.settle_seq)
+                issue["job_id"] = error.job_id
+            if sequence_known:
+                issue["settle_seq"] = error.settle_seq
             with suppress_intent_push(), mirror_refresh(row, ("settle_evidence_error",)) as locked:
                 locked.settle_evidence_error = issue
                 locked.save(update_fields=("settle_evidence_error",))

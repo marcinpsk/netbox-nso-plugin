@@ -355,7 +355,7 @@
     <div class="alert alert-warning" role="alert">
       {% if settlement_stall.job_id %}
         <strong>Settlement is paused.</strong>
-        Adapter job {{ settlement_stall.job_id }}, settle_seq {{ settlement_stall.settle_seq }}:
+        Adapter job {{ settlement_stall.job_id }}{% if settlement_stall.settle_seq %}, settle_seq {{ settlement_stall.settle_seq }}{% endif %}:
         {{ settlement_stall.reason }}.
       {% else %}
         <strong>Settlement is paused: {{ settlement_stall.reason }}.</strong>
