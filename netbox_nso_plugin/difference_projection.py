@@ -9,6 +9,8 @@ from .comparison_values import (
     _normalized,
     _values,
     inherit_parent_dependencies,
+    observed_collection,
+    observed_items,
     observed_value,
 )
 from .ownership_planner import _NATIVE_BINDING_BUILDERS, _native_binding, converted_scope_rules, device_interfaces
@@ -459,7 +461,7 @@ def _lag_device(document, interfaces):
     from .lacp_reconciler import lacp_bundle_values, lacp_member_values
 
     entries = []
-    for bundle in document["bundles"] or []:
+    for bundle in observed_items(document, "bundles"):
         name = bundle["name"]
         entries.append(
             ProjectedEntry(
@@ -468,9 +470,7 @@ def _lag_device(document, interfaces):
                 (interfaces.get(name),),
             )
         )
-        if observed_value(bundle, "member") is MISSING or bundle["member"] is None:
-            continue
-        for member in bundle["member"]:
+        for member in observed_items(bundle, "member"):
             entries.append(
                 ProjectedEntry(
                     ("member", member["interface_name"]),
@@ -486,12 +486,12 @@ def _l2_device(document, interfaces):
     from .l2_service_reconciler import _validated_l2_services, l2_sap_values
 
     entries = []
-    for service in document["services"] or []:
-        if service.get("saps") is None or "saps" not in service.get("present", []):
+    for service in observed_items(document, "services"):
+        if observed_collection(service, "saps") is MISSING:
             entries.append(ProjectedEntry((service["service_name"],), {}, reason="service SAP coverage is unavailable"))
             continue
         entries.append(ProjectedEntry((service["service_name"],), {}, coverage_only=True))
-        for sap in service["saps"]:
+        for sap in observed_items(service, "saps"):
             try:
                 _validated_l2_services({"services": [{**service, "saps": [sap]}]})
             except AdapterError as exc:
@@ -519,7 +519,7 @@ def _snmp_device(document):
     from .vault_refs import is_secret_fingerprint
 
     entries = []
-    for item in document["communities"] or []:
+    for item in observed_items(document, "communities"):
         if not is_secret_fingerprint(item["name"]):
             entries.append(ProjectedEntry(("community", ""), {}, reason="invalid community fingerprint"))
             continue
@@ -529,7 +529,7 @@ def _snmp_device(document):
                 {**_normalized(item, snmp_community_values(item)), "secret": item["name"]},
             )
         )
-    for item in document["users"] or []:
+    for item in observed_items(document, "users"):
         entries.append(
             ProjectedEntry(
                 ("user", item["username"]),
@@ -540,7 +540,7 @@ def _snmp_device(document):
                 },
             )
         )
-    for item in document["hosts"] or []:
+    for item in observed_items(document, "hosts"):
         normalized = snmp_host_values({**item, "username": item.get("user")})
         normalized["user"] = normalized.pop("username")
         normalized.pop("community_hash")
@@ -558,7 +558,7 @@ def _logging_device(document, ned_id):
     from .template_content import _canonical_logging_field, logging_host_values, logging_level_values
 
     entries = []
-    for item in document["hosts"] or []:
+    for item in observed_items(document, "hosts"):
         values = _normalized(item, logging_host_values(item))
         for name, value in values.items():
             if value is not MISSING:
@@ -646,9 +646,9 @@ def device_entries(scope, management, snapshot, *, ned_id="", native_items=()):
 
         from .template_content import interface_ip_vrf_candidates_by_name
 
-        names = sorted({item["vrf"] for item in document[collection] or [] if item.get("vrf")})
+        names = sorted({item["vrf"] for item in observed_items(document, collection) if item.get("vrf")})
         vrfs_by_name = interface_ip_vrf_candidates_by_name(VRF, names)
-    for item in document[collection] or []:
+    for item in observed_items(document, collection):
         try:
             if scope == "vlan":
                 normalized = _validated_vlan_items({"vlans": [item]})[0]

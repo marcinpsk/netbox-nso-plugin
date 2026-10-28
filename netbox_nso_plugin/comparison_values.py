@@ -32,6 +32,21 @@ def observed_value(item, name):
     return item.get(name, MISSING)
 
 
+def observed_collection(item, name):
+    """Return a covered collection, or MISSING when its emptiness is unknown."""
+    if name not in item.get("present", ()):
+        return MISSING
+    value = item.get(name, MISSING)
+    return MISSING if value is None else value
+
+
+def observed_items(item, name):
+    """Traverse covered items; callers must report gaps before comparing membership."""
+    collection = observed_collection(item, name)
+    if collection is not MISSING:
+        yield from collection
+
+
 def _values(item, names):
     return {name: observed_value(item, name) for name in names}
 

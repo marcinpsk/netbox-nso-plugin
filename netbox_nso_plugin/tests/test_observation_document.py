@@ -24,17 +24,17 @@ def _observation():
         "family": "interface_attributes",
         "revision": 3,
         "source_epoch": 2,
-        "digest": "52155b66596db46cc9f022b1889b53ee59f70c0a0e619c6e0e46c735fa908b95",
+        "digest": "3960438c7e71c62e4ebcc2a43bff1941fd05dde3bbc7a5714b808df8bbda2e9b",
         "observed_at": "2026-10-01T12:00:00+00:00",
         "coverage": {"attributes": ["description", "enabled"]},
-        "document": {"interfaces": [], "unprojectable": []},
+        "document": {"interfaces": [], "present": ["interfaces"], "unprojectable": []},
     }
 
 
 def test_authoritative_empty_is_valid_and_has_an_aware_timestamp():
     validator = _validator()
     defaults = validator.observation_defaults("interface_attributes", 3, 2, _observation())
-    assert defaults["document"] == {"interfaces": [], "unprojectable": []}
+    assert defaults["document"] == {"interfaces": [], "present": ["interfaces"], "unprojectable": []}
     assert defaults["observed_at"].utcoffset().total_seconds() == 0
 
 
@@ -51,14 +51,22 @@ def test_authoritative_empty_is_valid_and_has_an_aware_timestamp():
         ("coverage", {"attributes": [False]}),
         ("revision", True),
         ("document", None),
-        ("document", {"interfaces": [{"name": None}], "unprojectable": []}),
-        ("document", {"interfaces": [], "unprojectable": [{"index": True, "reason": "missing name"}]}),
+        ("document", {"interfaces": [{"name": None}], "present": ["interfaces"], "unprojectable": []}),
+        (
+            "document",
+            {"interfaces": [], "present": ["interfaces"], "unprojectable": [{"index": True, "reason": "missing name"}]},
+        ),
     ],
 )
 def test_invalid_observation_is_a_protocol_error(field, value):
     validator = _validator()
     snapshot = _observation()
     snapshot[field] = value
+    if field == "document" and value is not None:
+        # A matching digest leaves the invalid value as the only failure cause.
+        snapshot["digest"] = hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
     with pytest.raises(validator.ObservationProtocolError):
         validator.observation_defaults("interface_attributes", 3, 2, snapshot)
 
@@ -98,7 +106,7 @@ def test_ip_authoritative_empty_uses_the_same_canonical_digest():
     snapshot["family"] = "interface_ip"
     snapshot["coverage"] = {"attributes": ["address", "prefix_length", "secondary", "vrf"]}
     defaults = validator.observation_defaults("interface_ip", 3, 2, snapshot)
-    assert defaults["digest"] == "52155b66596db46cc9f022b1889b53ee59f70c0a0e619c6e0e46c735fa908b95"
+    assert defaults["digest"] == "3960438c7e71c62e4ebcc2a43bff1941fd05dde3bbc7a5714b808df8bbda2e9b"
 
 
 @pytest.mark.parametrize("field", ["revision", "source_epoch"])

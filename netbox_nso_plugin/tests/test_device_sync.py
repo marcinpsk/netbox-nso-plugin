@@ -79,7 +79,9 @@ class SyncCase(IntentPushResetMixin, TestCase):
             }
             for item in interfaces
         ]
-        transport.documents["interface-ips"]["interfaces"] = list(ips)
+        transport.documents["interface-ips"]["interfaces"] = [
+            {key: value for key, value in item.items() if key != "present"} for item in ips
+        ]
         return transport
 
     def preview(self, transport, data):

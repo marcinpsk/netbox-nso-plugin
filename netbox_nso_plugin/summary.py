@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from .families import AGGREGATION_ORDER
+
 
 def matches_device_value(attribute, netbox_value, nso_value):
     """Return True if a NetBox attribute value equals the device (NSO) value.
@@ -259,17 +261,7 @@ _RS_ADMIT_RESULTS = ("replaced", "cleared")
 
 #: worst-first merge order for a category's family display states (D8 + the two
 #: pending states). Healthy renders NO chip, so it never appears here.
-_CHIP_SEVERITY = (
-    "reset_pending",
-    "unavailable",
-    "unknown",
-    "unproven",
-    "stale",
-    "aged",
-    "refresh_pending",
-    "not_authoritative",
-    "unsupported",
-)
+_CHIP_SEVERITY = tuple(state for state in AGGREGATION_ORDER if state != "healthy")
 
 #: D10 render matrix — css classes only from the approved palette (never bg-secondary).
 _CHIP_RENDER = {
@@ -282,6 +274,11 @@ _CHIP_RENDER = {
         "css": "text-bg-danger",
         "label": "NSO read unavailable — last-known data",
         "tip": "The newest declared read for this category failed (export down / read error / not ready) or its materialization errored. Rows show the last successful read.",
+    },
+    "not_covered": {
+        "css": "text-bg-danger",
+        "label": "NSO collections unavailable, last-known data",
+        "tip": "NSO did not report every collection for this category. The plugin keeps the last certified data and does not import from this read.",
     },
     "unknown": {
         "css": "text-bg-danger",
@@ -336,7 +333,7 @@ def _family_read_display(row, adopted_incarnation: str) -> str | None:
         return None
     outcome, reason = row.observed_outcome, row.observed_reason
     if outcome == "unavailable":
-        if reason in ("not_authoritative", "unsupported"):
+        if reason in ("not_authoritative", "unsupported", "not_covered"):
             return reason
         if reason in ("export_down", "read_error", "not_ready"):
             return "unavailable"

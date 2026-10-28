@@ -8,6 +8,24 @@ import json
 
 from ._scope_observation_case import entry
 
+
+def redistribution_components(components):
+    """Build all protocol partitions from the inventories a fixture observed."""
+    components = copy.deepcopy(components)
+    for component in components:
+        explicit = "status" in component
+        component.setdefault("status", "covered" if component["inventory"] is not None else "unavailable")
+        if not explicit and component["status"] == "unavailable":
+            component["present"] = []
+    reported = {component.get("protocol") for component in components}
+    components.extend(
+        {"protocol": protocol, "status": "unavailable", "inventory": None, "present": []}
+        for protocol in ("bgp", "isis", "ospf")
+        if protocol not in reported
+    )
+    return components
+
+
 DOCUMENTS = {
     "bgp": {
         "routers": [
@@ -31,7 +49,7 @@ DOCUMENTS = {
                                 ],
                             )
                         ],
-                        peer_group=[entry(name="EXAMPLE", remote_as="64513")],
+                        peer_group=[entry(name="EXAMPLE", remote_as="64513", peer_group_address_family=[])],
                     )
                 ],
             )
@@ -46,11 +64,24 @@ DOCUMENTS = {
                 area_auth_key_present=True,
                 flex_algo=[entry(algo_id=128, metric_type="igp", priority=100)],
                 level=[entry(level=2, default_metric=10)],
+                setting=[],
+                srv6_locator=[],
+                segment_routing=None,
+                segment_routing_reported=True,
+                segment_routing_configured=False,
             )
         ],
         "interfaces": [
             entry(
-                interface_name="Ethernet1", af="ipv4", process_tag="0", circuit_type="level-2", metric=10, passive=False
+                interface_name="Ethernet1",
+                af="ipv4",
+                process_tag="0",
+                circuit_type="level-2",
+                metric=10,
+                passive=False,
+                setting=[],
+                level=[],
+                prefix_sid=[],
             )
         ],
     },
@@ -145,6 +176,8 @@ for family, document in DOCUMENTS.items():
     if family != "redistribution":
         document["present"] = sorted(document)
     document["unprojectable"] = []
+    if family == "redistribution":
+        document["components"] = redistribution_components(document["components"])
 
 COVERAGE = {
     "bgp": [
@@ -334,7 +367,21 @@ def route_policy_document(payload):
         document[key] = [
             entry(
                 **{name: value for name, value in policy.items() if name != "entries"},
-                entry=[entry(**values) for values in policy["entries"]],
+                entry=[
+                    entry(
+                        **(
+                            {
+                                "match_prefix_lists": [],
+                                "match_community_lists": [],
+                                "match_as_paths": [],
+                            }
+                            if key == "route_maps"
+                            else {}
+                        )
+                        | values
+                    )
+                    for values in policy["entries"]
+                ],
             )
             for policy in payload.get(key, [])
         ]
@@ -343,6 +390,9 @@ def route_policy_document(payload):
 
 def routing_observation(family, *, document=None, coverage=None, revision=1, source_epoch=1):
     document = copy.deepcopy(DOCUMENTS[family] if document is None else document)
+    explicit_components = family == "redistribution" and all(
+        "status" in component for component in document["components"]
+    )
     if coverage is None:
         coverage = {"attributes": list(COVERAGE[family])}
         credentials = {
@@ -355,6 +405,16 @@ def routing_observation(family, *, document=None, coverage=None, revision=1, sou
             coverage["components"] = [
                 {"protocol": "ospf", "destinations": ["1"], "sources": [{"protocol": "bgp", "reference": "64512"}]}
             ]
+    if family == "redistribution":
+        document["components"] = redistribution_components(document["components"])
+        covered = {
+            component.get("protocol") for component in document["components"] if component["status"] == "covered"
+        }
+        if not explicit_components:
+            coverage = {
+                **coverage,
+                "components": [component for component in coverage["components"] if component["protocol"] in covered],
+            }
     return {
         "family": family,
         "revision": revision,
@@ -364,3 +424,51 @@ def routing_observation(family, *, document=None, coverage=None, revision=1, sou
         "coverage": copy.deepcopy(coverage),
         "document": document,
     }
+
+
+def redistribution_read_payload(payload):
+    """State full protocol coverage for tests of the mirror collection consumer."""
+    return {
+        **payload,
+        "observation": routing_observation(
+            "redistribution",
+            document={
+                "entries": [],
+                "components": [
+                    {"protocol": protocol, "status": "covered", "inventory": [], "present": ["inventory"]}
+                    for protocol in ("bgp", "isis", "ospf")
+                ],
+                "unprojectable": [],
+            },
+            coverage={
+                "attributes": list(COVERAGE["redistribution"]),
+                "components": [
+                    {"protocol": protocol, "destinations": [], "sources": []} for protocol in ("bgp", "isis", "ospf")
+                ],
+            },
+        ),
+    }
+
+
+def store_redistribution_observation(management):
+    """Store certified protocol coverage for tests of ownership after a completed read."""
+    from netbox_nso_plugin.models import NSOFamilyObservation, NSOFamilyReadState
+    from netbox_nso_plugin.observations import observation_defaults
+
+    snapshot = redistribution_read_payload({"entries": []})["observation"]
+    state, _ = NSOFamilyReadState.objects.update_or_create(
+        management=management,
+        family="redistribution",
+        defaults={
+            "observed_outcome": "present",
+            "observed_result": "replaced",
+            "observed_succeeded": True,
+            "observed_attempt_id": 1,
+            "applied_attempt_id": 1,
+            "applied_source_epoch": 1,
+            "applied_payload_revision": 1,
+        },
+    )
+    NSOFamilyObservation.objects.update_or_create(
+        read_state=state, defaults=observation_defaults("redistribution", 1, 1, snapshot)
+    )

@@ -109,9 +109,12 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
     from vpn.models import L2VPN, L2VPNTermination
 
     from . import status_machine as sm
+    from .collection_coverage import require_collection_coverage
     from .models import NSODeviceManagement, NSOL2SapState
     from .renderer_writer import planned_save
 
+    if isinstance(payload, dict) and "observation" in payload:
+        require_collection_coverage("l2_service", payload["observation"])
     services = _validated_l2_services(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:

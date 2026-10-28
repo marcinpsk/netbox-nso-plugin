@@ -20,6 +20,7 @@ from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
 
 from ._outbox_case import ReceiptAdapter, entries, make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
+from ._routing_observation_case import redistribution_read_payload
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -195,16 +196,18 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         reconcile_redistribution(
             self.device,
-            {
-                "entries": [
-                    {
-                        "dest_protocol": "bgp",
-                        "dest_ref": "65123/placeholder-blue",
-                        "source_protocol": "connected",
-                        "source_ref": "",
-                    }
-                ]
-            },
+            redistribution_read_payload(
+                {
+                    "entries": [
+                        {
+                            "dest_protocol": "bgp",
+                            "dest_ref": "65123/placeholder-blue",
+                            "source_protocol": "connected",
+                            "source_ref": "",
+                        }
+                    ]
+                }
+            ),
         )
         return NSORedistributionState.objects.get(management=self.management, dest_ref="65123/placeholder-blue")
 
@@ -275,16 +278,18 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
         reconcile_redistribution(
             self.device,
-            {
-                "entries": [
-                    {
-                        "dest_protocol": "bgp",
-                        "dest_ref": state.dest_ref,
-                        "source_protocol": "connected",
-                        "source_ref": "",
-                    }
-                ]
-            },
+            redistribution_read_payload(
+                {
+                    "entries": [
+                        {
+                            "dest_protocol": "bgp",
+                            "dest_ref": state.dest_ref,
+                            "source_protocol": "connected",
+                            "source_ref": "",
+                        }
+                    ]
+                }
+            ),
         )
         payload = self.payload()
         self.assertIsInstance(payload, list)

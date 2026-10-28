@@ -3275,3 +3275,21 @@ class NSOProvisionLinkRoleView:
     def parse_checked_identity(self, raw):
         # ok: nso-request-identity-isdigit
         return parse_object_id(raw)
+
+
+def observation_collection_defaults(document, snapshot, intent):
+    # ruleid: nso-observation-collection-empty-default
+    routers = document.get("routers") or []
+    # ruleid: nso-observation-collection-empty-default
+    policies = snapshot.document.get("prefix_lists", [])
+    # ruleid: nso-observation-collection-empty-default
+    routes = document.get("routes") or []
+    # ruleid: nso-observation-collection-empty-default
+    hosts = snapshot.document.get("hosts", [])
+    # ruleid: nso-observation-collection-empty-default
+    vlans, users, communities = document.get("vlans", []), document.get("users") or [], document.get("communities", [])
+    # ok: nso-observation-collection-empty-default
+    desired = intent.get("routers") or []
+    # ok: nso-observation-collection-empty-default
+    observed = observed_collection(document, "routers")
+    return routers, policies, routes, hosts, vlans, users, communities, desired, observed

@@ -100,6 +100,20 @@ def test_redistribution_requires_per_component_coverage():
         observation_defaults("redistribution", 1, 1, observed)
 
 
+@pytest.mark.parametrize("disagreement", ["unavailable_claimed", "covered_omitted", "duplicate_component"])
+def test_redistribution_component_status_must_agree_with_coverage(disagreement):
+    observed = routing_observation("redistribution")
+    if disagreement == "unavailable_claimed":
+        observed["coverage"]["components"].append({"protocol": "bgp", "destinations": [], "sources": []})
+    elif disagreement == "covered_omitted":
+        observed["coverage"]["components"] = []
+    else:
+        observed["document"]["components"].append(copy.deepcopy(observed["document"]["components"][0]))
+        observed = routing_observation("redistribution", document=observed["document"], coverage=observed["coverage"])
+    with pytest.raises(ObservationProtocolError):
+        observation_defaults("redistribution", 1, 1, observed)
+
+
 def test_every_read_family_has_an_observation_schema():
     from netbox_nso_plugin.families import ALL_FAMILY_KEYS
     from netbox_nso_plugin.observations import OBSERVATION_SCHEMAS

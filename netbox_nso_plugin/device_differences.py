@@ -66,6 +66,8 @@ def _visible_pks(model, user, objects):
 def _interface_rows(spec, management, snapshot, user):
     from dcim.models import Interface
 
+    if gaps := _scope_component_gaps(spec, snapshot):
+        return [Difference(spec.scope, "unavailable", attribute=name, reason=reason) for name, reason in gaps.items()]
     attributes = [
         projection
         for projection in spec.attributes
@@ -152,13 +154,31 @@ def _without_vrf(observed):
     return {**observed, "vrf": None}
 
 
-def _ip_device_index(spec, snapshot, interfaces, user):
+def _ip_address_gaps(snapshot, interfaces):
+    from .template_content import resolve_interface_ip_interface
+
+    gaps = {}
+    for entry in snapshot.document["interfaces"]:
+        if entry["addresses"] is not None and "addresses" in entry["present"]:
+            continue
+        interface = resolve_interface_ip_interface(interfaces, entry["interface"], entry["bound_port"])
+        name = interface.name if interface is not None else entry["interface"]
+        gaps[name] = "interface addresses were not observed"
+    return gaps
+
+
+def _ip_device_index(spec, snapshot, interfaces, user, gaps):
     from ipam.models import VRF
 
     from .template_content import interface_ip_vrf_candidates_by_name
 
     device = defaultdict(list)
-    names = {address["vrf"] for entry in snapshot.document["interfaces"] for address in entry["addresses"]}
+    covered_entries = [
+        entry
+        for entry in snapshot.document["interfaces"]
+        if entry["addresses"] is not None and "addresses" in entry["present"]
+    ]
+    names = {address["vrf"] for entry in covered_entries for address in entry["addresses"]}
     # Match names over every VRF so keys stay true; rows that depend on a hidden VRF are redacted.
     vrfs = interface_ip_vrf_candidates_by_name(VRF, sorted(name for name in names if name))
     every_vrf = [vrf for candidates in vrfs.values() for vrf in candidates]
@@ -166,7 +186,7 @@ def _ip_device_index(spec, snapshot, interfaces, user):
     vrfs[None] = vrfs[""] = []
     rows = []
     blocked = set()
-    for entry in snapshot.document["interfaces"]:
+    for entry in covered_entries:
         for address in entry["addresses"]:
             try:
                 item = _device_ip_projection(entry, address, interfaces)
@@ -176,6 +196,8 @@ def _ip_device_index(spec, snapshot, interfaces, user):
                         spec.scope, "ambiguous", entry["interface"], device_value=address, reason="invalid address"
                     )
                 )
+                continue
+            if item["interface"] in gaps:
                 continue
             name = address["vrf"]
             if len(vrfs[name]) > 1:
@@ -244,10 +266,19 @@ def _ip_rows(spec, management, snapshot, user):
     from dcim.models import Interface
     from ipam.models import VRF, IPAddress
 
+    if gaps := _scope_component_gaps(spec, snapshot):
+        return [Difference(spec.scope, "unavailable", attribute=name, reason=reason) for name, reason in gaps.items()]
     interfaces = {interface.pk: interface for interface in device_interfaces(management)}
+    by_name = {interface.name: interface for interface in interfaces.values()}
+    gaps = _ip_address_gaps(snapshot, by_name)
     visible_interfaces = _visible_pks(Interface, user, interfaces.values())
-    device, rows, blocked, hidden_vrfs = _ip_device_index(
-        spec, snapshot, {interface.name: interface for interface in interfaces.values()}, user
+    device, rows, blocked, hidden_vrfs = _ip_device_index(spec, snapshot, by_name, user, gaps)
+    hidden_names = {interface.name for interface in interfaces.values() if interface.pk not in visible_interfaces}
+    rows.extend(
+        Difference(spec.scope, "ambiguous", reason=NOT_VISIBLE)
+        if name in hidden_names
+        else Difference(spec.scope, "unavailable", name, "addresses", reason=reason)
+        for name, reason in sorted(gaps.items())
     )
     native = defaultdict(list)
     hidden = set()
@@ -280,7 +311,7 @@ def _ip_rows(spec, management, snapshot, user):
             item = (device[key] or native[key])[0]
             item = _without_vrf(item) if key[2] in hidden_vrfs else item
             rows.append(Difference(spec.scope, "ambiguous", spec.identity(item), reason=NOT_VISIBLE))
-        elif key not in blocked:
+        elif key not in blocked and key[0] not in gaps:
             host_vrf = (key[1], key[2])
             rows.extend(_ip_group_rows(spec, native[key], device[key], candidates[host_vrf], device_counts[host_vrf]))
     return rows
@@ -322,9 +353,10 @@ def _entry_component(spec, item):
 
 def _scope_component_gaps(spec, snapshot):
     if spec.scope == "redistribution":
+        from .redistribution_coverage import refresh_is_unavailable
         from .routing_protocol_projection import component_gaps
 
-        return component_gaps(snapshot)
+        return component_gaps(snapshot, read_unavailable=refresh_is_unavailable(snapshot))
     gaps = {}
     for name in spec.components:
         if name != "system" and name not in snapshot.document["present"]:
@@ -548,6 +580,7 @@ SCOPE_SPECS = {
         ),
         _interface_blockers,
         _interface_rows,
+        ("interfaces",),
     ),
     "ip": ScopeSpec(
         "ip",
@@ -563,6 +596,7 @@ SCOPE_SPECS = {
         ),
         _ip_blockers,
         _ip_rows,
+        ("interfaces",),
     ),
 }
 

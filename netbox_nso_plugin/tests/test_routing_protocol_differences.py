@@ -515,7 +515,7 @@ class TestRoutingProtocolDifferences(TestCase):
         self._snapshot("redistribution", document, self._redist_coverage())
         self.assertTrue(all(row.kind == "unavailable" for row in self._rows("redistribution")))
 
-    def test_redistribution_missing_destination_collection_names_the_collection(self):
+    def test_redistribution_missing_destination_collection_makes_the_component_unavailable(self):
         inventories = {
             "isis": [{"process_tag": "CORE", "present": ["process_tag"]}],
             "ospf": [{"process_id": "10", "vrf": "", "present": ["process_id", "vrf"]}],
@@ -532,7 +532,7 @@ class TestRoutingProtocolDifferences(TestCase):
                 document = self._redist_document([], protocol=protocol, inventory=inventory)
                 self._snapshot("redistribution", document, self._redist_coverage(protocol))
                 self.assertIn(
-                    ("unavailable", "redistribute", "redistribute collection was not reported"),
+                    ("unavailable", protocol, "redistribution component is unavailable"),
                     [(row.kind, row.attribute, row.reason) for row in self._rows("redistribution")],
                 )
 
@@ -907,7 +907,10 @@ class TestRoutingProtocolDifferences(TestCase):
         self._snapshot("redistribution", self._redist_document([], inventory=inventory), self._redist_coverage())
         rows = self._rows("redistribution")
         self.assertNotIn("example-hidden-process", repr(rows))
-        self.assertTrue(any(row.kind == "ambiguous" for row in rows))
+        self.assertEqual(
+            [(row.kind, row.attribute) for row in rows],
+            [("unavailable", "bgp"), ("unavailable", "isis"), ("unavailable", "ospf")],
+        )
 
     def test_malformed_ospf_overlay_area_association_is_ambiguous(self):
         from netbox_nso_plugin.models import NSOOSPFInstanceState

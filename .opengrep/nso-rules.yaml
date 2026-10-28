@@ -1,6 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-observation-collection-empty-default
+    languages: [python]
+    severity: ERROR
+    message: Read observation collections through observed_collection or observed_items and report unknown coverage.
+    patterns:
+      - pattern-either:
+          - pattern: $DOCUMENT.get($COLLECTION) or []
+          - pattern: $DOCUMENT.get($COLLECTION, [])
+      - metavariable-regex:
+          metavariable: $DOCUMENT
+          regex: '^(?:document|snapshot\.document)$'
+      - metavariable-regex:
+          metavariable: $COLLECTION
+          regex: '^["''](?:routers|processes|interfaces|instances|prefix_lists|community_lists|as_paths|route_maps|services|bundles|communities|users|hosts|routes|vlans)["'']$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]
   - id: nso-row-error-projection-bypass
     languages: [python]
     severity: ERROR

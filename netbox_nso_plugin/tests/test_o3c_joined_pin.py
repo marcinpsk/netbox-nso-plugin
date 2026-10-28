@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "14d4668cb289e7d4cf085a430279a1268d08905050335213c72bb77b8ba09fea"
+_ADAPTER_RUNTIME_DIGEST = "882ef5fd9adfcea5ed5d3afa9b229f65bf153035993d0a48cc1b07d48332abce"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -183,7 +183,9 @@ class _RestconfState:
     def device_section(self, device_name: str) -> dict:
         with self.lock:
             routes = [dict(route) for route in self.device.get(device_name, [])]
-        return {"status": "ok", "route": routes}
+        manifest = json.loads((_ADAPTER_ROOT / "nso_adapter/nso/collection_manifest.json").read_text(encoding="utf-8"))
+        collections = manifest["families"]["static-route"]["collections"]
+        return {"status": "ok", "route": routes, manifest["marker"]: list(collections)}
 
     def plugin_callback_bodies(self, path: str) -> list[dict]:
         with self.lock:
@@ -406,7 +408,12 @@ class _O3CEnvironment:
     @staticmethod
     def _runtime_digest() -> str:
         files = [
-            *(_ADAPTER_ROOT / "nso_adapter").rglob("*.py"),
+            # Every package file: the runtime also reads data files such as collection_manifest.json.
+            *(
+                path
+                for path in (_ADAPTER_ROOT / "nso_adapter").rglob("*")
+                if path.is_file() and path.suffix != ".pyc" and "__pycache__" not in path.parts
+            ),
             *(_ADAPTER_ROOT / "alembic").rglob("*.py"),
             *(
                 _ADAPTER_ROOT / name
@@ -1085,6 +1092,30 @@ class TestO3CJoinedPinUvVersion(SimpleTestCase):
         assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"setup-uv must pin an exact uv version, got {version!r}"
         # uv rejects --system-certs before 0.11.0.
         assert tuple(int(part) for part in version.split(".")) >= (0, 11, 0)
+
+
+class TestO3CRuntimeDigest(SimpleTestCase):
+    def test_the_digest_covers_package_data_files_and_ignores_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("scripts/docker-entrypoint.sh", "alembic.ini", "pyproject.toml", "uv.lock", "alembic/env.py"):
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(name, encoding="utf-8")
+            manifest = root / "nso_adapter/nso/collection_manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"marker": "covered-collections"}', encoding="utf-8")
+            bytecode = root / "nso_adapter/nso/__pycache__/collection_coverage.cpython-312.pyc"
+            bytecode.parent.mkdir()
+            bytecode.write_bytes(b"one")
+            legacy_bytecode = root / "nso_adapter/nso/collection_coverage.pyc"
+            legacy_bytecode.write_bytes(b"one")
+            with patch(f"{__name__}._ADAPTER_ROOT", root):
+                original = _O3CEnvironment._runtime_digest()
+                bytecode.write_bytes(b"two")
+                legacy_bytecode.write_bytes(b"two")
+                assert _O3CEnvironment._runtime_digest() == original
+                manifest.write_text('{"marker": "covered"}', encoding="utf-8")
+                assert _O3CEnvironment._runtime_digest() != original
 
 
 class TestO3CEnvironmentFailFast(SimpleTestCase):

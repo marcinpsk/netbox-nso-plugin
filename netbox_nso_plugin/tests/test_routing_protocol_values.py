@@ -108,20 +108,26 @@ def test_flex_algo_unknown_collection_is_not_authoritative_empty(null):
     process = {"process_tag": "CORE", "present": ["process_tag"]}
     if null:
         process.update(flex_algo=None, present=["process_tag", "flex_algo"])
-    snapshot = SimpleNamespace(document={"processes": [process], "interfaces": []})
+    snapshot = SimpleNamespace(
+        document={"processes": [process], "interfaces": [], "present": ["processes", "interfaces"]}
+    )
     assert list(nested_gaps("isis_flex_algo", snapshot)) == [(("process", "CORE", "flex_algo"), "")]
 
 
 def test_flex_algo_authoritative_empty_collection_has_no_gap():
     snapshot = SimpleNamespace(
-        document={"processes": [{"process_tag": "CORE", "flex_algo": [], "present": ["process_tag", "flex_algo"]}]}
+        document={
+            "processes": [{"process_tag": "CORE", "flex_algo": [], "present": ["process_tag", "flex_algo"]}],
+            "present": ["processes"],
+        }
     )
     assert nested_gaps("isis_flex_algo", snapshot) == {}
 
 
 def test_redistribution_coverage_is_per_component():
     snapshot = SimpleNamespace(
-        document={"components": [{"protocol": "ospf", "inventory": [], "present": ["inventory"]}]},
+        read_state=SimpleNamespace(observed_outcome=""),
+        document={"components": [{"status": "covered", "protocol": "ospf", "inventory": [], "present": ["inventory"]}]},
         coverage={"components": [{"protocol": "ospf", "destinations": [], "sources": []}]},
     )
     assert set(component_gaps(snapshot)) == {"bgp", "isis"}
@@ -129,18 +135,26 @@ def test_redistribution_coverage_is_per_component():
 
 @pytest.mark.parametrize("null", [False, True])
 def test_redistribution_inventory_presence_is_required_for_authority(null):
-    component = {"protocol": "ospf", "inventory": [], "present": []}
+    component = {"status": "covered", "protocol": "ospf", "inventory": [], "present": []}
     if null:
         component.update(inventory=None, present=["inventory"])
-    snapshot = SimpleNamespace(document={"components": [component]}, coverage={"components": [{"protocol": "ospf"}]})
+    snapshot = SimpleNamespace(
+        read_state=SimpleNamespace(observed_outcome=""),
+        document={"components": [component]},
+        coverage={"components": [{"protocol": "ospf"}]},
+    )
     assert set(component_gaps(snapshot)) == {"bgp", "isis", "ospf"}
 
 
 def test_redistribution_uncovered_inventory_cannot_emit_named_nested_gap():
+    from netbox_nso_plugin.observations import ObservationProtocolError
+
     snapshot = SimpleNamespace(
+        read_state=SimpleNamespace(observed_outcome=""),
         document={
             "components": [
                 {
+                    "status": "covered",
                     "protocol": "isis",
                     "inventory": [{"process_tag": "example-hidden", "present": ["process_tag"]}],
                     "present": ["inventory"],
@@ -149,14 +163,17 @@ def test_redistribution_uncovered_inventory_cannot_emit_named_nested_gap():
         },
         coverage={"components": []},
     )
-    assert nested_gaps("redistribution", snapshot) == {}
+    with pytest.raises(ObservationProtocolError):
+        nested_gaps("redistribution", snapshot)
 
 
-def test_redistribution_missing_sources_block_only_the_destination():
+def test_redistribution_missing_sources_block_the_component():
     snapshot = SimpleNamespace(
+        read_state=SimpleNamespace(observed_outcome=""),
         document={
             "components": [
                 {
+                    "status": "covered",
                     "protocol": "ospf",
                     "inventory": [{"process_id": "10", "vrf": "", "present": ["process_id", "vrf"]}],
                     "present": ["inventory"],
@@ -165,7 +182,8 @@ def test_redistribution_missing_sources_block_only_the_destination():
         },
         coverage={"components": [{"protocol": "ospf"}]},
     )
-    assert list(nested_gaps("redistribution", snapshot)) == [(("ospf", "10", ""), "redistribute")]
+    assert nested_gaps("redistribution", snapshot) == {}
+    assert component_gaps(snapshot)["ospf"] == "redistribution component is unavailable"
 
 
 def test_segment_routing_explicit_absence_is_authoritative():
@@ -204,6 +222,7 @@ def test_schema_valid_invalid_redistribution_inventory_fails_closed(asn):
         "entries": [],
         "components": [
             {
+                "status": "covered",
                 "protocol": "bgp",
                 "inventory": [{"asn": asn, "scope": [], "present": ["asn", "scope"]}],
                 "present": ["inventory"],
@@ -215,8 +234,10 @@ def test_schema_valid_invalid_redistribution_inventory_fails_closed(asn):
     validated = observation_defaults(
         "redistribution", 1, 1, routing_observation("redistribution", document=document, coverage=coverage)
     )
-    snapshot = SimpleNamespace(document=validated["document"], coverage=validated["coverage"])
-    assert _redist_coverage_entries(snapshot.document) == []
+    snapshot = SimpleNamespace(
+        read_state=SimpleNamespace(observed_outcome=""), document=validated["document"], coverage=validated["coverage"]
+    )
+    assert _redist_coverage_entries(snapshot.document, {"bgp"}) == []
     assert nested_gaps("redistribution", snapshot) == {}
     assert component_gaps(snapshot)["bgp"] == "redistribution inventory has an invalid AS number"
     rows = [
@@ -244,18 +265,18 @@ def test_schema_valid_anonymous_isis_process_uses_empty_tag():
     assert list(nested_gaps("isis_flex_algo", snapshot)) == [(("process", "", "flex_algo"), "")]
 
 
-def test_schema_valid_redistribution_component_without_protocol_fails_closed():
-    from netbox_nso_plugin.observations import observation_defaults
-    from netbox_nso_plugin.routing_protocol_projection import _redist_coverage_entries
+def test_redistribution_component_without_protocol_is_protocol_error():
+    from netbox_nso_plugin.observations import ObservationProtocolError, observation_defaults
 
     from ._routing_observation_case import routing_observation
 
-    document = {"entries": [], "components": [{"inventory": [], "present": ["inventory"]}], "unprojectable": []}
+    document = {
+        "entries": [],
+        "components": [{"status": "covered", "inventory": [], "present": ["inventory"]}],
+        "unprojectable": [],
+    }
     coverage = {"attributes": [], "components": [{"protocol": "bgp", "destinations": [], "sources": []}]}
-    validated = observation_defaults(
-        "redistribution", 1, 1, routing_observation("redistribution", document=document, coverage=coverage)
-    )
-    snapshot = SimpleNamespace(document=validated["document"], coverage=validated["coverage"])
-    assert set(component_gaps(snapshot)) == {"bgp", "isis", "ospf"}
-    assert _redist_coverage_entries(snapshot.document) == []
-    assert nested_gaps("redistribution", snapshot) == {}
+    with pytest.raises(ObservationProtocolError):
+        observation_defaults(
+            "redistribution", 1, 1, routing_observation("redistribution", document=document, coverage=coverage)
+        )
