@@ -5,6 +5,7 @@
 import copy
 import hashlib
 import json
+from unittest import mock
 from uuid import uuid4
 
 from django.contrib.auth import get_user_model
@@ -500,3 +501,48 @@ class TestRedistributionCoverage(TestCase):
         lookups = [query for query in queries if f'FROM "{table}"' in query["sql"]]
         # Before the writer locks, after it locks, and for the intent push.
         self.assertEqual(len(lookups), 3)
+
+    def test_coverage_lost_after_the_precheck_refuses_accept_after_the_writer_locks(self):
+        from django.db.models import F
+
+        from netbox_nso_plugin.views import NSORedistributionBulkAcceptView, NSORedistributionStateAcceptView
+
+        self.prime()
+        rows = NSORedistributionState.objects.filter(management=self.management)
+        row = rows.get(dest_protocol="bgp", source_protocol="static")
+        before = list(rows.order_by("pk").values())
+        outbox = list(NSOIntentOutboxEntry.objects.filter(device=self.device).values_list("pk", flat=True))
+        for view, hook, name, pk in (
+            (NSORedistributionStateAcceptView, "_accept_blocker", "routing_accept_redistribution", row.pk),
+            (
+                NSORedistributionBulkAcceptView,
+                "_first_accept_blocker",
+                "routing_bulk_accept_redistribution",
+                self.device.pk,
+            ),
+        ):
+            with self.subTest(view=name):
+                precheck = getattr(view, hook)
+
+                def lose_coverage(view_self, *args, precheck=precheck):
+                    result = precheck(view_self, *args)
+                    # A newer publication lands between the pre-check and the writer lock.
+                    NSOFamilyReadState.objects.filter(management=self.management, family="redistribution").update(
+                        publication_sequence=F("publication_sequence") + 1
+                    )
+                    return result
+
+                with mock.patch.object(view, hook, lose_coverage):
+                    response = self.client.post(reverse(f"plugins:netbox_nso_plugin:{name}", args=[pk]))
+
+                self.assertRedirects(
+                    response, reverse("dcim:device_nso", args=[self.device.pk]), fetch_redirect_response=False
+                )
+                self.assertIn(
+                    "BGP redistribution coverage is unavailable",
+                    " ".join(str(item) for item in get_messages(response.wsgi_request)),
+                )
+                self.assertEqual(list(rows.order_by("pk").values()), before)
+                self.assertEqual(
+                    list(NSOIntentOutboxEntry.objects.filter(device=self.device).values_list("pk", flat=True)), outbox
+                )
