@@ -5,6 +5,7 @@
 import threading
 
 from django.db import connections
+from django.urls import reverse
 
 from netbox_nso_plugin import adapter_client
 from netbox_nso_plugin.durable_capture import mapping_epoch
@@ -192,3 +193,81 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
         self.assertTrue(result.drained)
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_evidence_error, {})
+
+    def test_empty_valid_snapshot_clears_an_unidentified_banner(self):
+        mirror_update(
+            self.management,
+            settle_cursor_seq=40,
+            settle_cursor_device_id=self.management.adapter_device_id,
+            settle_cursor_incarnation="placeholder-store-a",
+        )
+        self.serve_feed([])
+        responses = iter((("placeholder-store-a", []), ("placeholder-store-b", [])))
+        self.feed_response = lambda: next(responses)
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        self.management.refresh_from_db()
+        self.assertIsNotNone(settlement_stall_projection(self.management))
+        self.serve_feed([])
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.drained)
+        self.assertFalse(result.stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertNotContains(response, "Settlement is paused")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        self.assertEqual(self.management.settle_cursor_seq, 40)
+
+    def test_late_unidentified_failure_cannot_restore_a_banner_after_cursor_progress(self):
+        mirror_update(
+            self.management,
+            settle_cursor_seq=40,
+            settle_cursor_device_id=self.management.adapter_device_id,
+            settle_cursor_incarnation="placeholder-store-a",
+        )
+        job = self.job(kind="sync", status="succeeded")
+        self.serve_feed([job])
+        started, release = threading.Event(), threading.Event()
+        errors, results = [], []
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def delayed_feed():
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                current = calls
+            if current == 2:
+                started.set()
+                if not release.wait(30):
+                    raise AssertionError("the late snapshot was not released")
+                return "placeholder-store-b", []
+            return "placeholder-store-a", [job] if current in (3, 5) else []
+
+        def consume_late_snapshot():
+            try:
+                results.append(consume_static_route_settlements(self.management.pk))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        self.feed_response = delayed_feed
+        worker = threading.Thread(target=consume_late_snapshot)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(10), "the late snapshot request did not start")
+            advanced = consume_static_route_settlements(self.management)
+            self.assertTrue(advanced.drained)
+            self.assertEqual(advanced.cursor, 42)
+        finally:
+            release.set()
+            worker.join(30)
+        self.assertFalse(worker.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertTrue(results[0].stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertNotContains(response, "Settlement is paused")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        self.assertEqual(self.management.settle_cursor_seq, 42)

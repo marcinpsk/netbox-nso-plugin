@@ -185,6 +185,59 @@ class TestCoalescedOwnerSettlement(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(list(NSOApplyExecution.objects.values_list("settle_seq", flat=True)), [1, 1])
         self.assertFalse(settle_static_routes(self.management).stalled)
 
+    def test_inconsistent_manual_carrier_projections_name_the_carrier(self):
+        from django.urls import reverse
+
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_response
+
+        generations = self.prepare_carrier()
+        self.serve_terminal_evidence(generations[0], settle_seq=42, manual=True)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                listing = response.json()
+                listing.append(
+                    {
+                        **listing[0],
+                        "digest": self.attempt.response["generations"][1]["digest"],
+                        **{
+                            key: generations[1][key]
+                            for key in ("generation_id", "seq", "status", "stream_revisions", "source_push_seq")
+                        },
+                    }
+                )
+                return make_response(200, listing)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                evidence = response.json()
+                projections = copy.deepcopy(generations)
+                projections[0]["carrier_job_error"] = {"message": "placeholder-secret-canary"}
+                evidence["attempts"][0]["generations"] = projections
+                return make_response(200, evidence)
+            return response
+
+        self.adapter._handle = handle
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        self.assertEqual(
+            list(
+                self.management.apply_executions.filter(carrier_job_id=501)
+                .order_by("generation_id")
+                .values_list("invariant_code", flat=True)
+            ),
+            ["invalid_terminal_batch", "invalid_terminal_batch"],
+        )
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertContains(response, "settle_seq 42")
+        self.assertContains(response, "invalid settlement evidence")
+        self.assertNotContains(response, "placeholder-secret-canary")
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+
     def test_coalesced_bgp_and_vlan_settle_as_one_certified_carrier(self):
         from netbox_nso_plugin.models import NSOApplyExecution
 

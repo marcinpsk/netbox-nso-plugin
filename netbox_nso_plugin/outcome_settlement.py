@@ -10,7 +10,7 @@ from django.utils import timezone
 
 from . import delivery, refusal_contract
 from . import durable_capture as capture
-from .apply_settlement import EvidenceInvariantError, _parse_time
+from .apply_settlement import EvidenceInvariantError, _carrier_job, _parse_time, identify_evidence_stall
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
 from .refusal_registry import OVERLAYS
 
@@ -336,6 +336,22 @@ def settle_terminal_generation(
     )[0]
 
 
+def _validated_carrier_authorities(adapter_device_id, generations, incarnation, sequences):
+    authorities, groups = {}, {}
+    for generation in generations:
+        carrier_id = generation.get("carrier_job_id") if isinstance(generation, dict) else None
+        job = _carrier_job(adapter_device_id, carrier_id, sequences)
+        with identify_evidence_stall(job, incarnation):
+            refusal_contract.validate_generation(generation)
+            groups.setdefault(carrier_id, []).append(generation)
+            authorities.setdefault(carrier_id, {})[generation["generation_id"]] = generation
+    for carrier_id, group in groups.items():
+        job = _carrier_job(adapter_device_id, carrier_id, sequences)
+        with identify_evidence_stall(job, incarnation):
+            refusal_contract.validate_carrier_generations(group)
+    return authorities
+
+
 def settle_terminal_generations(
     management,
     generations,
@@ -356,23 +372,24 @@ def settle_terminal_generations(
     receipt_recoveries = receipt_recoveries or {}
     generations = list(generations)
     try:
-        refusal_contract.validate_carrier_generations(generations)
-        authorities = {}
-        for generation in generations:
-            authorities.setdefault(generation["carrier_job_id"], {})[generation["generation_id"]] = generation
+        authorities = _validated_carrier_authorities(
+            management.adapter_device_id, generations, store_incarnation, settle_sequences
+        )
         grouped = set()
         keys = set()
         for generation in generations:
             identity = generation["generation_id"], generation["carrier_job_id"]
             # The batch handler below records the invariant for every generation.
-            joined = _validated_join(
-                management,
-                generation,
-                store_incarnation,
-                attempts.get(identity),
-                authorities[generation["carrier_job_id"]],
-                receipt_recoveries,
-            )
+            job = _carrier_job(management.adapter_device_id, generation["carrier_job_id"], settle_sequences)
+            with identify_evidence_stall(job, store_incarnation):
+                joined = _validated_join(
+                    management,
+                    generation,
+                    store_incarnation,
+                    attempts.get(identity),
+                    authorities[generation["carrier_job_id"]],
+                    receipt_recoveries,
+                )
             if joined is not None:
                 grouped.update(joined[-1])
         for label, _pk in grouped:
@@ -391,18 +408,22 @@ def settle_terminal_generations(
             acknowledge_recoveries(management, receipt_recoveries, store_incarnation, states)
             for attempt_id, keep in restorations:
                 capture.restore_attempt(attempt_id, keep_streams=keep)
-            return [
-                _settle(
-                    management,
-                    generation,
-                    store_incarnation,
-                    attempt=attempts.get((generation["generation_id"], generation["carrier_job_id"])),
-                    settle_seq=settle_sequences.get(generation["carrier_job_id"]),
-                    mode=modes.get(generation["generation_id"], "networked"),
-                    authorities=authorities[generation["carrier_job_id"]],
-                )
-                for generation in generations
-            ]
+            executions = []
+            for generation in generations:
+                job = _carrier_job(management.adapter_device_id, generation["carrier_job_id"], settle_sequences)
+                with identify_evidence_stall(job, store_incarnation):
+                    executions.append(
+                        _settle(
+                            management,
+                            generation,
+                            store_incarnation,
+                            attempt=attempts.get((generation["generation_id"], generation["carrier_job_id"])),
+                            settle_seq=settle_sequences.get(generation["carrier_job_id"]),
+                            mode=modes.get(generation["generation_id"], "networked"),
+                            authorities=authorities[generation["carrier_job_id"]],
+                        )
+                    )
+            return executions
     except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
         code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
         for generation in generations:
@@ -413,7 +434,10 @@ def settle_terminal_generations(
                 _attempt_for(attempts, generation),
                 code,
             )
-        raise EvidenceInvariantError(code) from exc
+        error = EvidenceInvariantError(code)
+        if hasattr(exc, "invalid_job"):
+            error.invalid_job = exc.invalid_job
+        raise error from exc
 
 
 def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, authorities=None):

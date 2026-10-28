@@ -52,7 +52,11 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     pk = getattr(mgmt, "pk", mgmt)
     management = NSODeviceManagement.objects.get(pk=pk)
     epoch = mapping_epoch(management)
-    cursor_epoch = (management.settle_cursor_device_id, management.settle_cursor_incarnation)
+    cursor_epoch = (
+        management.settle_cursor_device_id,
+        management.settle_cursor_incarnation,
+        management.settle_cursor_seq,
+    )
     evidence = None
     if management.adapter_device_id is not None:
         try:
@@ -75,6 +79,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
                 and result.adapter_device_id == evidence["device_id"]
                 and row.settle_cursor_incarnation == evidence.store_incarnation
             ):
+                _clear_unidentified_evidence(row)
                 return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
             return result
     except adapter_client.InvalidJobEvidence as exc:
@@ -86,13 +91,13 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
 
 
 def _invariant_evidence_stall(management, epoch, cursor_epoch, error):
-    """Persist the identified invariant through the existing diagnostic fence."""
+    """Persist the invariant through the existing diagnostic fence."""
     invalid_job = getattr(error, "invalid_job", adapter_client.InvalidJobEvidence({}, "invalid settlement evidence"))
     return _invalid_evidence_stall(management, epoch, cursor_epoch, invalid_job)
 
 
 def _invalid_evidence_stall(management, epoch, cursor_epoch, error):
-    """Retain one identified invalid job without advancing its settlement cursor."""
+    """Retain invalid evidence without advancing its settlement cursor."""
     from .durable_capture import mapping_epoch
     from .intent_state import mirror_refresh
     from .models import NSODeviceManagement
@@ -100,37 +105,52 @@ def _invalid_evidence_stall(management, epoch, cursor_epoch, error):
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
+        identified = (
+            type(error.job_id) is int and error.job_id > 0 and type(error.settle_seq) is int and error.settle_seq > 0
+        )
         identity_valid = (
             mapping_epoch(row) == epoch
-            and (row.settle_cursor_device_id, row.settle_cursor_incarnation) == cursor_epoch
+            and (row.settle_cursor_device_id, row.settle_cursor_incarnation) == cursor_epoch[:2]
             and type(error.device_id) is int
             and error.device_id == row.adapter_device_id
-            and type(error.job_id) is int
-            and error.job_id > 0
-            and type(error.settle_seq) is int
-            and error.settle_seq > 0
+            and (identified or error.job_id is None and error.settle_seq is None)
+            and (identified or row.settle_cursor_seq == cursor_epoch[2])
             and bool(error.store_incarnation)
         )
         already_consumed = (
             identity_valid
+            and identified
             and row.settle_cursor_device_id == error.device_id
             and row.settle_cursor_incarnation == error.store_incarnation
             and (row.settle_cursor_seq or 0) >= error.settle_seq
         )
         if identity_valid and not already_consumed:
             issue = {
-                "job_id": error.job_id,
-                "settle_seq": error.settle_seq,
                 "reason": error.reason,
                 "mapping_epoch": epoch,
                 "store_incarnation": error.store_incarnation,
                 "cursor_device_id": cursor_epoch[0],
                 "cursor_incarnation": cursor_epoch[1],
             }
+            if identified:
+                issue.update(job_id=error.job_id, settle_seq=error.settle_seq)
             with suppress_intent_push(), mirror_refresh(row, ("settle_evidence_error",)) as locked:
                 locked.settle_evidence_error = issue
                 locked.save(update_fields=("settle_evidence_error",))
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
+
+
+def _clear_unidentified_evidence(management):
+    """Clear an unowned diagnostic after its full evidence snapshot validates."""
+    from .intent_state import mirror_refresh
+    from .signals import suppress_intent_push
+
+    issue = management.settle_evidence_error
+    if not issue or issue.get("job_id") is not None or issue.get("settle_seq") is not None:
+        return
+    with suppress_intent_push(), mirror_refresh(management, ("settle_evidence_error",)) as locked:
+        locked.settle_evidence_error = {}
+        locked.save(update_fields=("settle_evidence_error",))
 
 
 def settle_static_routes(mgmt) -> ConsumeResult:

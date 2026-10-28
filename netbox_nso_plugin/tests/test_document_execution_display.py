@@ -3,6 +3,7 @@
 """Document causes and invalid feed evidence remain visible without local owners."""
 
 import copy
+from unittest.mock import patch
 
 from django.urls import reverse
 
@@ -15,10 +16,10 @@ from .test_durable_bgp_capture import BGPCaptureCase
 
 
 class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
-    def serve_preceding_sync_jobs(self, generation, *, full_page=False):
+    def serve_preceding_sync_jobs(self, generation, *, full_page=False, manual=False):
         from ._adapter_http import make_response
 
-        self.serve_terminal_evidence(generation, settle_seq=42)
+        self.serve_terminal_evidence(generation, settle_seq=42, manual=manual)
         original = self.adapter._handle
 
         def handle(method, url, **kwargs):
@@ -207,6 +208,130 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertContains(response, "settle_seq 42")
         self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
         self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
+
+    def serve_carrier_status_mismatch(self):
+        from ._adapter_http import make_response
+
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42)
+        original = self.adapter._handle
+        self.settlement_pages = []
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs"):
+                params = kwargs["params"]
+                self.settlement_pages.append((int(params["after_settle_seq"]), int(params["limit"])))
+                response = original(method, url, **{**kwargs, "params": {**params, "after_settle_seq": 0}})
+                carrier = {**response.json()[0], "status": "failed"}
+                sync = {
+                    **carrier,
+                    "id": 500,
+                    "type": "sync",
+                    "status": "succeeded",
+                    "settle_seq": 41,
+                    "result": None,
+                    "row_outcomes": None,
+                    "refusals": None,
+                }
+                jobs = [job for job in (sync, carrier) if job["settle_seq"] > int(params["after_settle_seq"])]
+                jobs = jobs[: int(params["limit"])]
+                return make_response(200, jobs)
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+
+    def test_carrier_status_mismatch_names_the_failing_job(self):
+        self.serve_carrier_status_mismatch()
+        self.assert_carrier_stall_banner()
+        self.assertIn((0, 100), self.settlement_pages)
+
+    def test_carrier_status_mismatch_on_a_later_page_names_the_failing_job(self):
+        self.serve_carrier_status_mismatch()
+        with patch("netbox_nso_plugin.settlement.SETTLE_FEED_PAGE", 1):
+            self.assert_carrier_stall_banner()
+        self.assertIn((0, 1), self.settlement_pages)
+        self.assertIn((41, 1), self.settlement_pages)
+
+    def assert_carrier_stall_banner(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertNotContains(response, "Adapter job 500")
+        self.assertContains(response, "settle_seq 42")
+        self.assertContains(response, "invalid settlement evidence")
+        self.assertNotContains(response, "placeholder-secret-canary")
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+        self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
+
+    def test_store_change_stall_shows_a_reason_without_a_job(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42, epoch_change=True)
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Settlement is paused: invalid settlement evidence.", html=True)
+        self.assertNotContains(response, "Adapter job")
+        self.assertNotContains(response, "settle_seq")
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertIsNone(self.management.settle_evidence_error.get("job_id"))
+        self.assertIsNone(self.management.settle_evidence_error.get("settle_seq"))
+
+    def test_write_phase_stall_keeps_the_failing_carrier_through_batch_rejection(self):
+        self.prepare()
+        prior = self.terminal(refused=None)
+        prior["carrier_job_id"] = 499
+        self.settle(prior)
+        NSOApplyExecution.objects.filter(management=self.management, carrier_job_id=499).update(settle_seq=None)
+        self.serve_preceding_sync_jobs(self.terminal())
+        self.assert_carrier_stall_banner()
+        execution = NSOApplyExecution.objects.get(management=self.management, carrier_job_id=501)
+        self.assertEqual(execution.invariant_code, "execution_order_unproven")
+
+    def test_invalid_manual_generation_names_its_carrier(self):
+        from ._adapter_http import make_response
+
+        self.prepare()
+        self.serve_preceding_sync_jobs(self.terminal(), manual=True)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                evidence = response.json()
+                evidence["attempts"][0]["generations"][0]["row_outcomes"][0]["disposition"] = (
+                    "placeholder-secret-canary"
+                )
+                return make_response(200, evidence)
+            return response
+
+        self.adapter._handle = handle
+        self.assert_carrier_stall_banner()
+
+    def test_invalid_head_admission_names_its_carrier(self):
+        from ._adapter_http import make_response
+
+        self.prepare()
+        self.serve_preceding_sync_jobs(self.terminal())
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                evidence = response.json()
+                evidence["head"]["apply_attempt_id"] = "placeholder-secret-canary"
+                return make_response(200, evidence)
+            return response
+
+        self.adapter._handle = handle
+        self.assert_carrier_stall_banner()
 
     def test_invalid_evidence_banner_does_not_follow_a_mapping_change(self):
         from netbox_nso_plugin.models import NSODeviceManagement

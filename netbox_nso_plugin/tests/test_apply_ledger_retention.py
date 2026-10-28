@@ -421,6 +421,7 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
                 }
             )
         bound = _BoundEvidence(attempts=[])
+        bound.settlement_sequences = {}
         bound.automatic_generations = []
         self.management.refresh_from_db()
         with CaptureQueriesContext(connection) as queries:
