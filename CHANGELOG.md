@@ -2,6 +2,56 @@
 
 <!-- version list -->
 
+## v1.14.0 (2026-10-27)
+
+### Bug Fixes
+
+- **authz**: Install the SQL backstop on every database alias
+  ([`bc2c395`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bc2c3957f8ffcd2e8901ec10bf3b1fc3e77f0ace))
+
+- **authz**: Latch an add denial on every enclosing scope
+  ([`25c3a1a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/25c3a1a641ca7e0949e8fe376f07531598340d57))
+
+- **authz**: Roll back operator writes when a view answers an exception
+  ([`c3921fa`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c3921fa65fa65257e385f7411d2bc050e9ebdd7a))
+
+- **bfd**: Settle an owned row only when the native row matches the intent
+  ([`85caf73`](https://github.com/marcinpsk/netbox-nso-plugin/commit/85caf731603d78faf6f734b407ae73973f9f26d2))
+
+- **jobs**: Serve a polled job that is older than the listing page
+  ([`08e1241`](https://github.com/marcinpsk/netbox-nso-plugin/commit/08e1241517b066fa29e60a5b8111039774e09681))
+
+### Chores
+
+- **ci**: Bump the actions group with 3 updates
+  ([`37e5803`](https://github.com/marcinpsk/netbox-nso-plugin/commit/37e5803166d0343f1096a9abe463aad43ee0683d))
+
+- **deps**: Bump the python-minor-patch group with 2 updates
+  ([`d5d2406`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d5d240637b8da1495f9c622a8a8ae892e585ed28))
+
+- **deps**: Bump vitest from 5.0.4 to 5.0.5 in the js-minor-patch group
+  ([`73c7241`](https://github.com/marcinpsk/netbox-nso-plugin/commit/73c72417b3f0b7bd9b3a9e30510861eea3831617))
+
+- **reuse**: Give the new authorization tests the full copyright line
+  ([`284df1c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/284df1cbffc24288c81a131019f73c25eadedfb1))
+
+### Refactoring
+
+- **authz**: Resolve an onboarding instance selection in one helper
+  ([`3663f6b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3663f6b511883eae5187d8f4e4114a713592d652))
+
+### Testing
+
+- **ipam**: A shared-operation conflict in bulk auto-assign writes nothing
+  ([`007c2a3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/007c2a349506f10aaa5324d9f644e57d788be0d5))
+
+- **jobs**: Prove the unknown polled job reaches the adapter lookup
+  ([`e0c534d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e0c534d9bf75a5ffe6c8ececcfef1fbf1322fc46))
+
+- **vlan**: Commit the competing rescope attachment on its own connection
+  ([`bf1b646`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bf1b6466d7604b6ce035bed343f3372edfc09060))
+
+
 ## v1.13.0 (2026-10-25)
 
 ### Bug Fixes
