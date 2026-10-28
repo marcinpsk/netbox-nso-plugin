@@ -155,6 +155,72 @@ class TestDeviceDifferencesView(TestCase):
         self.assertContains(response, "Ethernet2 198.18.0.1/24 (VRF example-vrf)")
         self.assertNotContains(response, "&#x27;Ethernet2&#x27;")
 
+    def test_stale_snapshot_migration_restores_the_panel(self):
+        from importlib import import_module
+
+        from django.apps import apps
+
+        from ._observation_case import ip_observation
+        from ._routing_observation_case import store_redistribution_observation
+        from ._scope_observation_case import scope_observation
+
+        ip_state = NSOFamilyReadState.objects.create(management=self.management, family="interface_ip")
+        snapshot = observation("interface_ip", interfaces=[ip_observation("Ethernet2")])
+        NSOFamilyObservation.objects.create(read_state=ip_state, **observation_defaults("interface_ip", 1, 1, snapshot))
+        store_redistribution_observation(self.management)
+        logging = scope_observation(
+            "logging", document={"hosts": [], "local_levels": None, "present": ["hosts"], "unprojectable": []}
+        )
+        logging_state = NSOFamilyReadState.objects.create(management=self.management, family="logging")
+        NSOFamilyObservation.objects.create(read_state=logging_state, **observation_defaults("logging", 1, 1, logging))
+        _other_device, other_management = _make(f"panel{uuid4().hex[:8]}")
+        unobserved = NSOFamilyReadState.objects.create(management=other_management, family="interface_ip")
+        # Store the interface and redistribution documents in their shape before #1833.
+        for stored in NSOFamilyObservation.objects.filter(read_state__management=self.management):
+            document = stored.document
+            if "interfaces" in document:
+                del document["present"]
+                for entry in document["interfaces"]:
+                    entry.pop("present", None)
+            for component in document.get("components", []):
+                del component["status"]
+            stored.save(update_fields=["document"])
+        sequences = dict(
+            NSOFamilyReadState.objects.filter(management=self.management).values_list("family", "publication_sequence")
+        )
+        with self.assertRaises(KeyError):
+            self.client.get(self.url)
+
+        migration = import_module("netbox_nso_plugin.migrations.0037_delete_stale_observations")
+        with connection.schema_editor() as schema_editor:
+            migration.delete_stale_observations(apps, schema_editor)
+
+        response = self.client.get(self.url, {"scope": "interface"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [(row["kind"], row["reason"]) for row in response.context["page_obj"]],
+            [("unavailable", "no successful read yet")],
+        )
+        self.assertEqual(self.client.get(self.url).status_code, 200)
+        self.assertEqual(
+            set(
+                NSOFamilyObservation.objects.filter(read_state__management=self.management).values_list(
+                    "read_state__family", flat=True
+                )
+            ),
+            {"logging"},
+        )
+        self.assertEqual(
+            dict(
+                NSOFamilyReadState.objects.filter(management=self.management).values_list(
+                    "family", "publication_sequence"
+                )
+            ),
+            {family: value + (family != "logging") for family, value in sequences.items()},
+        )
+        unobserved.refresh_from_db()
+        self.assertEqual(unobserved.publication_sequence, 0)
+
     def _candidate_page(self):
         from ipam.models import IPAddress
 

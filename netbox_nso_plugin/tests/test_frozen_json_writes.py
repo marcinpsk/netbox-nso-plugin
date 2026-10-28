@@ -18,6 +18,7 @@ from netbox_nso_plugin.renderer_writer import (
 )
 
 from ._outbox_case import make_managed, without_commit_drain
+from ._routing_observation_case import redistribution_read_payload
 from .mixins import IntentPushResetMixin
 
 
@@ -98,7 +99,7 @@ class FrozenJSONWriteTests(IntentPushResetMixin, TestCase):
         destination = ISISInstance.objects.create(device=self.device, process_tag="")
         native = Redistribution.objects.create(destination=destination, source_protocol="static")
         with without_commit_drain(), renderer_mirror_writes(self._native_plan(native)):
-            reconcile_redistribution(self.device, {"entries": []})
+            reconcile_redistribution(self.device, redistribution_read_payload({"entries": []}))
         native.refresh_from_db()
         self.assertEqual(native.custom_field_data, self._nested_value())
 

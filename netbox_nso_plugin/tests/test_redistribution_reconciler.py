@@ -17,6 +17,7 @@ from django.test import TestCase
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
+from ._routing_observation_case import redistribution_read_payload
 
 
 class TestReconcileRedistribution(TestCase):
@@ -69,7 +70,9 @@ class TestReconcileRedistribution(TestCase):
 
         states = reconcile_redistribution(
             self.device,
-            {"entries": [self._entry(route_map="RM-REDIST", metric=10, metric_type="external")]},
+            redistribution_read_payload(
+                {"entries": [self._entry(route_map="RM-REDIST", metric=10, metric_type="external")]}
+            ),
         )
 
         self.assertEqual(len(states), 1)
@@ -93,7 +96,9 @@ class TestReconcileRedistribution(TestCase):
 
         management = self._make_mgmt()
         ISISInstance.objects.create(device=self.device, process_tag="")
-        redistribution_reconciler.reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        redistribution_reconciler.reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]})
+        )
         real_plan = redistribution_reconciler.redistribution_reconcile_plan
         plan_calls = 0
 
@@ -107,7 +112,9 @@ class TestReconcileRedistribution(TestCase):
             return plan
 
         with patch.object(redistribution_reconciler, "redistribution_reconcile_plan", side_effect=plan_then_flip):
-            rows = redistribution_reconciler.reconcile_redistribution(self.device, {"entries": []})
+            rows = redistribution_reconciler.reconcile_redistribution(
+                self.device, redistribution_read_payload({"entries": []})
+            )
 
         state = NSORedistributionState.objects.get(management=management)
         self.assertEqual(plan_calls, 2)
@@ -135,7 +142,7 @@ class TestReconcileRedistribution(TestCase):
 
         state = reconcile_redistribution(
             self.device,
-            {"entries": [self._entry(metric=10, metric_type="external")]},
+            redistribution_read_payload({"entries": [self._entry(metric=10, metric_type="external")]}),
         )[0]
 
         native.refresh_from_db()
@@ -163,7 +170,7 @@ class TestReconcileRedistribution(TestCase):
         BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
         entry = self._entry(dest_protocol="bgp", dest_ref="64512/CUST-A/ipv4-unicast")
 
-        state = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+        state = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))[0]
 
         self.assertIsNone(state.redistribution_id)
         self.assertFalse(Redistribution.objects.exists())
@@ -191,7 +198,7 @@ class TestReconcileRedistribution(TestCase):
         family = self._global_bgp_destination(65546)
         entry = self._entry(dest_protocol="bgp", dest_ref="1.10//ipv4-unicast")
 
-        state = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+        state = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))[0]
 
         self.assertEqual(state.dest_ref, "65546//ipv4-unicast")
         self.assertEqual(state.redistribution.destination, family)
@@ -205,7 +212,7 @@ class TestReconcileRedistribution(TestCase):
         entry = self._entry(dest_protocol="bgp", dest_ref="65536.1//ipv4-unicast")
 
         with self.assertRaises(AdapterError) as caught:
-            reconcile_redistribution(self.device, {"entries": [entry]})
+            reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))
 
         self.assertEqual(caught.exception.code, "invalid_response")
         self.assertFalse(NSORedistributionState.objects.exists())
@@ -220,7 +227,7 @@ class TestReconcileRedistribution(TestCase):
             with self.subTest(dest_ref=dest_ref):
                 with self.assertRaises(AdapterError) as caught:
                     entry = self._entry(dest_protocol="bgp", dest_ref=dest_ref)
-                    reconcile_redistribution(self.device, {"entries": [entry]})
+                    reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))
                 self.assertEqual(caught.exception.code, "invalid_response")
         self.assertFalse(NSORedistributionState.objects.exists())
 
@@ -230,7 +237,7 @@ class TestReconcileRedistribution(TestCase):
         self._make_mgmt()
         entry = self._entry(dest_protocol="bgp", dest_ref="1.10/CUST-A")
 
-        state = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+        state = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))[0]
 
         self.assertEqual(state.dest_ref, "65546/CUST-A")
 
@@ -255,12 +262,12 @@ class TestReconcileRedistribution(TestCase):
         BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
         entry = self._entry(dest_protocol="bgp", dest_ref="64512/CUST-A/ipv4-unicast")
 
-        initial = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+        initial = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))[0]
         self.assertIsNotNone(initial.redistribution_id)
 
         vrf.name = "CUST-B"
         vrf.save(update_fields=("name",))
-        reconciled = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+        reconciled = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))[0]
 
         self.assertIsNone(reconciled.redistribution_id)
         self.assertEqual(Redistribution.objects.count(), 1)
@@ -281,7 +288,7 @@ class TestReconcileRedistribution(TestCase):
         device_route_map = RouteMap.objects.create(name="DEVICE-REDIST")
         accepted_route_map = RouteMap.objects.create(name="ACCEPTED-REDIST")
         device_entry = self._entry(route_map=device_route_map.name, metric=10, metric_type="external")
-        reconcile_redistribution(self.device, {"entries": [device_entry]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [device_entry]}))
         state = NSORedistributionState.objects.get()
         state.route_map = accepted_route_map.name
         state.metric = 20
@@ -296,7 +303,7 @@ class TestReconcileRedistribution(TestCase):
         state.refresh_from_db()
         self.assertIsNone(state.redistribution_id)
 
-        payload = {"entries": [device_entry]}
+        payload = redistribution_read_payload({"entries": [device_entry]})
         plan = redistribution_reconcile_plan(self.device, payload)
         self.assertEqual(plan.content_keys, ())
         revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis")
@@ -331,7 +338,7 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
 
-        payload = {"entries": [self._entry(metric=10)]}
+        payload = redistribution_read_payload({"entries": [self._entry(metric=10)]})
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
             patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value=payload),
@@ -370,7 +377,7 @@ class TestReconcileRedistribution(TestCase):
             status="imported",
         )
         destination = ISISInstance.objects.create(device=self.device, process_tag="")
-        payload = {"entries": [self._entry(route_map=route_map.name)]}
+        payload = redistribution_read_payload({"entries": [self._entry(route_map=route_map.name)]})
         footprints = []
         acquire = intent_state._acquire
 
@@ -401,7 +408,9 @@ class TestReconcileRedistribution(TestCase):
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
 
-        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=10)]})
+        plan = redistribution_reconcile_plan(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]})
+        )
 
         assert [(write.operation, write.model_label) for write in plan.write_set] == [
             ("save", "netbox_routing.redistribution"),
@@ -459,7 +468,7 @@ class TestReconcileRedistribution(TestCase):
 
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        states = reconcile_redistribution(self.device, {"entries": [self._entry()]})
+        states = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry()]}))
         self.assertEqual(len(states), 1)
         self.assertIsNone(states[0].redistribution_id)
         self.assertEqual(states[0].status, "imported")
@@ -471,13 +480,15 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=30)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=30)]}))
         state = NSORedistributionState.objects.get()
         state.metric = 20
         state.status = "accepted"
         save_overlay_fixture(state, update_fields=["metric", "status"])
 
-        state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=30)]})[0]
+        state = reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=30)]})
+        )[0]
 
         self.assertEqual(state.metric, 20)
         self.assertEqual(state.status, "accepted")
@@ -489,8 +500,8 @@ class TestReconcileRedistribution(TestCase):
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry()]})
-        reconcile_redistribution(self.device, {"entries": [self._entry()]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry()]}))
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry()]}))
         self.assertEqual(Redistribution.objects.filter(source_protocol="static").count(), 1)
 
     def test_duplicate_new_entry_is_rejected_before_persistence(self):
@@ -505,7 +516,9 @@ class TestReconcileRedistribution(TestCase):
         entry = self._entry()
 
         with self.assertRaises(AdapterError) as raised:
-            reconcile_redistribution(self.device, {"entries": [entry, {**entry, "metric": 20}]})
+            reconcile_redistribution(
+                self.device, redistribution_read_payload({"entries": [entry, {**entry, "metric": 20}]})
+            )
 
         self.assertEqual(raised.exception.code, "invalid_response")
         self.assertIn("duplicate redistribution", str(raised.exception))
@@ -526,7 +539,9 @@ class TestReconcileRedistribution(TestCase):
         for field in ("dest_protocol", "source_protocol"):
             with self.subTest(field=field):
                 with self.assertRaises(AdapterError) as raised:
-                    reconcile_redistribution(self.device, {"entries": [entry, {**entry, field: ""}]})
+                    reconcile_redistribution(
+                        self.device, redistribution_read_payload({"entries": [entry, {**entry, field: ""}]})
+                    )
 
                 self.assertEqual(raised.exception.code, "invalid_response")
                 self.assertIn("destination or source protocol", str(raised.exception))
@@ -542,9 +557,16 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
         ISISInstance.objects.create(device=self.device, process_tag="")
-        for payload in (None, {}, {"entries": None}, {"entries": {}}, {"entries": ()}, {"entries": [None]}):
+        for payload in (
+            None,
+            {},
+            redistribution_read_payload({"entries": None}),
+            redistribution_read_payload({"entries": {}}),
+            redistribution_read_payload({"entries": ()}),
+            redistribution_read_payload({"entries": [None]}),
+        ):
             with self.subTest(payload=payload):
-                reconcile_redistribution(self.device, {"entries": [self._entry()]})
+                reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry()]}))
                 with self.assertRaises(AdapterError) as raised:
                     reconcile_redistribution(self.device, payload)
 
@@ -560,7 +582,7 @@ class TestReconcileRedistribution(TestCase):
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         redist = Redistribution.objects.get(source_protocol="static")
         redist.metric = 99  # operator edit; device still reports 10
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
@@ -568,7 +590,9 @@ class TestReconcileRedistribution(TestCase):
         with intent_transaction(footprint_for_instance(redist)):
             redist.save()
 
-        states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        states = reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]})
+        )
         self.assertEqual(states[0].status, "changed")  # edit surfaced as drift
         redist.refresh_from_db()
         self.assertEqual(redist.metric, 99)  # edit preserved, not reverted
@@ -581,12 +605,16 @@ class TestReconcileRedistribution(TestCase):
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         # Device changes metric 10→20; object never edited → auto-mirror.
         self.assertFalse(
-            redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]}).changes_content
+            redistribution_reconcile_plan(
+                self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]})
+            ).changes_content
         )
-        states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
+        states = reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]})
+        )
         Redistribution.objects.get(source_protocol="static").refresh_from_db()
         self.assertEqual(Redistribution.objects.get(source_protocol="static").metric, 20)
         self.assertEqual(states[0].status, "imported")
@@ -603,9 +631,9 @@ class TestReconcileRedistribution(TestCase):
 
         self._make_mgmt()
         ISISInstance.objects.create(device=self.device, process_tag="")
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         original_state = NSORedistributionState.objects.get()
-        payload = {"entries": [self._entry(metric=20)]}
+        payload = redistribution_read_payload({"entries": [self._entry(metric=20)]})
         waiting = None
         native = None
         plan_calls = 0
@@ -672,7 +700,7 @@ class TestReconcileRedistribution(TestCase):
             metric=20,
             metric_type="",
         )
-        payload = {"entries": [self._entry(metric=20)]}
+        payload = redistribution_read_payload({"entries": [self._entry(metric=20)]})
         waiting = None
         state = None
         base_hash = None
@@ -746,8 +774,8 @@ class TestReconcileRedistribution(TestCase):
 
         self._make_mgmt()
         ISISInstance.objects.create(device=self.device, process_tag="")
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
-        payload = {"entries": [self._entry(metric=20)]}
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
+        payload = redistribution_read_payload({"entries": [self._entry(metric=20)]})
         waiting = redistribution_reconcile_plan(self.device, payload)
         native = Redistribution.objects.get(source_protocol="static")
         native.metric = 20
@@ -797,7 +825,7 @@ class TestReconcileRedistribution(TestCase):
             metric=20,
             metric_type="",
         )
-        payload = {"entries": [self._entry(metric=20)]}
+        payload = redistribution_read_payload({"entries": [self._entry(metric=20)]})
         waiting = redistribution_reconcile_plan(self.device, payload)
         base_hash = merge_util.content_hash({"route_map": None, "metric": 20, "metric_type": ""})
         state = NSORedistributionState(
@@ -848,7 +876,7 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSODeviceManagement, NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         redistribution = Redistribution.objects.get(source_protocol="static")
         other_device = Device.objects.create(
             name="rd-router-owned",
@@ -867,7 +895,9 @@ class TestReconcileRedistribution(TestCase):
         NSORedistributionState.objects.filter(pk=state.pk).update(management=other_management)
         state.refresh_from_db()
 
-        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
+        plan = redistribution_reconcile_plan(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]})
+        )
 
         self.assertTrue(plan.changes_content)
         self.assertIn((other_device.pk, "isis"), plan.lock_footprint.revision_keys)
@@ -880,7 +910,7 @@ class TestReconcileRedistribution(TestCase):
         with transaction.atomic(), intent_transaction(footprint_for_instance(redistribution)):
             redistribution.save(update_fields=["metric"])
         with self.assertRaises(IntentPlanStaleError), renderer_writes(plan):
-            reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
+            reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]}))
 
     def test_plan_validation_detects_destination_deletion(self):
         """The plan rejects a destination that disappears before acquisition."""
@@ -894,7 +924,7 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
         from netbox_nso_plugin.renderer_writer import renderer_writes
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         redistribution = Redistribution.objects.get(source_protocol="static")
         other_device = Device.objects.create(
             name="rd-router-destination-lock",
@@ -912,13 +942,15 @@ class TestReconcileRedistribution(TestCase):
         save_overlay_fixture(state, update_fields=("status",))
         NSORedistributionState.objects.filter(pk=state.pk).update(management=other_management)
         state.refresh_from_db()
-        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
+        plan = redistribution_reconcile_plan(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]})
+        )
 
         with transaction.atomic(), offline_mutation():
             destination.delete()
 
         with self.assertRaises(RendererTargetsChanged), renderer_writes(plan):
-            reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
+            reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]}))
 
     def test_new_reported_entry_locks_and_revalidates_its_destination(self):
         """A reported entry without an overlay still protects its destination."""
@@ -931,14 +963,16 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
         from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
 
-        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
+        plan = redistribution_reconcile_plan(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]})
+        )
 
         self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.lock_footprint.source_rows)
         with transaction.atomic(), offline_mutation():
             destination.delete()
 
         with self.assertRaises(RendererTargetsChanged), renderer_mirror_writes(plan):
-            reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
+            reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]}))
 
     def test_plan_validation_detects_equal_content_relink(self):
         """The prediction identifies native rows even when their content is equal."""
@@ -953,7 +987,9 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
         from netbox_nso_plugin.renderer_writer import IntentPlanStaleError, renderer_mirror_writes
 
-        state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})[0]
+        state = reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]})
+        )[0]
         other_device = Device.objects.create(
             name="rd-router-equal-relink",
             device_type=self.device.device_type,
@@ -967,14 +1003,16 @@ class TestReconcileRedistribution(TestCase):
             source_protocol="static",
             metric=10,
         )
-        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=10)]})
+        plan = redistribution_reconcile_plan(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]})
+        )
 
         state.redistribution = other_redistribution
         with transaction.atomic(), offline_mutation():
             state.save(update_fields=["redistribution"])
 
         with self.assertRaises(IntentPlanStaleError), renderer_mirror_writes(plan):
-            reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+            reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
 
     def test_overlay_footprint_serializes_current_and_proposed_redistributions(self):
         """A relink locks both native redistribution dependencies."""
@@ -986,7 +1024,9 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.intent_state import SourceRow, footprint_for_instance
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})[0]
+        state = reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]})
+        )[0]
         current_id = state.redistribution_id
         proposed = Redistribution.objects.create(
             destination_type=ContentType.objects.get_for_model(destination),
@@ -1018,8 +1058,8 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
 
         entry = self._entry(dest_protocol="ospf", dest_ref="1", metric_type="1")
-        reconcile_redistribution(self.device, {"entries": [entry]})
-        plan = redistribution_reconcile_plan(self.device, {"entries": [entry]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [entry]}))
+        plan = redistribution_reconcile_plan(self.device, redistribution_read_payload({"entries": [entry]}))
         self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.lock_footprint.source_rows)
 
     def test_plan_locks_devices_that_share_a_route_map_without_expanding_revisions(self):
@@ -1054,7 +1094,7 @@ class TestReconcileRedistribution(TestCase):
 
         plan = redistribution_reconcile_plan(
             self.device,
-            {"entries": [self._entry(route_map=route_map.name, metric=10)]},
+            redistribution_read_payload({"entries": [self._entry(route_map=route_map.name, metric=10)]}),
         )
 
         self.assertEqual(set(plan.lock_footprint.device_ids), {self.device.pk, other_device.pk})
@@ -1075,10 +1115,12 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric_type="internal")]})
+        reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric_type="internal")]})
+        )
         corrected = self._entry()
         corrected.pop("metric_type")
-        states = reconcile_redistribution(self.device, {"entries": [corrected]})
+        states = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [corrected]}))
 
         native = Redistribution.objects.get(source_protocol="static")
         overlay = NSORedistributionState.objects.get()
@@ -1095,14 +1137,16 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric_type="external")]})
+        reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric_type="external")]})
+        )
         state = NSORedistributionState.objects.get()
         state.status = "accepted"
         save_overlay_fixture(state, update_fields=["status"])
         corrected = self._entry()
         corrected.pop("metric_type")
 
-        state = reconcile_redistribution(self.device, {"entries": [corrected]})[0]
+        state = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [corrected]}))[0]
 
         self.assertEqual(Redistribution.objects.get().metric_type, "external")
         self.assertEqual(state.metric_type, "external")
@@ -1117,7 +1161,7 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry()]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry()]}))
         state = NSORedistributionState.objects.get()
         state.redistribution.metric_type = "internal"
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
@@ -1130,7 +1174,7 @@ class TestReconcileRedistribution(TestCase):
         corrected = self._entry()
         corrected.pop("metric_type")
 
-        state = reconcile_redistribution(self.device, {"entries": [corrected]})[0]
+        state = reconcile_redistribution(self.device, redistribution_read_payload({"entries": [corrected]}))[0]
 
         self.assertEqual(Redistribution.objects.get().metric_type, "internal")
         self.assertEqual(state.metric_type, "internal")
@@ -1146,7 +1190,7 @@ class TestReconcileRedistribution(TestCase):
 
         omitted = self._entry()
         omitted.pop("metric_type")
-        reconcile_redistribution(self.device, {"entries": [omitted]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [omitted]}))
 
         self.assertEqual(Redistribution.objects.get().metric_type, "")
 
@@ -1158,14 +1202,16 @@ class TestReconcileRedistribution(TestCase):
         ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         redist = Redistribution.objects.get(source_protocol="static")
         redist.metric = 99  # operator edit
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
         with intent_transaction(footprint_for_instance(redist)):
             redist.save()
-        states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})  # device also moved
+        states = reconcile_redistribution(
+            self.device, redistribution_read_payload({"entries": [self._entry(metric=20)]})
+        )  # device also moved
         self.assertEqual(states[0].status, "conflict")
         redist.refresh_from_db()
         self.assertEqual(redist.metric, 99)  # edit preserved
@@ -1180,11 +1226,11 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         self.assertEqual(NSORedistributionState.objects.count(), 1)
         self.assertEqual(Redistribution.objects.count(), 1)
 
-        reconcile_redistribution(self.device, {"entries": []})  # device removed it
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": []}))  # device removed it
         self.assertEqual(NSORedistributionState.objects.count(), 0)  # overlay gone
         self.assertEqual(Redistribution.objects.count(), 0)  # object gone
 
@@ -1212,7 +1258,7 @@ class TestReconcileRedistribution(TestCase):
                 status="imported",
             )
 
-        reconcile_redistribution(self.device, {"entries": []})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": []}))
 
         self.assertFalse(NSORedistributionState.objects.exists())
         self.assertFalse(Redistribution.objects.filter(pk=native.pk).exists())
@@ -1230,7 +1276,7 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         native = Redistribution.objects.get()
         statements = []
 
@@ -1240,7 +1286,10 @@ class TestReconcileRedistribution(TestCase):
 
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
-            patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value={"entries": []}),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_redistribution",
+                return_value=redistribution_read_payload({"entries": []}),
+            ),
             connection.execute_wrapper(observe_sql),
         ):
             context = reconcile_category(self.device, mgmt, "redistribution")
@@ -1268,13 +1317,13 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": [self._entry(metric=10)]}))
         s = NSORedistributionState.objects.get(management__device=self.device)
         s.status = "accepted"
         s.accepted_at = timezone.now()
         save_overlay_fixture(s, update_fields=["status", "accepted_at"])
 
-        reconcile_redistribution(self.device, {"entries": []})  # device removed it
+        reconcile_redistribution(self.device, redistribution_read_payload({"entries": []}))  # device removed it
         s.refresh_from_db()
         self.assertFalse(s.device_present)
         self.assertIn(s.status, ("accepted", "deploying", "in_sync", "apply_failed"))

@@ -20,6 +20,7 @@ from netbox_nso_plugin.models import (
 
 from ._outbox_case import ReceiptAdapter, make_managed, mirror_update
 from ._ownership_case import acquire_bgp_router, acquire_overlay
+from ._routing_observation_case import store_redistribution_observation
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 SOURCE_AS_MESSAGE = "The device's NED requires a source AS for this BGP redistribution."
@@ -56,6 +57,7 @@ class TestRedistributionPushErrors(_CascadeFlushMixin, IntentPushResetMixin, Tra
         acquire_overlay(
             NSOOSPFInstanceState, management=self.mgmt, ospf_instance=ospf, process_id="1", status="in_sync"
         )
+        store_redistribution_observation(self.mgmt)
         self.rejections = {"isis": "bgp_source_as_required"}
         self.adapter = ReceiptAdapter(respond=self._adapter_response)
         for patcher in self.adapter.patches():

@@ -169,9 +169,7 @@ def _content_hash(content: dict) -> str:
 
 def _bgp_complete_observation(payload):
     """Require complete collection coverage before changing the native graph or lifecycle."""
-    from types import SimpleNamespace
-
-    from .routing_policy_projection import nested_gaps
+    from .collection_coverage import collection_gaps
 
     observation = payload.get("observation")
     if observation is None:
@@ -185,17 +183,19 @@ def _bgp_complete_observation(payload):
         and document.get("routers") is not None
         and not document.get("unprojectable")
         and all(_bgp_router_fields_present(router) for router in document["routers"])
-        and not nested_gaps("bgp", SimpleNamespace(document=document))
+        and not collection_gaps("bgp", document)
     )
 
 
 def _bgp_router_fields_present(router):
+    from .comparison_values import observed_items
+
     if not {"asn", "router_id"} <= set(router.get("present") or ()) or "router_id" not in router:
         return False
-    for scope in router.get("scope") or ():
+    for scope in observed_items(router, "scope"):
         if "vrf" not in (scope.get("present") or ()) or not isinstance(scope.get("vrf"), str):
             return False
-        for family in scope.get("address_family") or ():
+        for family in observed_items(scope, "address_family"):
             if "afi" not in (family.get("present") or ()) or not family.get("afi"):
                 return False
     return True

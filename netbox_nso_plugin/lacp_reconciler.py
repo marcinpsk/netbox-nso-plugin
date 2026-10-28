@@ -284,6 +284,10 @@ class _LACPReconcilePlanner:
 
 def lacp_reconcile_plan(device, payload: dict):
     """Freeze native writes and overlay outcomes from one projected topology."""
+    from .collection_coverage import require_collection_coverage
+
+    if "observation" in payload:
+        require_collection_coverage("lag_config", payload["observation"])
     management = NSODeviceManagement.objects.filter(device=device).first()
     planned_at = timezone.now()
     if management is None:

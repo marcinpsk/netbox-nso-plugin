@@ -385,6 +385,7 @@ def _bgp_router_display_scopes(state):
 def _bgp_peer_observations(management_id):
     """Index published peer observations by canonical router, VRF, and address."""
     from .bgp_reconciler import canonical_bgp_peer_identity
+    from .comparison_values import observed_items
     from .models import NSOFamilyObservation
 
     document = (
@@ -393,9 +394,9 @@ def _bgp_peer_observations(management_id):
         .first()
     )
     peers = {}
-    for router in (document or {}).get("routers") or []:
-        for scope in router.get("scope") or []:
-            for peer in scope.get("peer") or []:
+    for router in observed_items(document or {}, "routers"):
+        for scope in observed_items(router, "scope"):
+            for peer in observed_items(scope, "peer"):
                 try:
                     identity = canonical_bgp_peer_identity(router["asn"], scope.get("vrf") or "", peer["peer_address"])
                 except ValueError:
@@ -1901,11 +1902,14 @@ class NSOCategoryView(AuthorizedView):
 
     def _grid_section(self, states, accept_route, fields, related=None):
         """Serialize projected owners and count the same buckets the grid filters."""
+        from .redistribution_coverage import covered_by_management
         from .refusal_display import group_projection, project_rows, row_projection
 
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
         owners = project_rows(states)
+        # A native-gap check reads redistribution coverage: read it once per management, not per row.
+        covered = covered_by_management([st for st in owners if isinstance(st, NSORedistributionState)])
         related_rows = {id(st): list(related(st)) if related else [] for st in owners}
         project_rows([row for rows_of in related_rows.values() for row in rows_of])
         for st in owners:
@@ -1926,7 +1930,7 @@ class NSOCategoryView(AuthorizedView):
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
                 "native_gap": bool(accept_route)
                 and st.status != "deploying"
-                and _owned_native_gap(st, self.request.user),
+                and _owned_native_gap(st, self.request.user, covered.get(st.management_id)),
             }
             row["accept_url"] = (
                 reverse(accept_route, args=[st.pk])
@@ -6668,8 +6672,11 @@ class NSOProvisionLinkRoleView(AuthorizedView):
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 
-def _owned_native_gap(state, user):
-    """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it."""
+def _owned_native_gap(state, user, covered):
+    """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it.
+
+    *covered* is the redistribution admission of the row's management (None for another overlay).
+    """
     from netbox_routing.models import BFDInterface
 
     from .status_machine import is_owned
@@ -6688,7 +6695,7 @@ def _owned_native_gap(state, user):
 
         return _resolve_redist_destination(
             state.management.device, state.dest_protocol, state.dest_ref
-        ) is not None and not _redistribution_materialization_blocker(state, user)
+        ) is not None and not _redistribution_materialization_blocker(state, user, covered)
     return False
 
 
@@ -6717,6 +6724,9 @@ class RoutingStateAcceptMixin(AuthorizedView, abstract=True):
         """
         return (), (), (), ()
 
+    def _validate_accept(self, states):
+        """Check family coverage again after the writer acquires its locks."""
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
@@ -6740,6 +6750,7 @@ class RoutingStateAcceptMixin(AuthorizedView, abstract=True):
             grant=OwnershipGrant("accept"),
             saves=(*native_saves, planned_save(candidate, update_fields=fields, references=references)),
             planned_at=candidate.accepted_at,
+            validate_after_acquire=lambda: self._validate_accept((state,)),
         )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
@@ -7708,11 +7719,13 @@ class NSOOSPFInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     policy = _accept_policy(NSOOSPFInterfaceState)
 
 
-def _redistribution_accept_blocker(state):
+def _redistribution_accept_blocker(state, covered):
     from .ownership_planner import OwnershipNotQualified, require_bgp_redistribution_destination
+    from .redistribution_coverage import require_covered_component
 
     try:
         require_bgp_redistribution_destination(state)
+        require_covered_component(state, covered)
     except OwnershipNotQualified as exc:
         return exc.public_message
     return ""
@@ -7756,7 +7769,7 @@ def _redistribution_native_writes(candidate, user):
     return (save,), ((native, None, True),), ("redistribution",), (("redistribution", native),)
 
 
-def _redistribution_materialization_blocker(state, user):
+def _redistribution_materialization_blocker(state, user, covered):
     """Return the shared refusal for a native-gap offer and its Accept request."""
     from netbox_routing.models import RouteMap
 
@@ -7766,7 +7779,7 @@ def _redistribution_materialization_blocker(state, user):
         and not RouteMap.objects.restrict(user, "view").filter(name=state.route_map).exists()
     ):
         return f"Route map {state.route_map!r} does not exist in NetBox."
-    return _redistribution_accept_blocker(state)
+    return _redistribution_accept_blocker(state, covered)
 
 
 class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
@@ -7775,10 +7788,25 @@ class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
     policy = _accept_policy(NSORedistributionState)
 
     def _accept_blocker(self, state):
-        return _redistribution_materialization_blocker(state, self.request.user)
+        from .redistribution_coverage import applied_covered_protocols
+
+        return _redistribution_materialization_blocker(
+            state, self.request.user, applied_covered_protocols(state.management_id)
+        )
 
     def _native_writes(self, candidate):  # noqa: D102
         return _redistribution_native_writes(candidate, self.request.user)
+
+    def _validate_accept(self, states):
+        _validate_redistribution_accept(states)
+
+
+def _validate_redistribution_accept(states):
+    from .redistribution_coverage import covered_by_management, require_covered_component
+
+    covered = covered_by_management(states)
+    for state in states:
+        require_covered_component(state, covered[state.management_id])
 
 
 # ── Routing bulk accept views (Track A) ───────────────────────────────────────
@@ -7803,13 +7831,22 @@ class RoutingBulkAcceptMixin(AuthorizedView, abstract=True):
         """Return why *state* cannot become owned, or an empty string."""
         return ""
 
+    def _first_accept_blocker(self, candidates):
+        """Return the first (row, reason) of *candidates* that cannot become owned, or None."""
+        return next(((row, reason) for row in candidates if (reason := self._accept_blocker(row))), None)
+
+    def _validate_accept(self, states):
+        """Check family coverage again after the writer acquires its locks."""
+
     def _build_accept_plan(self, mgmt, accepted, saves):
         """Build the family-specific exact plan and replay operations."""
         from .renderer_writer import RendererMutationPlan
 
-        return RendererMutationPlan.build(grant=OwnershipGrant("accept"), saves=saves), [
-            (*operation, False) for operation in accepted
-        ]
+        return RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"),
+            saves=saves,
+            validate_after_acquire=lambda: self._validate_accept(tuple(row for row, _fields in accepted)),
+        ), [(*operation, False) for operation in accepted]
 
     def post(self, request, device_pk):  # noqa: D102
         import copy
@@ -7834,7 +7871,7 @@ class RoutingBulkAcceptMixin(AuthorizedView, abstract=True):
                 .select_related("management")
                 .order_by("pk")
             )
-            blocked = next(((row, reason) for row in candidates if (reason := self._accept_blocker(row))), None)
+            blocked = self._first_accept_blocker(candidates)
             if blocked is not None:
                 row, reason = blocked
                 messages.error(request, f"Cannot accept {row}: {reason}")
@@ -7971,13 +8008,27 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     policy = _BULK_ACCEPT_POLICY
     model_class = NSORedistributionState
 
-    def _accept_blocker(self, state):
-        return _redistribution_accept_blocker(state)
+    def _first_accept_blocker(self, candidates):
+        from .redistribution_coverage import covered_by_management
+
+        covered = covered_by_management(candidates)
+        return next(
+            (
+                (row, reason)
+                for row in candidates
+                if (reason := _redistribution_accept_blocker(row, covered[row.management_id]))
+            ),
+            None,
+        )
+
+    def _validate_accept(self, states):
+        _validate_redistribution_accept(states)
 
     def _push(self, mgmt):
+        from .redistribution_coverage import applied_covered_protocols
         from .signals import _OWNED_PUSH_STATUSES, redistribution_destinations
 
-        supported = redistribution_destinations()
+        supported = set(redistribution_destinations()) & applied_covered_protocols(mgmt.pk)
         destinations = (
             self.model_class.objects.filter(
                 management=mgmt,

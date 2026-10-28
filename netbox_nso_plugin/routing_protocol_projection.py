@@ -4,7 +4,7 @@
 
 from collections import defaultdict
 
-from .comparison_values import MISSING, ProjectedEntry, _normalized, observed_value
+from .comparison_values import MISSING, ProjectedEntry, _normalized, observed_collection, observed_items, observed_value
 
 ATTRIBUTES = {
     "isis": (
@@ -590,7 +590,7 @@ def _isis_device(scope, document, *, defaults=None):
     for kind, collection, model in (("process", "processes", ISISInstance), ("interface", "interfaces", ISISInterface)):
         if scope == "isis_flex_algo" and kind == "interface":
             continue
-        for item in document.get(collection) or []:
+        for item in observed_items(document, collection):
             prefix = (
                 ("process", item.get("process_tag", ""))
                 if kind == "process"
@@ -598,7 +598,7 @@ def _isis_device(scope, document, *, defaults=None):
             )
             if scope == "isis_flex_algo":
                 entries.append(ProjectedEntry(prefix, {}, coverage_only=True))
-                for child in item.get("flex_algo") or []:
+                for child in observed_items(item, "flex_algo"):
                     entries.append(
                         _wire_entry((*prefix, "flex_algo", child["algo_id"]), ISISFlexAlgo, child, ATTRIBUTES[scope])
                     )
@@ -607,7 +607,8 @@ def _isis_device(scope, document, *, defaults=None):
             _apply_isis_defaults(parent, item, (defaults or {}).get(kind, {}))
             entries.append(parent)
             for tag, child_model, key, names in _isis_children(kind):
-                children = [item[tag]] if key is None and item.get(tag) is not None else item.get(tag) or []
+                value = observed_collection(item, tag)
+                children = (() if value is MISSING else (value,)) if key is None else observed_items(item, tag)
                 for child in children:
                     identity = (*prefix, tag, child[key]) if key else (*prefix, tag)
                     entry = _wire_entry(identity, child_model, child, names)
@@ -646,20 +647,20 @@ def _ospf_device(document):
     from .template_content import _canonical_area_id, _clean_router_id
 
     entries = []
-    for item in document.get("instances") or []:
+    for item in observed_items(document, "instances"):
         identity = ("instance", str(item["process_id"]), item.get("vrf", ""))
         values = _normalized(
             item, {"router_id": str(_clean_router_id(item.get("router_id"))), "enabled": item.get("enabled")}
         )
         entries.append(ProjectedEntry(identity, values))
-        for area in item.get("area") or []:
+        for area in observed_items(item, "area"):
             entries.append(
                 ProjectedEntry(
                     (*identity, "area", _canonical_area_id(area["area_id"])),
                     _normalized(area, {"area_type": area.get("area_type")}),
                 )
             )
-    for item in document.get("interfaces") or []:
+    for item in observed_items(document, "interfaces"):
         fields = _ospf_interface_fields(item, None, None)
         values = {name: fields[name] for name in ("passive", "priority", "cost", "network_type")}
         values["auth_type"] = fields["authentication"]
@@ -683,11 +684,13 @@ def _ospf_device(document):
     return entries
 
 
-def _redist_device(document):
+def _redist_device(document, covered):
     from .redistribution_reconciler import _redist_device_content
 
     entries = []
     for index, item in enumerate(document.get("entries") or []):
+        if item.get("dest_protocol") not in covered:
+            continue
         try:
             identity = _redist_identity(item)
             reason = ""
@@ -715,10 +718,14 @@ def _redist_inventory_reason(component):
     return ""
 
 
-def _redist_coverage_entries(document):
+def _redist_coverage_entries(document, covered):
     entries = []
     for component in document.get("components") or []:
-        if _redist_inventory_reason(component):
+        if (
+            component.get("status") != "covered"
+            or component.get("protocol") not in covered
+            or _redist_inventory_reason(component)
+        ):
             continue
         protocol = component["protocol"]
         for parent in component.get("inventory") or []:
@@ -819,7 +826,7 @@ def _isis_device_dependencies(management, snapshot, entries):
     for row in ISISInstance.objects.filter(device_id=management.device_id).select_related("vrf"):
         processes[row.process_tag].extend((row, row.vrf))
     reported_interfaces = defaultdict(list)
-    for item in snapshot.document.get("interfaces") or []:
+    for item in observed_items(snapshot.document, "interfaces"):
         reported_interfaces[(item["interface_name"], item["af"])].extend(
             interfaces[item["interface_name"]]
             + interfaces[observed_value(item, "bound_port")]
@@ -891,7 +898,10 @@ def device_entries(scope, management, snapshot, ned_id="", *, native_items=()):
     elif scope == "ospf":
         entries = _ospf_device(snapshot.document)
     else:
-        entries = [*_redist_device(snapshot.document), *_redist_coverage_entries(snapshot.document)]
+        from .redistribution_coverage import covered_protocols
+
+        covered = covered_protocols(snapshot.document, snapshot.coverage)
+        entries = [*_redist_device(snapshot.document, covered), *_redist_coverage_entries(snapshot.document, covered)]
     dependencies = {
         "isis": _isis_device_dependencies,
         "isis_flex_algo": _isis_device_dependencies,
@@ -926,12 +936,20 @@ def _collection_gap(item, name):
     return ""
 
 
+def _protocol_collection_gap(item, name):
+    from .collection_coverage import segment_routing_absent
+
+    if name not in item.get("present", ()) and not (name == "segment_routing" and segment_routing_absent(item)):
+        return f"{name} collection was not reported"
+    return _collection_gap(item, name)
+
+
 def nested_gaps(scope, snapshot):
     document = snapshot.document
     gaps = {}
     if scope in {"isis", "isis_flex_algo"}:
         for kind, collection in (("process", "processes"), ("interface", "interfaces")):
-            for item in document.get(collection) or []:
+            for item in observed_items(document, collection):
                 prefix = (
                     ("process", item.get("process_tag", ""))
                     if kind == "process"
@@ -946,63 +964,38 @@ def nested_gaps(scope, snapshot):
                         else ("setting", "level", "prefix_sid")
                     )
                 for name in names:
-                    reason = _collection_gap(item, name)
+                    reason = _protocol_collection_gap(item, name)
                     if reason:
                         gaps[((*prefix, name), "")] = reason
     elif scope == "ospf":
-        for item in document.get("instances") or []:
-            reason = _collection_gap(item, "area")
+        for item in observed_items(document, "instances"):
+            reason = _protocol_collection_gap(item, "area")
             if reason:
                 gaps[(("instance", str(item["process_id"]), item.get("vrf", ""), "area"), "")] = reason
     elif scope == "redistribution":
-        covered = {item["protocol"] for item in snapshot.coverage.get("components", [])}
-        gaps.update(_redist_nested_gaps(document, covered))
+        from .redistribution_coverage import covered_protocols
+
+        covered_protocols(document, snapshot.coverage)
     return gaps
 
 
-def _redist_nested_gaps(document, covered):
-    gaps = {}
-    for item in document.get("components") or []:
-        protocol = item.get("protocol")
-        if protocol not in covered or _redist_inventory_reason(item):
-            continue
-        for destination in item.get("inventory") or []:
-            if protocol != "bgp":
-                reference = destination.get("process_tag", "") if protocol == "isis" else str(destination["process_id"])
-                vrf = destination.get("vrf", "") if protocol == "ospf" else None
-                reason = _collection_gap(destination, "redistribute")
-                if reason:
-                    gaps[((protocol, reference, vrf), "redistribute")] = reason
-                continue
-            asn = _redist_reference("bgp", destination["asn"])
-            reason = _collection_gap(destination, "scope")
-            if reason:
-                gaps[(("bgp",), "scope")] = reason
-            for scope in destination.get("scope") or []:
-                reason = _collection_gap(scope, "address_family")
-                if reason:
-                    gaps[(("bgp",), "address_family")] = reason
-                for family in scope.get("address_family") or []:
-                    reference = f"{asn}/{scope.get('vrf', '')}" + (f"/{family['afi']}" if family.get("afi") else "")
-                    reason = _collection_gap(family, "redistribute")
-                    if reason:
-                        gaps[(("bgp", reference, None), "redistribute")] = reason
-    return gaps
+def component_gaps(snapshot, *, read_unavailable=False):
+    from .observations import ObservationProtocolError
+    from .redistribution_coverage import PROTOCOLS, covered_protocols
 
-
-def component_gaps(snapshot):
-    covered = {item["protocol"] for item in snapshot.coverage.get("components", [])}
+    if read_unavailable:
+        return {protocol: "redistribution component is unavailable" for protocol in PROTOCOLS}
+    try:
+        covered = covered_protocols(snapshot.document, snapshot.coverage)
+    except ObservationProtocolError:
+        return {protocol: "redistribution component coverage is invalid" for protocol in PROTOCOLS}
     inventories = {item.get("protocol"): item for item in snapshot.document.get("components", [])}
     gaps = {}
-    for protocol in ("bgp", "isis", "ospf"):
+    for protocol in PROTOCOLS:
         if protocol not in covered:
-            gaps[protocol] = "redistribution component is not covered"
-        elif protocol not in inventories:
-            gaps[protocol] = "redistribution component was not reported"
+            gaps[protocol] = "redistribution component is unavailable"
         else:
-            reason = _collection_gap(inventories[protocol], "inventory") or _redist_inventory_reason(
-                inventories[protocol]
-            )
+            reason = _redist_inventory_reason(inventories[protocol])
             if reason:
                 gaps[protocol] = reason
     return gaps

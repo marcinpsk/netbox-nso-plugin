@@ -66,10 +66,14 @@ CATEGORY_FAMILIES: dict[str, tuple[str, ...]] = {
 # Worst-first severity for merging a category's family states into one chip (D8/D10).
 # 'healthy' = fresh-present OR authoritative-empty (absent_authoritative/cleared/True).
 AGGREGATION_ORDER: tuple[str, ...] = (
+    "reset_pending",
     "unavailable",  # incl. materialization error — red
+    "not_covered",
     "unknown",  # unrecognized/malformed — red, fail-closed visible
+    "unproven",
     "stale",  # amber
     "aged",  # amber
+    "refresh_pending",
     "not_authoritative",  # muted outline
     "unsupported",  # muted outline
     "healthy",  # no chip

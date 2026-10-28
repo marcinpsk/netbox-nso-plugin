@@ -36,7 +36,13 @@ def test_unobserved_routing_inventory_is_unavailable(scope):
     else:
         for name in document["present"]:
             document[name] = None
-    snapshots = {spec.family: SimpleNamespace(document=document, coverage=observed["coverage"])}
+    snapshots = {
+        spec.family: SimpleNamespace(
+            document=document,
+            coverage=observed["coverage"],
+            read_state=SimpleNamespace(observed_outcome="present", observed_result="replaced", observed_succeeded=True),
+        )
+    }
     rows = [row for row in differences(SimpleNamespace(), user=None, snapshots=snapshots) if row.scope == scope]
     assert rows
     assert all(row.kind == "unavailable" for row in rows)

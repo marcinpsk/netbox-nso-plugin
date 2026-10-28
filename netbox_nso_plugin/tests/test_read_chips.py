@@ -307,6 +307,49 @@ class TestTabLiveReadStateFetch(TestCase):
             resp = self.client.get(url)
         return resp, m_rs
 
+    def test_not_covered_renders_red_collection_gap_on_the_tab(self):
+        from netbox_nso_plugin.adapter_client import bound_session
+
+        from ._observation_case import ObservationTransport, observation
+        from .test_read_gate import _rs
+
+        mirror_update(self.mgmt, adapter_source_epoch=1, source_epoch_aware=True)
+        transport = ObservationTransport(
+            self.mgmt.adapter_device_id, observation("interface_attributes"), observation("interface_ip")
+        )
+        transport.documents.update(
+            {
+                str(self.mgmt.adapter_device_id): {
+                    "id": self.mgmt.adapter_device_id,
+                    "nso_device_name": self.mgmt.nso_device_name,
+                    "nso_instance": self.mgmt.nso_instance.adapter_instance_id,
+                },
+                "capability": {"known": False},
+                "read-state": {
+                    "device_id": self.mgmt.adapter_device_id,
+                    "families_version": 1,
+                    "families": {
+                        "l2_service": _rs(
+                            outcome="unavailable",
+                            reason="not_covered",
+                            freshness=None,
+                            result="kept",
+                            incarnation=_INC[0],
+                            incarnation_born=_INC[1],
+                        )
+                    },
+                },
+            }
+        )
+        with bound_session(transport.session()):
+            response = self.client.get(reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
+        self.assertContains(response, "NSO collections unavailable")
+        self.assertNotContains(response, "unknown read state")
+        self.assertContains(response, "NSO did not report every collection for this category")
+        self.mgmt.refresh_from_db()
+        chip = _chip(self.device, self.mgmt, "l2_services")
+        self.assertEqual((chip["state"], chip["css"]), ("not_covered", "text-bg-danger"))
+
     def test_success_upserts_observed_rows(self):
         families = {
             "l2_service": {

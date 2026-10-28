@@ -460,9 +460,12 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
 
     from . import merge_util
     from . import status_machine as sm
+    from .collection_coverage import require_collection_coverage
     from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
     from .renderer_writer import IntentPlanStaleError, planned_delete, planned_m2m_set, planned_save
 
+    if isinstance(payload, dict) and "observation" in payload:
+        require_collection_coverage("switchport", payload["observation"])
     items = _validated_switchport_items(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:

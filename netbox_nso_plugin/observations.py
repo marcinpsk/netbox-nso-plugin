@@ -33,6 +33,10 @@ def validate_observation_schema(family, observation):
         OBSERVATION_SCHEMAS[family].validate(observation)
     except ValidationError as exc:
         raise ObservationProtocolError("Invalid observation: schema.") from exc
+    if family == "redistribution":
+        from .redistribution_coverage import covered_protocols
+
+        covered_protocols(observation["document"], observation["coverage"])
 
 
 def observation_defaults(family, revision, source_epoch, observation):

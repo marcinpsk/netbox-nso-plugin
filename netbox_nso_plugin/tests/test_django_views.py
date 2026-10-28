@@ -2818,6 +2818,10 @@ class TestRoutingStateAcceptView(ViewTestBase):
         'staged Nd' staleness badge can never fire for them."""
         from netbox_nso_plugin.models import NSORedistributionState
 
+        from ._routing_observation_case import store_redistribution_observation
+
+        store_redistribution_observation(self.mgmt)
+
         state = NSORedistributionState.objects.create(
             management=self.mgmt,
             dest_protocol="bgp",
@@ -8655,6 +8659,9 @@ class TestReviewRegressionPins(ViewTestBase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.views import NSORedistributionBulkAcceptView
 
+        from ._routing_observation_case import store_redistribution_observation
+
+        store_redistribution_observation(self.mgmt)
         acquire_overlay(
             NSORedistributionState,
             management=self.mgmt,
@@ -8702,6 +8709,10 @@ class TestReviewRegressionPins(ViewTestBase):
 
     def test_routing_bulk_accept_stamps_first_ownership_time(self):
         from netbox_nso_plugin.models import NSORedistributionState
+
+        from ._routing_observation_case import store_redistribution_observation
+
+        store_redistribution_observation(self.mgmt)
 
         row = NSORedistributionState.objects.create(
             management=self.mgmt,

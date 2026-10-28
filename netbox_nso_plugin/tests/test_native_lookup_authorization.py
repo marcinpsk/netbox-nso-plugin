@@ -42,6 +42,7 @@ from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
 from ._authority_case import AdapterCase, FakeAdapter, grant, operator
 from ._outbox_case import make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
+from ._routing_observation_case import store_redistribution_observation
 
 
 class TestStoredInterfaceIpVrf(AdapterCase):
@@ -448,6 +449,7 @@ class TestRedistributionDestinationLookup(AdapterCase):
                 source_protocol="static",
                 status="accepted",
             )
+        store_redistribution_observation(cls.management)
 
     def _user(self, hidden=None):
         grants = [(("add",), Redistribution, None)]
@@ -525,6 +527,7 @@ class TestRedistributionNativeLookup(AdapterCase):
                 source_ref="",
                 status="accepted",
             )
+        store_redistribution_observation(cls.management)
 
     def _accept(self, user):
         self.client.force_login(user)

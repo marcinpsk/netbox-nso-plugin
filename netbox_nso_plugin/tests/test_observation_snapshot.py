@@ -48,7 +48,7 @@ class TestObservationSnapshot(TestCase):
                     read_state__management=self.management, read_state__family=family
                 )
                 self.assertEqual(saved.revision, revision)
-                self.assertEqual(saved.document, {"interfaces": [], "unprojectable": []})
+                self.assertEqual(saved.document, {"interfaces": [], "present": ["interfaces"], "unprojectable": []})
                 self.assertIsNotNone(saved.observed_at.utcoffset())
                 self.assertEqual(saved.read_state.applied_payload_revision, revision)
         self.assertEqual(NSOFamilyObservation.objects.count(), 2)
@@ -72,7 +72,9 @@ class TestObservationSnapshot(TestCase):
                 },
             }
         ]
-        transport.documents["interface-ips"]["interfaces"] = ip["document"]["interfaces"]
+        transport.documents["interface-ips"]["interfaces"] = [
+            {key: value for key, value in item.items() if key != "present"} for item in ip["document"]["interfaces"]
+        ]
         with bound_session(transport.session()):
             context = reconcile_category(self.device, self.management, "interfaces")
         self.assertEqual(context["_gate"]["interface_attributes"], "ran")

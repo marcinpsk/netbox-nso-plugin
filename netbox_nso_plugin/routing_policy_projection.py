@@ -6,7 +6,7 @@ import json
 from collections import defaultdict
 from ipaddress import ip_address, ip_network
 
-from .comparison_values import MISSING, ProjectedEntry, _normalized, observed_value
+from .comparison_values import MISSING, ProjectedEntry, _normalized, observed_collection, observed_items, observed_value
 
 _BGP_PEER_FIELDS = ("remote_as", "local_as", "enabled", "ttl", "source", "description", "peer_group", "bfd_enabled")
 _BGP_AF_FIELDS = ("enabled", "routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out")
@@ -68,15 +68,15 @@ def _reference_objects(document):
 
     names = defaultdict(set)
     for component_name in _POLICY_COMPONENTS.values():
-        for parent in document.get(component_name) or []:
+        for parent in observed_items(document, component_name):
             names[component_name].add(parent["name"])
-            for item in parent.get("entry") or []:
+            for item in observed_items(parent, "entry"):
                 for field_name, target in (
                     ("match_prefix_lists", "prefix_lists"),
                     ("match_community_lists", "community_lists"),
                     ("match_as_paths", "as_paths"),
                 ):
-                    names[target].update(item.get(field_name) or [])
+                    names[target].update(observed_items(item, field_name))
                 try:
                     names["prefix_lists"].update(_prefix_reference_names(item))
                     structured = structure_entry(_json_blob(item.get("match_json")), _json_blob(item.get("set_json")))
@@ -89,11 +89,11 @@ def _reference_objects(document):
                 names["route_maps"].update(
                     str(name) for name in _as_list(_json_blob(item.get("set_json")).get("apply"))
                 )
-    for router in document.get("routers") or []:
-        for scope in router.get("scope") or []:
+    for router in observed_items(document, "routers"):
+        for scope in observed_items(router, "scope"):
             for field_name, af_name in (("peer", "peer_address_family"), ("peer_group", "peer_group_address_family")):
-                for peer in scope.get(field_name) or []:
-                    for item in peer.get(af_name) or []:
+                for peer in observed_items(scope, field_name):
+                    for item in observed_items(peer, af_name):
                         for name in _BGP_AF_FIELDS[1:]:
                             value = item.get(name)
                             if value:
@@ -227,8 +227,8 @@ def _policy_entry_values(component_name, item, *, prefix_resolver=None):
 
 def _observed_prefix_units(document):
     units = {}
-    for parent in document.get("prefix_lists") or []:
-        if observed_value(parent, "entry") in (MISSING, None):
+    for parent in observed_items(document, "prefix_lists"):
+        if observed_collection(parent, "entry") is MISSING:
             units[parent["name"]] = None
             continue
         try:
@@ -380,7 +380,9 @@ def _native_policy(management):
                 item = {}
             result.append(projected)
             pending.append((projected, item))
-            reference_document.setdefault(component_name, []).append({"name": root.name, "entry": [item]})
+            reference_document.setdefault(component_name, []).append(
+                {"name": root.name, "entry": [item], "present": ["name", "entry"]}
+            )
     edited_policies = {projected.identity[:2] for projected, item in pending if item.get("structured_edited")}
     for projected, item in pending:
         if (
@@ -389,7 +391,7 @@ def _native_policy(management):
             and isinstance(item.get("match_json"), dict)
         ):
             item["match_json"].pop("_rpl_raw", None)
-    references = _reference_objects(reference_document)
+    references = _reference_objects({**reference_document, "present": list(reference_document)})
     for projected, item in pending:
         if not projected.reason:
             projected.values, projected.unavailable = _policy_comparison_values(
@@ -431,6 +433,7 @@ def _native_policy_entry(component_name, row, identity):
         values = {} if reason else _policy_entry_values(component_name, item)
     except ValueError:
         values, reason = {}, "invalid native policy content"
+    item["present"] = list(item)
     return ProjectedEntry(identity, values, tuple(entry_objects), reason=reason), item
 
 
@@ -678,7 +681,7 @@ def _device_policy(document, references):
     result = []
     units = _observed_prefix_units(document)
     for component_name in _POLICY_COMPONENTS.values():
-        for parent in document.get(component_name) or []:
+        for parent in observed_items(document, component_name):
             identity = (component_name, parent["name"])
             parent_objects = (references.get(component_name, {}).get(parent["name"]),)
             fields = (
@@ -690,7 +693,7 @@ def _device_policy(document, references):
                 ProjectedEntry(identity, {name: observed_value(parent, name) for name in fields}, parent_objects)
             )
             sequences = set()
-            for index, item in enumerate(parent.get("entry") or [], start=1):
+            for index, item in enumerate(observed_items(parent, "entry"), start=1):
                 reason = "multiple policy entries have the same sequence" if item["sequence"] in sequences else ""
                 sequences.add(item["sequence"])
                 entry_identity = (*identity, "entry", index)
@@ -740,7 +743,7 @@ def _device_bgp(document, objects, references, dependencies, *, native_values=No
         return projected
 
     def peer_afs(peer, parent, collection):
-        for item in peer.get(collection) or []:
+        for item in observed_items(peer, collection):
             # Keep the reconciler's AF omission defaults.
             values = {name: item.get(name) for name in _BGP_AF_FIELDS}
             values["enabled"] = bool(item.get("enabled", True))
@@ -758,7 +761,7 @@ def _device_bgp(document, objects, references, dependencies, *, native_values=No
                 )
             )
 
-    for router in document.get("routers") or []:
+    for router in observed_items(document, "routers"):
         router_identity = ("router", _bgp_asn_identity(router["asn"]))
         try:
             values = {"router_id": str(ip_address(router["router_id"])) if router.get("router_id") else None}
@@ -768,7 +771,7 @@ def _device_bgp(document, objects, references, dependencies, *, native_values=No
         parent = project(
             router_identity, router, values, dependencies.get(("asn", router_identity[1]), ()), reason=reason
         )
-        for scope in router.get("scope") or []:
+        for scope in observed_items(router, "scope"):
             vrf = scope.get("vrf", "")
             scoped = project(
                 (*router_identity, "scope", vrf),
@@ -777,9 +780,9 @@ def _device_bgp(document, objects, references, dependencies, *, native_values=No
                 dependencies.get(("vrf", vrf), ()),
                 reason=parent.reason,
             )
-            for item in scope.get("address_family") or []:
+            for item in observed_items(scope, "address_family"):
                 project((*scoped.identity, "address_family", item["afi"]), item, {})
-            for item in scope.get("peer") or []:
+            for item in observed_items(scope, "peer"):
                 identity = (*scoped.identity, "peer", _bgp_address_identity(item["peer_address"]))
                 values = {name: item.get(name) for name in _BGP_PEER_FIELDS}
                 reason = scoped.reason
@@ -806,7 +809,7 @@ def _device_bgp(document, objects, references, dependencies, *, native_values=No
                     reason,
                 )
                 peer_afs(item, peer, "peer_address_family")
-            for item in scope.get("peer_group") or []:
+            for item in observed_items(scope, "peer_group"):
                 reason = scoped.reason
                 try:
                     remote_as = _asn(item.get("remote_as"))
@@ -849,16 +852,16 @@ def _bgp_reference_names(document):
     from .bgp_reconciler import _canonical_source_ip
 
     asns, addresses, interfaces, vrfs, groups = set(), set(), set(), set(), set()
-    for router in document.get("routers") or []:
+    for router in observed_items(document, "routers"):
         asns.add(_bgp_asn_identity(router["asn"]))
-        for scope in router.get("scope") or []:
+        for scope in observed_items(router, "scope"):
             vrf = scope.get("vrf", "")
             if vrf:
                 vrfs.add(vrf)
-            for group in scope.get("peer_group") or []:
+            for group in observed_items(scope, "peer_group"):
                 groups.add(group["name"])
             for collection in ("peer", "peer_group"):
-                for item in scope.get(collection) or []:
+                for item in observed_items(scope, collection):
                     for name in ("remote_as", "local_as"):
                         if item.get(name) is not None:
                             asns.add(_bgp_asn_identity(item[name]))
@@ -938,23 +941,30 @@ def nested_gaps(scope, snapshot):
     gaps = {}
 
     def missing(parent, identity, collection):
-        if observed_value(parent, collection) in (MISSING, None):
+        if observed_collection(parent, collection) is MISSING:
             gaps[((*identity, collection), collection)] = f"{collection} coverage is unavailable"
 
     if scope == "route_policy":
         for component_name in _POLICY_COMPONENTS.values():
-            for parent in snapshot.document.get(component_name) or []:
+            for parent in observed_items(snapshot.document, component_name):
                 missing(parent, (component_name, parent["name"]), "entry")
+                if component_name == "route_maps":
+                    for index, item in enumerate(observed_items(parent, "entry"), start=1):
+                        for name in ("match_prefix_lists", "match_community_lists", "match_as_paths"):
+                            if observed_collection(item, name) is MISSING:
+                                gaps[((component_name, parent["name"], "entry", index), name)] = (
+                                    f"{name} coverage is unavailable"
+                                )
         return gaps
-    for router in snapshot.document.get("routers") or []:
+    for router in observed_items(snapshot.document, "routers"):
         identity = ("router", _bgp_asn_identity(router["asn"]))
         missing(router, identity, "scope")
-        for parent in router.get("scope") or []:
+        for parent in observed_items(router, "scope"):
             scoped = (*identity, "scope", parent.get("vrf", ""))
             for collection in ("address_family", "peer", "peer_group"):
                 missing(parent, scoped, collection)
-            for peer in parent.get("peer") or []:
+            for peer in observed_items(parent, "peer"):
                 missing(peer, (*scoped, "peer", _bgp_address_identity(peer["peer_address"])), "peer_address_family")
-            for group in parent.get("peer_group") or []:
+            for group in observed_items(parent, "peer_group"):
                 missing(group, (*scoped, "peer_group", group["name"]), "peer_group_address_family")
     return gaps
