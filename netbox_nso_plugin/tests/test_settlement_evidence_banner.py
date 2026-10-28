@@ -108,7 +108,7 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
         self.management.refresh_from_db()
         self.assertEqual(
             {key: self.management.settle_evidence_error.get(key) for key in ("job_id", "settle_seq", "reason")},
-            {"job_id": 501, "settle_seq": 42, "reason": "invalid settlement evidence"},
+            {"job_id": 502, "settle_seq": 41, "reason": "invalid settlement evidence"},
         )
 
     def test_first_invalid_response_from_a_new_store_remains_visible(self):
