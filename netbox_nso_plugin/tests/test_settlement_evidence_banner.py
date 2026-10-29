@@ -734,6 +734,23 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         self.assertIsNone(self.management.settle_cursor_seq)
 
+    def test_feed_values_postgresql_cannot_store_stall_with_a_rendered_banner(self):
+        for label, extra in (
+            ("nul", {"detail": "\x00"}),
+            ("surrogate", {"\ud800": 1}),
+            ("infinite", {"n": float("inf")}),
+        ):
+            with self.subTest(case=label):
+                mirror_update(self.management, settle_evidence_error={})
+                job = self.job(kind="sync", status="succeeded")
+                self.serve_feed([{**job, "result": {**(job["result"] or {}), **extra}}])
+                self.assertTrue(consume_static_route_settlements(self.management).stalled)
+                response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+                self.assertContains(response, "Settlement is paused", count=1)
+                self.assertContains(response, "invalid job envelope")
+                self.management.refresh_from_db()
+                self.assertIsNone(self.management.settle_cursor_seq)
+
     def test_out_of_range_evidence_integers_stall_with_a_rendered_banner(self):
         feed, generations, deployment = self.settlement_responses()
         cases = [

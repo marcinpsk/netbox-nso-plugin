@@ -3,6 +3,7 @@
 """Validate settlement response shapes before the settlement walk reads them."""
 
 import json
+import math
 from importlib.resources import files
 from uuid import UUID
 
@@ -10,6 +11,9 @@ from jsonschema import Draft202012Validator
 
 _SCHEMA = json.loads(files("netbox_nso_plugin").joinpath("schemas/settlements.json").read_text(encoding="utf-8"))
 _ARRAY_COMPONENTS = frozenset({"JobOut", "DeviceGenerationOut"})
+APPLY_SKIP_REASONS = frozenset(
+    _SCHEMA["components"]["schemas"]["ActionApplyOut"]["properties"]["skipped"]["additionalProperties"]["enum"]
+)
 # The deepest live settlement response measured 12 levels (2026-10-29).
 MAX_NESTING = 64
 # Every integer that settlement persists lands in a PostgreSQL bigint column.
@@ -69,16 +73,31 @@ def _error_identity(component, body, path):
     return (prefix, identity) if identity else None
 
 
+def _jsonb_text(value):
+    """Return whether PostgreSQL JSONB can store *value* as text: valid UTF-8 and no NUL."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return "\x00" not in value
+
+
 def within_wire_bounds(body):
-    """Return whether *body* nests at most ``MAX_NESTING`` deep and holds only int64 integers, without recursion."""
+    """Return whether *body* nests at most ``MAX_NESTING`` deep and PostgreSQL can store it, without recursion."""
     stack = [(body, 1)]
     while stack:
         value, depth = stack.pop()
         if type(value) is int and value not in _INT64:
             return False
+        if type(value) is float and not math.isfinite(value):
+            return False
+        if type(value) is str and not _jsonb_text(value):
+            return False
         if isinstance(value, dict | list):
             if depth > MAX_NESTING:
                 return False
+            if isinstance(value, dict):
+                stack.extend((key, depth) for key in value)
             stack.extend((item, depth + 1) for item in (value.values() if isinstance(value, dict) else value))
     return True
 
@@ -88,7 +107,7 @@ def validate_settlement_response(component, body, device_id):
     from .adapter_client import InvalidJobEvidence
 
     reason = "invalid job envelope" if component == "JobOut" else "invalid settlement evidence"
-    # Bound first: the validator and later comparisons recurse, and the database stores int64.
+    # Bound first: the validator and later comparisons recurse, and PostgreSQL must store every value.
     if not within_wire_bounds(body):
         raise InvalidJobEvidence({"device_id": device_id}, reason)
     errors = list(VALIDATORS[component].iter_errors(body))

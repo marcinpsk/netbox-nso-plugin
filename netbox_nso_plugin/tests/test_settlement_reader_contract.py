@@ -351,6 +351,66 @@ def test_generation_semantic_failures_keep_the_reader_exception_contract(failure
     assert raised.value.reason == "invalid settlement evidence"
 
 
+JSONB_REJECTED = {
+    "nul value": {"detail": "\x00"},
+    "nul key": {"\x00": 1},
+    "lone surrogate value": {"detail": "\ud800"},
+    "lone surrogate key": {"\ud800": 1},
+    "infinite number": {"n": float("inf")},
+    "not a number": {"n": float("nan")},
+}
+
+
+@pytest.mark.parametrize("case", sorted(JSONB_REJECTED))
+def test_schema_bound_rejects_values_postgresql_jsonb_cannot_store(case):
+    from netbox_nso_plugin.settlement_schemas import validate_settlement_response
+
+    from .test_adapter_client_ext import _JOB_OUT
+
+    stored = [{**_JOB_OUT, "result": {**_JOB_OUT["result"], "detail": "caf\u00e9 \U0001f600", "n": 1.5}}]
+    assert validate_settlement_response("JobOut", stored, 7) is stored
+    page = [{**_JOB_OUT, "result": {**_JOB_OUT["result"], **JSONB_REJECTED[case]}}]
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        validate_settlement_response("JobOut", page, 7)
+    assert raised.value.job_id is None
+    assert raised.value.reason == "invalid job envelope"
+
+
+@pytest.mark.parametrize("case", sorted(JSONB_REJECTED))
+def test_receipt_jsonb_bound_keeps_the_reader_exception_contract(case):
+    from netbox_nso_plugin.intent_receipt_contract import validate_intent_receipts
+    from netbox_nso_plugin.refusal_contract import ContractError
+
+    receipt = {
+        "device_id": 7,
+        "section": "bgp",
+        "push_seq": 1,
+        "request_digest": "a" * 64,
+        "store_only": False,
+        "delete_origin": False,
+        "backfill_only": False,
+        "status_code": 200,
+        "response": JSONB_REJECTED[case],
+        "generation_id": 1,
+        "created_at": "2026-01-02T03:04:05+00:00",
+        "updated_at": None,
+    }
+    with pytest.raises(ContractError, match="invalid receipt bounds"):
+        validate_intent_receipts({"receipts": [receipt], "global_max_push_seq": None, "global_max_route_id": None})
+
+
+def test_apply_skip_reasons_follow_the_vendored_schema():
+    from netbox_nso_plugin.apply_settlement import apply_stream_partition
+    from netbox_nso_plugin.settlement_schemas import _SCHEMA
+
+    schema = _SCHEMA["components"]["schemas"]["ActionApplyOut"]["properties"]["skipped"]["additionalProperties"]
+    for reason in schema["enum"]:
+        selected, skipped, error = apply_stream_partition(
+            {"selected": {"bgp": 1}, "skipped": {"bgp": reason}}, {"bgp": 1}
+        )
+        assert (selected, skipped, error) == ({"bgp": 1}, {"bgp": reason}, None), reason
+
+
 @pytest.mark.parametrize("field", ["push_seq", "response"])
 def test_receipt_integer_bound_keeps_the_reader_exception_contract(field):
     from netbox_nso_plugin.intent_receipt_contract import validate_intent_receipts

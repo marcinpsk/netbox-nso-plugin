@@ -12,7 +12,7 @@ from uuid import UUID
 from django.utils import timezone
 
 from .refusal_contract import GENERATION_FIELDS, ContractError
-from .settlement_schemas import valid_store_incarnation
+from .settlement_schemas import APPLY_SKIP_REASONS, valid_store_incarnation
 
 logger = logging.getLogger(__name__)
 
@@ -239,9 +239,6 @@ def _load_attempts(
 _APPLY_GENERATION_FIELDS = frozenset(
     {"generation_id", "seq", "job_id", "mode", "source_push_seq", "stream_revisions", "digest"}
 )
-_APPLY_SKIP_REASONS = frozenset(
-    {"superseded", "already_applied", "already_authorized", "no_receipt", "backfill_only", "revision_mismatch"}
-)
 
 
 def apply_stream_partition(result, selected):
@@ -256,7 +253,7 @@ def apply_stream_partition(result, selected):
     if (
         not isinstance(skipped, dict)
         or not set(skipped).issubset(expected_selected)
-        or any(type(reason) is not str or reason not in _APPLY_SKIP_REASONS for reason in skipped.values())
+        or any(type(reason) is not str or reason not in APPLY_SKIP_REASONS for reason in skipped.values())
     ):
         return None, None, "Adapter returned invalid Apply skip results."
     return expected_selected, skipped, None
