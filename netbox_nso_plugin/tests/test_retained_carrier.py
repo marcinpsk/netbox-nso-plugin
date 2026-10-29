@@ -27,6 +27,8 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         from netbox_nso_plugin.refusal_display import settlement_stall_projection
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
+        from ._outbox_case import mirror_update
+
         self.prepare_automatic()
         self.serve_terminal_evidence(self.terminal())
         valid = make_generation_listing(source_push_seq=self.attempt.selected)
@@ -50,6 +52,7 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         for row in malformed:
             with self.subTest(row=row):
                 self.serve_listing([row])
+                mirror_update(self.management, settle_evidence_error={})
                 result = consume_static_route_settlements(self.management)
                 self.assertTrue(result.stalled)
                 self.assertFalse(result.drained)

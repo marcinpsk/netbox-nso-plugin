@@ -304,6 +304,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         from netbox_nso_plugin.settlement import settle_static_routes
 
         from ._adapter_http import make_response
+        from ._outbox_case import mirror_update
 
         self.prepare_automatic()
         self.serve_terminal_evidence(self.terminal())
@@ -341,6 +342,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                     invalid.clear()
                     invalid[field] = value
                     invalid["settle_seq"] = sequence
+                    mirror_update(self.management, settle_evidence_error={})
                     result = settle_static_routes(self.management)
                     self.assertTrue(result.stalled)
                     self.assertEqual(result.consumed, 0)
