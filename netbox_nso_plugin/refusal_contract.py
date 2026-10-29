@@ -9,6 +9,7 @@ from .execution_contract import (
     GENERATION_STATUSES,
     ContractError,
     _cause,
+    _key,
     _logical_identity,
     _positive,
     _require,
@@ -28,14 +29,19 @@ __all__ = (
     "ContractError",
     "_CAUSE_ORDER",
     "_cause",
-    "_logical_identity",
     "_positive",
     "_require",
     "_shape",
     "_timestamp",
+    "logical_key",
     "validate_carrier_generations",
     "validate_count_map",
     "validate_generation",
     "validate_refusals",
     "validate_result",
 )
+
+
+def logical_key(raw):
+    """Return the hashable canonical key of one logical row identity."""
+    return _key(_logical_identity(raw))

@@ -395,10 +395,10 @@ def document_projection(result):
         summary = UNAVAILABLE if unavailable else UNAPPLIED if unapplied else ""
         return {"refusal": None, "refusal_text": "", "summary": summary}
     projected = attributed_projection(attributed)
-    identities = [refusal_contract._logical_identity(row) for row in result["row_outcomes"]]
+    identities = {refusal_contract.logical_key(row) for row in result["row_outcomes"]}
     phrases = set()
     for cause, catalog in zip(attributed, projected["causes"], strict=True):
-        if any(logical in identities for logical in cause["logical_rows"]):
+        if any(refusal_contract.logical_key(logical) in identities for logical in cause["logical_rows"]):
             phrases.add(f"{catalog['reason']}: {catalog['message']}")
         else:
             row = catalog["row"]

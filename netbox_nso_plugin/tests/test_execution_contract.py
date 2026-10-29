@@ -57,6 +57,16 @@ def test_existing_contract_consumers_keep_their_shared_rules():
     assert catalog_causes([cause]) == [cause]
 
 
+def test_logical_key_matches_the_attempted_row_and_not_a_foreign_row():
+    result = refused_bgp_result()
+    attempted = {refusal_contract.logical_key(row) for row in result["row_outcomes"]}
+    logical = result["refusals"][0]["logical_rows"][0]
+    foreign = copy.deepcopy(logical)
+    foreign["row"]["key"] = "f" * 64
+    assert refusal_contract.logical_key(logical) in attempted
+    assert refusal_contract.logical_key(foreign) not in attempted
+
+
 def _unapplied(result):
     for row in result["row_outcomes"]:
         row.update(disposition="not_applied", refusals=[])
