@@ -25,6 +25,8 @@ SETTLEMENT_EVIDENCE_READERS = frozenset(
     }
 )
 ADAPTER_LOCAL_HELPERS = frozenset({"InvalidJobEvidence", "capture_wire_body", "static_route_deletions"})
+# Complete JSON that json.loads rejects with RecursionError, not ValueError.
+DEEP_JSON = b"[" * 100_000 + b"0" + b"]" * 100_000
 
 
 def _read_response(reader):
@@ -60,7 +62,9 @@ def _serve_response(response, *, error=None):
 
 
 @pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
-@pytest.mark.parametrize("content", [b"", b"{", b"<html>placeholder</html>"])
+@pytest.mark.parametrize(
+    "content", [b"", b"{", b"<html>placeholder</html>", DEEP_JSON], ids=["empty", "truncated", "html", "deep"]
+)
 def test_reader_json_decode_failures_keep_the_declared_caller_contract(reader, content):
     response = make_response(200, content=content)
     response.headers["X-Store-Incarnation"] = "placeholder-store-a"

@@ -19,6 +19,7 @@ from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import mirror_update
 from .test_apply_settlement import _attempt, _payload
 from .test_durable_bgp_capture import BGPCaptureCase, _CaptureHandler
+from .test_settlement_reader_contract import DEEP_JSON
 
 
 def _resolve_schema(root, schema):
@@ -251,7 +252,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.serve_feed([])
         original = self.adapter._handle
         responses = [make_response(200, body) for body in ({}, None, [], {"outcome": []})]
-        responses.extend(make_response(200, content=content) for content in (b"{", b""))
+        responses.extend(make_response(200, content=content) for content in (b"{", b"", DEEP_JSON))
         no_op = {
             "device_id": self.management.adapter_device_id,
             "outcome": "no_op",
@@ -266,7 +267,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             del body[key]
             responses.append(make_response(200, body))
         for response in responses:
-            with self.subTest(body=response.content):
+            with self.subTest(body=response.content[:16]):
                 mirror_update(self.management, settle_evidence_error={})
                 calls = []
 
@@ -310,8 +311,8 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
 
     def test_undecodable_success_bodies_stall_with_a_banner(self):
         for method, endpoint in (("GET", "/jobs"), ("GET", "/generations"), ("POST", "/deployment-evidence")):
-            for content in (b"{", b""):
-                with self.subTest(endpoint=endpoint, content=content):
+            for content in (b"{", b"", DEEP_JSON):
+                with self.subTest(endpoint=endpoint, content=content[:8]):
                     mirror_update(self.management, settle_evidence_error={})
                     self.serve_feed([])
                     original = self.adapter._handle

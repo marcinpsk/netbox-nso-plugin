@@ -25,6 +25,9 @@ from .vault_refs import is_secret_fingerprint
 
 logger = logging.getLogger(__name__)
 
+# json.loads raises RecursionError, not ValueError, on deeply nested input.
+_JSON_DECODE_ERRORS = (ValueError, RecursionError)
+
 # When set, every adapter request carries ``?store_only=true``: the adapter updates its
 # intent STORE but suppresses the device-touching job enqueues (shrink-removal +
 # auto-apply). This is what lets intent re-sync keep its "never touches the device"
@@ -472,7 +475,7 @@ def _request(method, path, **kwargs):
         return None
     try:
         return resp.json()
-    except ValueError as exc:
+    except _JSON_DECODE_ERRORS as exc:
         raise AdapterError("Adapter returned a response that is not valid JSON.", code="invalid_response") from exc
 
 
@@ -484,7 +487,7 @@ def _error_envelope(resp):
     """
     try:
         body = resp.json()
-    except ValueError:
+    except _JSON_DECODE_ERRORS:
         return {}
     err = body.get("error") if isinstance(body, dict) else None
     return err if isinstance(err, dict) else {}
@@ -573,7 +576,7 @@ def _request_response(method, path, **kwargs):
         err = _error_envelope(resp)
         try:
             response = resp.json()
-        except ValueError:
+        except _JSON_DECODE_ERRORS:
             response = None
         detail = err.get("detail")
         # ``or`` not ``.get(key, default)``: the adapter emits nulls, and a present null
@@ -1416,7 +1419,7 @@ def _settlement_response(resp, component, device_id):
 
     try:
         body = resp.json()
-    except ValueError as exc:
+    except _JSON_DECODE_ERRORS as exc:
         reason = "invalid job envelope" if component == "JobOut" else "invalid settlement evidence"
         raise InvalidJobEvidence({"device_id": device_id}, reason) from exc
     return validate_settlement_response(component, body, device_id)
