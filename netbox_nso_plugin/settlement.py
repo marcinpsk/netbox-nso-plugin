@@ -195,8 +195,8 @@ def _consume_locked(row) -> ConsumeResult:
 
     for job in jobs:
         with identify_evidence_stall(job, incarnation):
-            seq = job.get("settle_seq")
-            if type(seq) is not int or seq <= cursor:
+            seq = job["settle_seq"]
+            if seq <= cursor or job["device_id"] != device_id or job["status"] not in {"succeeded", "failed"}:
                 from .apply_settlement import EvidenceInvariantError
 
                 raise EvidenceInvariantError("invalid_settlement_order")
@@ -288,9 +288,9 @@ def _settle_job(row, job, incarnation) -> bool:
     from .apply_settlement import _cursor_epoch_executions
     from .outcome_settlement import _bind_consumed_sequences
 
-    if job.get("type") not in {"apply", "removal"}:
+    if job["type"] not in {"apply", "removal"}:
         return True
-    result = job.get("result")
+    result = job["result"]
     if not isinstance(result, dict) or "row_outcomes" not in result:
         return False
     # A certificate from an earlier mapping epoch is still this cursor's history.
@@ -309,5 +309,5 @@ def _settle_job(row, job, incarnation) -> bool:
     ]
     if not matching:
         return False
-    _bind_consumed_sequences(matching, job.get("settle_seq"))
+    _bind_consumed_sequences(matching, job["settle_seq"])
     return True

@@ -1482,6 +1482,28 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
             "Adapter returned a settlement feed that is not valid JSON.", code="invalid_response"
         ) from exc
     try:
+        if isinstance(page, list):
+            required = {
+                "settle_seq",
+                "device_id",
+                "status",
+                "row_outcomes",
+                "result",
+                "error",
+                "refusals",
+                "updated_at",
+            }
+            for job in page:
+                if (
+                    not isinstance(job, dict)
+                    or not required <= job.keys()
+                    or type(job["settle_seq"]) is not int
+                    or job["settle_seq"] <= 0
+                    or type(job["device_id"]) is not int
+                    or not isinstance(job["status"], str)
+                    or not isinstance(job["updated_at"], str)
+                ):
+                    raise InvalidJobEvidence(job, "invalid job envelope")
         jobs = _validated_jobs(page, "settlement feed")
     except InvalidJobEvidence as exc:
         exc.store_incarnation = incarnation

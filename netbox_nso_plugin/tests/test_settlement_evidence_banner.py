@@ -30,6 +30,7 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
             "refusals": None,
             "error": None,
             "context": None,
+            "updated_at": "2026-01-02T03:04:05+00:00",
         }
 
     def serve_feed(self, jobs, incarnation="placeholder-store-a"):
@@ -111,6 +112,96 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
             {key: self.management.settle_evidence_error.get(key) for key in ("job_id", "settle_seq", "reason")},
             {"job_id": 502, "settle_seq": 41, "reason": "invalid settlement evidence"},
         )
+
+    def test_missing_feed_fields_show_the_carrier_in_the_evidence_phase(self):
+        for field in ("settle_seq", "device_id", "status", "row_outcomes", "result", "error", "refusals", "updated_at"):
+            with self.subTest(field=field):
+                mirror_update(
+                    self.management,
+                    settle_cursor_seq=40,
+                    settle_cursor_device_id=self.management.adapter_device_id,
+                    settle_cursor_incarnation="placeholder-store-a",
+                    settle_evidence_error={},
+                )
+                job = self.job(kind="sync", status="succeeded")
+                del job[field]
+                self.serve_feed([job])
+                self.assert_stalled_carrier_banner(cursor=40)
+
+    def test_missing_feed_fields_show_the_carrier_after_a_concurrent_cursor_advance(self):
+        for field in ("settle_seq", "device_id", "status", "row_outcomes", "result", "error", "refusals", "updated_at"):
+            with self.subTest(field=field):
+                mirror_update(
+                    self.management,
+                    settle_cursor_seq=40,
+                    settle_cursor_device_id=self.management.adapter_device_id,
+                    settle_cursor_incarnation="placeholder-store-a",
+                    settle_evidence_error={},
+                )
+                job = self.job(kind="sync", status="succeeded")
+                del job[field]
+                advanced_job = {**self.job(kind="sync", status="succeeded"), "id": 502, "settle_seq": 41}
+                self.serve_feed([])
+                calls = 0
+                advanced = []
+                requests = []
+                original = self.adapter._handle
+
+                def feed():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        advanced.append(consume_static_route_settlements(self.management.pk))
+                        return "placeholder-store-a", []
+                    if calls in (3, 5):
+                        return "placeholder-store-a", [advanced_job]
+                    return "placeholder-store-a", [job] if calls >= 6 else []
+
+                def handle(method, url, **kwargs):
+                    if method == "GET" and url.endswith("/jobs"):
+                        requests.append((int(kwargs["params"]["after_settle_seq"]), int(kwargs["params"]["limit"])))
+                    return original(method, url, **kwargs)
+
+                self.feed_response = feed
+                self.adapter._handle = handle
+                self.assert_stalled_carrier_banner(cursor=41)
+                self.assertEqual(len(advanced), 1)
+                self.assertTrue(advanced[0].drained)
+                self.assertEqual(advanced[0].cursor, 41)
+                self.assertEqual(requests[:6], [(40, 100), (40, 1), (40, 100), (41, 1), (40, 100), (41, 100)])
+
+    def assert_stalled_carrier_banner(self, *, cursor):
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertEqual(result.consumed, 0)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_cursor_seq, cursor)
+        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+        self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertContains(response, "invalid job envelope")
+
+    def test_mistyped_feed_fields_show_the_carrier_banner(self):
+        for field, values in (
+            ("settle_seq", (None, True, "42", 42.0, [], {}, 0, -1)),
+            ("device_id", (None, True, "1558", 1558.0, [], {})),
+            ("status", (None, True, 42, [], {})),
+            ("updated_at", (None, True, 42, [], {})),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    mirror_update(
+                        self.management,
+                        settle_cursor_seq=40,
+                        settle_cursor_device_id=self.management.adapter_device_id,
+                        settle_cursor_incarnation="placeholder-store-a",
+                        settle_evidence_error={},
+                    )
+                    self.serve_feed([{**self.job(kind="sync", status="succeeded"), field: value}])
+                    self.assert_stalled_carrier_banner(cursor=40)
 
     def test_current_ordering_failure_at_the_cursor_keeps_a_rendered_banner(self):
         mirror_update(
@@ -196,7 +287,7 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, "Settlement is paused", count=1)
         self.assertContains(response, "Adapter job 501")
-        self.assertContains(response, "invalid settlement evidence")
+        self.assertContains(response, "invalid job envelope")
         self.assertNotContains(response, "settle_seq")
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
