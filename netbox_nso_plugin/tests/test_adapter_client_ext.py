@@ -27,6 +27,8 @@ _BASE_CFG = {
     "ca_cert_path": None,
     "timeout": 30,
 }
+# A canonical store incarnation, so a feed test reaches the body checks.
+_INCARNATION = "00000000-0000-4000-8000-0000000000a1"
 
 
 class TestClientResetHelpers(unittest.TestCase):
@@ -547,7 +549,7 @@ class TestJobBoundaryValidation(unittest.TestCase):
         return make_session(response=response)
 
     def _refuses(self, session, call):
-        """Assert *call* raises the typed refusal while *session* is the transport."""
+        """Assert *call* raises the typed refusal while *session* is the transport, and return it."""
         from netbox_nso_plugin.adapter_client import AdapterError
 
         with (
@@ -557,6 +559,7 @@ class TestJobBoundaryValidation(unittest.TestCase):
             with self.assertRaises(AdapterError) as ctx:
                 call()
         self.assertEqual(ctx.exception.code, "invalid_response")
+        return ctx.exception
 
     def test_a_job_shaped_exactly_like_jobout_is_accepted_unchanged(self):
         """The contract pin: what the adapter's model emits must pass through untouched."""
@@ -607,8 +610,9 @@ class TestJobBoundaryValidation(unittest.TestCase):
     def test_settlement_feed_refuses_a_malformed_page(self):
         from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
 
-        session = self._session([_job_with_scalar("result")], headers={STORE_INCARNATION_HEADER: "inc-1"})
-        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+        session = self._session([_job_with_scalar("result")], headers={STORE_INCARNATION_HEADER: _INCARNATION})
+        error = self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+        self.assertEqual(error.reason, "invalid job envelope")
 
     def test_settlement_feed_refuses_a_body_that_is_not_json(self):
         """The feed reads the body itself, so its own decode must raise the typed refusal.
@@ -618,8 +622,9 @@ class TestJobBoundaryValidation(unittest.TestCase):
         """
         from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
 
-        session = self._session(content=b"<html>gateway</html>", headers={STORE_INCARNATION_HEADER: "inc-1"})
-        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+        session = self._session(content=b"<html>gateway</html>", headers={STORE_INCARNATION_HEADER: _INCARNATION})
+        error = self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+        self.assertEqual(error.reason, "invalid job envelope")
 
     def test_static_route_read_back_refuses_a_payload_without_routes(self):
         """StaticRouteIntentOut always carries a ``routes`` list; anything else is undecidable.
