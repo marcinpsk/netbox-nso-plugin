@@ -186,6 +186,56 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.assertIsNotNone(issue)
         self.assertEqual(issue["reason"], self.management.settle_evidence_error["reason"])
 
+    def assert_metadata_banner(self, reason, *, incarnation="placeholder-store-a"):
+        from netbox_nso_plugin.settlement_evidence import request_fence
+
+        issue = settlement_stall_projection(self.management)
+        self.assertEqual(issue["reason"], reason)
+        self.assertNotIn("job_id", issue)
+        self.assertNotIn("settle_seq", issue)
+        self.assertEqual(issue["store_incarnation"], incarnation)
+        self.assertEqual(issue["request_fence"], request_fence(self.management))
+        tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(tab, "Settlement is paused", count=1)
+        self.assertContains(tab, reason)
+
+    def assert_feed_header_stalls(self, header):
+        mirror_update(
+            self.management,
+            settle_cursor_seq=40,
+            settle_cursor_device_id=self.management.adapter_device_id,
+            settle_cursor_incarnation="placeholder-store-a",
+        )
+        self.serve_feed([])
+
+        class MetadataHandler(self.server.RequestHandlerClass):
+            def send_header(handler, keyword, value):
+                if keyword == "X-Store-Incarnation":
+                    if header is None:
+                        return
+                    value = header
+                super().send_header(keyword, value)
+
+        self.server.RequestHandlerClass = MetadataHandler
+        self.assert_visible_stall()
+        self.assertEqual(self.management.settle_cursor_seq, 40)
+        self.assert_metadata_banner("invalid settlement evidence", incarnation=None)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_cursor_seq, 40)
+        self.assertIsNone(self.management.settle_evidence_error["store_incarnation"])
+        self.serve_feed([])
+        self.assertTrue(consume_static_route_settlements(self.management).drained)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertNotContains(tab, "Settlement is paused")
+
+    def test_missing_feed_header_stalls_with_a_rendered_banner(self):
+        self.assert_feed_header_stalls(None)
+
+    def test_empty_feed_header_stalls_with_a_rendered_banner(self):
+        self.assert_feed_header_stalls("")
+
     def test_malformed_successful_apply_replays_stall_with_a_banner(self):
         from netbox_nso_plugin.models import NSOApplyAttempt
 
@@ -229,6 +279,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 self.adapter._handle = handle
                 self.assert_visible_stall()
                 self.assertEqual(len(calls), 1)
+                self.assert_metadata_banner("invalid settlement evidence")
                 self.assertIsNone(self.management.settle_cursor_seq)
                 attempt.refresh_from_db()
                 self.assertIsNone(attempt.response)
@@ -273,6 +324,9 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
 
                     self.adapter._handle = malformed
                     self.assert_visible_stall()
+                    self.assert_metadata_banner(
+                        "invalid job envelope" if endpoint == "/jobs" else "invalid settlement evidence"
+                    )
 
     def test_open_admission_content_stalls_without_type_errors(self):
         feed, generations, deployment = self.settlement_responses()

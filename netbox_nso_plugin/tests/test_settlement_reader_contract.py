@@ -3,8 +3,17 @@
 """Bound the adapter response boundaries in the direct settlement call graph."""
 
 import ast
+from contextlib import contextmanager
 from importlib.util import resolve_name
 from pathlib import Path
+from unittest.mock import patch
+from uuid import UUID
+
+import pytest
+
+from netbox_nso_plugin import adapter_client
+
+from ._adapter_http import make_response, make_transport_session
 
 SETTLEMENT_EVIDENCE_READERS = frozenset(
     {
@@ -16,6 +25,127 @@ SETTLEMENT_EVIDENCE_READERS = frozenset(
     }
 )
 ADAPTER_LOCAL_HELPERS = frozenset({"InvalidJobEvidence", "capture_wire_body", "static_route_deletions"})
+
+
+def _read_response(reader):
+    if reader == "get_settlement_feed":
+        return adapter_client.get_settlement_feed(7, after_settle_seq=0, limit=100)
+    if reader == "get_intent_receipts":
+        return adapter_client.get_intent_receipts(device_id=7)
+    if reader == "trigger_apply":
+        return adapter_client.trigger_apply(7, UUID(int=1), {"bgp": 1})
+    if reader == "get_deployment_evidence":
+        return adapter_client.get_deployment_evidence(7, [])
+    assert reader == "list_device_generations"
+    return adapter_client.list_device_generations(7)
+
+
+@contextmanager
+def _serve_response(response, *, error=None):
+    config = {"url": "http://adapter.invalid", "token": "placeholder", "verify_tls": True, "timeout": 5}
+    config["ca_cert_path"] = None
+    adapter_client.reset_session()
+    try:
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", autospec=True, return_value=config),
+            patch(
+                "netbox_nso_plugin.adapter_client.requests.Session",
+                autospec=True,
+                return_value=make_transport_session(response, error=error),
+            ),
+        ):
+            yield
+    finally:
+        adapter_client.reset_session()
+
+
+@pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
+@pytest.mark.parametrize("content", [b"", b"{", b"<html>placeholder</html>"])
+def test_reader_json_decode_failures_keep_the_declared_caller_contract(reader, content):
+    response = make_response(200, content=content)
+    response.headers["X-Store-Incarnation"] = "placeholder-store-a"
+    if reader == "trigger_apply" and content == b"":
+        with _serve_response(response):
+            assert _read_response(reader) is None
+        return
+    with _serve_response(response), pytest.raises(adapter_client.AdapterError) as raised:
+        _read_response(reader)
+    assert raised.value.code == "invalid_response"
+    if reader in {"trigger_apply", "get_intent_receipts"}:
+        assert type(raised.value) is adapter_client.AdapterError
+    else:
+        assert isinstance(raised.value, adapter_client.InvalidJobEvidence)
+        assert raised.value.device_id == 7
+        assert raised.value.job_id is None
+        assert raised.value.settle_seq is None
+        assert raised.value.reason == (
+            "invalid job envelope" if reader == "get_settlement_feed" else "invalid settlement evidence"
+        )
+
+
+@pytest.mark.parametrize("header", [None, ""])
+def test_feed_header_failures_are_device_only_evidence(header):
+    response = make_response(200, [])
+    if header is not None:
+        response.headers["X-Store-Incarnation"] = header
+    with _serve_response(response), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        _read_response("get_settlement_feed")
+    assert raised.value.device_id == 7
+    assert raised.value.job_id is None
+    assert raised.value.settle_seq is None
+    assert raised.value.store_incarnation is None
+    assert raised.value.reason == "invalid settlement evidence"
+
+
+@pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
+@pytest.mark.parametrize("content_type", [None, "text/plain", "application/json; charset=utf-8"])
+def test_readers_decode_valid_json_without_a_content_type_precondition(reader, content_type):
+    bodies = {
+        "get_settlement_feed": [],
+        "list_device_generations": [],
+        "get_deployment_evidence": {
+            "device_id": 7,
+            "head": None,
+            "blocked": False,
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "attempts": [],
+            "unknown_apply_attempt_ids": [],
+        },
+        "get_intent_receipts": {"receipts": [], "global_max_push_seq": None, "global_max_route_id": None},
+        "trigger_apply": {
+            "device_id": 7,
+            "outcome": "no_op",
+            "job_id": None,
+            "selected": {"bgp": 1},
+            "skipped": {"bgp": "already_applied"},
+            "skipped_detail": None,
+            "generations": [],
+        },
+    }
+    assert bodies.keys() == SETTLEMENT_EVIDENCE_READERS
+    response = make_response(200, bodies[reader])
+    response.headers["X-Store-Incarnation"] = "placeholder-store-a"
+    if content_type is not None:
+        response.headers["Content-Type"] = content_type
+    with _serve_response(response):
+        result = _read_response(reader)
+    assert result == (([], "placeholder-store-a") if reader == "get_settlement_feed" else bodies[reader])
+
+
+@pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
+@pytest.mark.parametrize("failure", ["http", "transport"])
+def test_reader_http_and_transport_failures_keep_the_existing_error(reader, failure):
+    import requests
+
+    response = make_response(503, content=b"placeholder unavailable")
+    error = requests.exceptions.ReadTimeout() if failure == "transport" else None
+    with _serve_response(response, error=error), pytest.raises(adapter_client.AdapterError) as raised:
+        _read_response(reader)
+    assert type(raised.value) is adapter_client.AdapterError
+    assert raised.value.code == ("nso_timeout" if error else "503")
+    assert raised.value.status_code == (None if error else 503)
 
 
 def _import_bindings(nodes, module):

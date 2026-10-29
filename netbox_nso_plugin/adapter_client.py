@@ -1474,12 +1474,8 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
     )
     incarnation = resp.headers.get(STORE_INCARNATION_HEADER)
     if not incarnation:
-        # Without it the cursor epoch cannot be compared, and applying a cursor whose
-        # store may be dead is the silent-skip this header exists to prevent.
-        raise AdapterError(
-            f"Adapter served the settlement feed without a {STORE_INCARNATION_HEADER} header.",
-            code="missing_store_incarnation",
-        )
+        # An unknown store cannot validate the cursor epoch or identify a carrier.
+        raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid settlement evidence")
     try:
         page = _settlement_response(resp, "JobOut", adapter_device_id)
         for job in page:

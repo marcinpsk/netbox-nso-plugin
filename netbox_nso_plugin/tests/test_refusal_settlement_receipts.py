@@ -14,6 +14,7 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
 
         from netbox_nso_plugin.refusal_display import settlement_stall_projection
         from netbox_nso_plugin.settlement import consume_static_route_settlements
+        from netbox_nso_plugin.settlement_evidence import request_fence
 
         from ._outbox_case import mirror_update
 
@@ -39,6 +40,8 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
             self.assertIsNotNone(issue)
             self.assertEqual(issue["reason"], "invalid settlement evidence")
             self.assertIsNone(issue.get("job_id"))
+            self.assertNotIn("settle_seq", issue)
+            self.assertEqual(issue["request_fence"], request_fence(self.management))
             tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
             self.assertContains(tab, "Settlement is paused", count=1)
             self.assertContains(tab, "invalid settlement evidence")
