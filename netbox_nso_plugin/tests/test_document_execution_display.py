@@ -305,11 +305,24 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
         self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
 
-    def test_store_change_stall_shows_a_reason_without_a_job(self):
+    def test_invalid_store_marker_stall_shows_a_reason_without_a_job(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         self.prepare()
-        self.serve_terminal_evidence(self.terminal(), settle_seq=42, epoch_change=True)
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42)
+        original = self.adapter._handle
+        feed_requests = 0
+
+        def handle(method, url, **kwargs):
+            nonlocal feed_requests
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/jobs"):
+                feed_requests += 1
+                if feed_requests > 1:
+                    self.server.evidence_incarnation = "placeholder-invalid-incarnation"
+            return response
+
+        self.adapter._handle = handle
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, "Settlement is paused", count=1)
@@ -320,6 +333,20 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertIsNone(self.management.settle_cursor_seq)
         self.assertIsNone(self.management.settle_evidence_error.get("job_id"))
         self.assertIsNone(self.management.settle_evidence_error.get("settle_seq"))
+
+    def test_store_change_during_the_evidence_read_is_not_shown_as_invalid_evidence(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42, epoch_change=True)
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.epoch_reset)
+        self.assertTrue(result.stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertNotContains(response, "Settlement is paused")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        self.assertEqual(self.management.settle_cursor_incarnation, "00000000-0000-4000-8000-000000000003")
 
     def test_write_phase_stall_keeps_the_failing_carrier_through_batch_rejection(self):
         self.prepare()

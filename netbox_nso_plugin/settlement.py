@@ -62,8 +62,8 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
             return _invalid_evidence_stall(management, fence, exc)
         except EvidenceInvariantError as exc:
             logger.warning("Settlement evidence remains unresolved for management %s", pk)
-            # A backlog too long to bind still drains page by page; _settle_job stays fail-closed.
-            if str(exc) != "settlement_feed_not_bounded":
+            # A long backlog or a store reset is not invalid evidence; _settle_job stays fail-closed.
+            if str(exc) not in {"settlement_feed_not_bounded", "evidence_epoch_changed"}:
                 return _invariant_evidence_stall(management, fence, exc)
     try:
         with transaction.atomic():

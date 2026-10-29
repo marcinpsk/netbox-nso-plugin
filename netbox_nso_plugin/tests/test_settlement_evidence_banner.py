@@ -841,7 +841,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
         self.serve_feed([])
-        responses = iter((("00000000-0000-4000-8000-000000000001", []), ("00000000-0000-4000-8000-000000000002", [])))
+        responses = iter((("00000000-0000-4000-8000-000000000001", []), ("placeholder-invalid-incarnation", [])))
         self.feed_response = lambda: next(responses)
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         self.management.refresh_from_db()
@@ -855,6 +855,39 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_evidence_error, {})
         self.assertEqual(self.management.settle_cursor_seq, 40)
+
+    def test_store_reset_during_the_evidence_read_settles_without_a_banner(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        mirror_update(
+            self.management,
+            settle_cursor_seq=40,
+            settle_cursor_device_id=self.management.adapter_device_id,
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
+        )
+        self.serve_feed([])
+        responses = iter(
+            (
+                ("00000000-0000-4000-8000-000000000001", []),
+                ("00000000-0000-4000-8000-000000000002", []),
+                ("00000000-0000-4000-8000-000000000002", []),
+                ("00000000-0000-4000-8000-000000000002", []),
+            )
+        )
+        self.feed_response = lambda: next(responses)
+        with CaptureQueriesContext(connection) as queries:
+            result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.epoch_reset)
+        self.assertTrue(result.drained)
+        self.assertFalse(result.stalled)
+        self.assertFalse(any('"settle_evidence_error" =' in query["sql"] for query in queries))
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        self.assertEqual(self.management.settle_cursor_incarnation, "00000000-0000-4000-8000-000000000002")
+        self.assertEqual(self.management.settle_cursor_seq, 0)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertNotContains(response, "Settlement is paused")
 
     def test_an_unchanged_diagnostic_is_not_written_again(self):
         from django.db import connection
@@ -900,7 +933,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 started.set()
                 if not release.wait(30):
                     raise AssertionError("the late snapshot was not released")
-                return "00000000-0000-4000-8000-000000000002", []
+                return "placeholder-invalid-incarnation", []
             return "00000000-0000-4000-8000-000000000001", [job] if current in (3, 5) else []
 
         def consume_late_snapshot():
