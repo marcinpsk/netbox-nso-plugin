@@ -41,10 +41,13 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
                     }
                     for sequence in sequences
                 ]
+                if full_page and after < 100:
+                    page = [row for row in preceding if row["settle_seq"] > after]
+                    return make_response(200, [job_wire(row) for row in page[: int(kwargs["params"]["limit"])]])
+                if full_page and after >= 100:
+                    return make_response(200, [job_wire(job)])
                 if after == 0:
                     return make_response(200, [job_wire(row) for row in [*preceding, job][:100]])
-                if full_page and after == 100:
-                    return make_response(200, [job_wire(job)])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
@@ -229,7 +232,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         result = consume_static_route_settlements(self.management)
         self.assertTrue(result.stalled)
         self.management.refresh_from_db()
-        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertEqual((result.consumed, self.management.settle_cursor_seq), (1, 41))
         execution = NSOApplyExecution.objects.get(management=self.management, carrier_job_id=501)
         self.assertEqual(execution.invariant_code, "invalid_terminal_batch")
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
@@ -251,9 +254,13 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare()
         self.serve_preceding_sync_jobs(self.terminal(), full_page=True)
+        prefix = consume_static_route_settlements(self.management)
+        self.assertFalse(prefix.stalled)
+        self.assertFalse(prefix.drained)
+        self.assertEqual((prefix.consumed, prefix.cursor), (100, 100))
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         self.management.refresh_from_db()
-        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertEqual(self.management.settle_cursor_seq, 100)
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, "Settlement is paused", count=1)
         self.assertContains(response, "Adapter job 501")
@@ -295,17 +302,23 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
 
     def test_carrier_status_mismatch_names_the_failing_job(self):
         self.serve_carrier_status_mismatch()
-        self.assert_carrier_stall_banner()
+        self.assert_carrier_stall_banner(cursor=41)
         self.assertIn((0, 100), self.settlement_pages)
 
     def test_carrier_status_mismatch_on_a_later_page_names_the_failing_job(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
         self.serve_carrier_status_mismatch()
         with patch("netbox_nso_plugin.settlement.SETTLE_FEED_PAGE", 1):
-            self.assert_carrier_stall_banner()
+            prefix = consume_static_route_settlements(self.management)
+            self.assertFalse(prefix.stalled)
+            self.assertFalse(prefix.drained)
+            self.assertEqual((prefix.consumed, prefix.cursor), (1, 41))
+            self.assert_carrier_stall_banner(cursor=41)
         self.assertIn((0, 1), self.settlement_pages)
         self.assertIn((41, 1), self.settlement_pages)
 
-    def assert_carrier_stall_banner(self):
+    def assert_carrier_stall_banner(self, *, cursor=None):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
@@ -317,7 +330,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertContains(response, "invalid settlement evidence")
         self.assertNotContains(response, "placeholder-secret-canary")
         self.management.refresh_from_db()
-        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertEqual(self.management.settle_cursor_seq, cursor)
         self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
         self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
 
@@ -371,7 +384,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.settle(prior)
         NSOApplyExecution.objects.filter(management=self.management, carrier_job_id=499).update(settle_seq=None)
         self.serve_preceding_sync_jobs(self.terminal())
-        self.assert_carrier_stall_banner()
+        self.assert_carrier_stall_banner(cursor=41)
         execution = NSOApplyExecution.objects.get(management=self.management, carrier_job_id=501)
         self.assertEqual(execution.invariant_code, "execution_order_unproven")
 
@@ -393,7 +406,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             return response
 
         self.adapter._handle = handle
-        self.assert_carrier_stall_banner()
+        self.assert_carrier_stall_banner(cursor=41)
 
     def serve_invalid_receipt_generation(self, *, pruned=False):
         from ._adapter_http import make_response
@@ -539,7 +552,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             return response
 
         self.adapter._handle = handle
-        self.assert_carrier_stall_banner()
+        self.assert_carrier_stall_banner(cursor=41)
 
     def test_invalid_evidence_banner_does_not_follow_a_mapping_change(self):
         from netbox_nso_plugin.models import NSODeviceManagement

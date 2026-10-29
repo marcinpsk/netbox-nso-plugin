@@ -396,7 +396,10 @@ class TestUnresolvedExecution(_SettlementCase):
         execution.save(update_fields=("terminal_projection",))
         result = consume_static_route_settlements(mgmt)
         assert result.stalled
-        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert result.consumed == 0
+        assert self._cursor(mgmt).settle_cursor_seq is None
+        execution.refresh_from_db()
+        assert execution.terminal_projection == projection
 
     def test_a_queued_sibling_never_blocks_the_cursor(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements

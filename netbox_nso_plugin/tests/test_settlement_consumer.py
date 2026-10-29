@@ -131,4 +131,8 @@ class TestExecutionConsumption(_SettlementCase):
         result = consume_static_route_settlements(management)
 
         assert result.stalled
-        assert result.cursor == 0
+        assert result.consumed == 0
+        assert result.cursor is None
+        assert self._cursor(management).settle_cursor_seq is None
+        execution.refresh_from_db()
+        assert execution.terminal_projection == projection

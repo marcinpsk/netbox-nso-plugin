@@ -493,6 +493,11 @@ def settle_apply_attempts(
     after_settle=None,
 ) -> None:
     """Commit each complete carrier independently in settlement order."""
+    if deployment_evidence["device_id"] != management.adapter_device_id:
+        raise EvidenceInvariantError("deployment_mapping_changed")
+    incarnation = store_incarnation or getattr(deployment_evidence, "store_incarnation", None)
+    if not valid_store_incarnation(incarnation):
+        raise EvidenceInvariantError("missing_store_incarnation")
     sequences = getattr(deployment_evidence, "settlement_sequences", {})
     carrier_id = getattr(deployment_evidence, "carrier_id", None)
     carriers = (
@@ -511,7 +516,7 @@ def settle_apply_attempts(
             deployment_evidence,
             carrier,
             required_attempt_ids=required_attempt_ids,
-            store_incarnation=store_incarnation,
+            store_incarnation=incarnation,
             before_settle=before_settle,
             after_settle=after_settle,
         )
@@ -531,11 +536,7 @@ def _settle_apply_carrier(
     from .models import NSOApplyAttempt
     from .outcome_settlement import settle_terminal_generations
 
-    if deployment_evidence["device_id"] != management.adapter_device_id:
-        raise EvidenceInvariantError("deployment_mapping_changed")
-    incarnation = store_incarnation or getattr(deployment_evidence, "store_incarnation", None)
-    if not valid_store_incarnation(incarnation):
-        raise EvidenceInvariantError("missing_store_incarnation")
+    incarnation = store_incarnation
     sequences = getattr(deployment_evidence, "settlement_sequences", {})
     local_attempts, validated, _unknown = _load_attempts(
         management,
@@ -1381,7 +1382,6 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         if (getattr(bound, "carrier_id", None) is None or generation["carrier_job_id"] == bound.carrier_id)
         and generation["row_outcomes"] is not None
     )
-    _require_matching_carrier_projections(evidence, bound, management, incarnation)
     for row in evidence:
         job = _carrier_job(management.adapter_device_id, row["carrier_job_id"], bound.settlement_sequences)
         with identify_evidence_stall(job, incarnation):
@@ -1398,6 +1398,7 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
                     _validate_generation(row)
                 elif immutable_execution_projection(cached) != immutable_execution_projection(row):
                     raise EvidenceInvariantError("consumed_execution_changed")
+    _require_matching_carrier_projections(evidence, bound, management, incarnation)
     pending = [
         generation
         for generation in generations
