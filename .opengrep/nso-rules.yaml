@@ -927,3 +927,41 @@ rules:
               ...
     paths:
       include: ["netbox_nso_plugin/views.py"]
+
+  - id: nso-test-subtest-stale-diagnostic
+    languages: [python]
+    severity: ERROR
+    message: A subtest loop reads the stored settlement diagnostic without clearing it. A value from an earlier subtest can satisfy the assertion. Call mirror_update(<management>, settle_evidence_error={}) in the loop body before the code under test runs. This checks direct reads of settle_evidence_error and settlement_stall_projection(...) in a subTest block inside a for loop, not reads through helper methods.
+    patterns:
+      - pattern-either:
+          - pattern: $ROW.settle_evidence_error
+          - pattern: settlement_stall_projection(...)
+          - pattern: $MODULE.settlement_stall_projection(...)
+      - pattern-inside: |
+          with $CASE.subTest(...):
+              ...
+      - pattern-inside: |
+          for $ITEM in $ITEMS:
+              ...
+      - pattern-not-inside: |
+          for $ITEM in $ITEMS:
+              ...
+              mirror_update(..., settle_evidence_error={}, ...)
+              ...
+      - pattern-not-inside: |
+          for $ITEM in $ITEMS:
+              ...
+              $HELPERS.mirror_update(..., settle_evidence_error={}, ...)
+              ...
+      - pattern-not-inside: |
+          with $CASE.subTest(...):
+              ...
+              mirror_update(..., settle_evidence_error={}, ...)
+              ...
+      - pattern-not-inside: |
+          with $CASE.subTest(...):
+              ...
+              $HELPERS.mirror_update(..., settle_evidence_error={}, ...)
+              ...
+    paths:
+      include: ["netbox_nso_plugin/tests/**"]

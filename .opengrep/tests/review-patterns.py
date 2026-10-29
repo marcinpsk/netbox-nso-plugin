@@ -3293,3 +3293,38 @@ def observation_collection_defaults(document, snapshot, intent):
     # ok: nso-observation-collection-empty-default
     observed = observed_collection(document, "routers")
     return routers, policies, routes, hosts, vlans, users, communities, desired, observed
+
+
+def subtest_diagnostic_reads(
+    self, rows, mirror_update, settlement_stall_projection, consume, refusal_display, _outbox_case
+):
+    for row in rows:
+        with self.subTest(row=row):
+            consume(row)
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(settlement_stall_projection(self.management))
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(refusal_display.settlement_stall_projection(self.management))
+    for row in rows:
+        with self.subTest(row=row):
+            _outbox_case.mirror_update(self.management, settle_evidence_error={})
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(refusal_display.settlement_stall_projection(self.management))
+    for row in rows:
+        with self.subTest(row=row):
+            mirror_update(self.management, settle_evidence_error={})
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+    for row in rows:
+        mirror_update(self.management, settle_evidence_error={})
+        with self.subTest(row=row):
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(settlement_stall_projection(self.management))
+    consume(rows[0])
+    # ok: nso-test-subtest-stale-diagnostic
+    self.assertEqual(self.management.settle_evidence_error, {})
