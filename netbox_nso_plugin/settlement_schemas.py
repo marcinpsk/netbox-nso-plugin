@@ -46,9 +46,12 @@ def _error_identity(component, body, path):
         key, prefix = "carrier_job_id", path[:4]
     else:
         return None
-    if not isinstance(row, dict) or type(row.get(key)) is not int or row[key] <= 0:
+    if not isinstance(row, dict):
         return None
-    return prefix, {"id": row[key], "settle_seq": row.get("settle_seq") if key == "id" else None}
+    identity = {"settle_seq": row.get("settle_seq")} if key == "id" else {}
+    if type(row.get(key)) is int and row[key] > 0:
+        identity["id"] = row[key]
+    return (prefix, identity) if identity else None
 
 
 def validate_settlement_response(component, body, device_id):

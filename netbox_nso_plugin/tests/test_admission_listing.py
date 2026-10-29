@@ -141,6 +141,8 @@ class TestAdmissionListing(DeploymentCase):
         self.assertFalse(NSOApplyExecution.objects.exists())
 
     def test_null_evidence_response_is_an_invalid_stored_response_before_persistence(self):
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence
+
         self.prepare()
         self.serve_terminal_evidence(self.terminal(), manual=True)
         NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=None, http_status=None)
@@ -156,8 +158,9 @@ class TestAdmissionListing(DeploymentCase):
 
         self.adapter._handle = handle
         before = list(NSOAcceptedSelection.objects.order_by("pk").values())
-        with self.assertRaisesRegex(EvidenceInvariantError, "deployment evidence has an invalid stored response"):
+        with self.assertRaises(InvalidJobEvidence) as raised:
             load_deployment_evidence(self.management)
+        self.assertEqual(raised.exception.reason, "invalid settlement evidence")
         self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before)
         self.assertFalse(NSOApplyExecution.objects.exists())
 

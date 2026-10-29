@@ -24,7 +24,8 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         self.adapter._handle = handle
 
     def test_listing_rejects_every_missing_field_and_invalid_value_before_writes(self):
-        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+        from netbox_nso_plugin.refusal_display import settlement_stall_projection
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         self.prepare_automatic()
         self.serve_terminal_evidence(self.terminal())
@@ -49,12 +50,15 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         for row in malformed:
             with self.subTest(row=row):
                 self.serve_listing([row])
-                with self.assertRaises(adapter_client.AdapterError) as raised:
-                    load_deployment_evidence(self.management)
-                self.assertEqual(raised.exception.code, "invalid_response")
+                result = consume_static_route_settlements(self.management)
+                self.assertTrue(result.stalled)
+                self.assertFalse(result.drained)
                 self.assertFalse(NSOApplyExecution.objects.exists())
                 self.management.refresh_from_db()
                 self.assertIsNone(self.management.settle_cursor_seq)
+                issue = settlement_stall_projection(self.management)
+                self.assertIsNotNone(issue)
+                self.assertEqual(issue["reason"], "invalid settlement evidence")
 
     def test_malformed_later_page_is_rejected_before_writes(self):
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence

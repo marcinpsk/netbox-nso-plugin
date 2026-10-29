@@ -130,14 +130,14 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         self.assertEqual(
             {key: self.management.settle_evidence_error[key] for key in ("job_id", "settle_seq", "reason")},
-            {"job_id": 501, "settle_seq": 42, "reason": "invalid disposition"},
+            {"job_id": 501, "settle_seq": 42, "reason": "invalid job envelope"},
         )
         self.assertIsNone(self.management.settle_cursor_seq)
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, "Settlement is paused")
         self.assertContains(response, "Adapter job 501")
         self.assertContains(response, "settle_seq 42")
-        self.assertContains(response, "invalid disposition")
+        self.assertContains(response, "invalid job envelope")
         self.assertNotContains(response, "placeholder-secret-canary")
         stale.save()
         self.management.refresh_from_db()
