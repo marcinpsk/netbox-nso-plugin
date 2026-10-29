@@ -183,6 +183,21 @@ def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequence
     return {**raw, "id": attempt_id, "generations": generations}
 
 
+def _attempt_generations(raw):
+    """Read retained child identities without treating a failed attempt as a projection."""
+    from .adapter_client import EvidenceItem
+
+    return raw.evidence_generations if isinstance(raw, EvidenceItem) else raw["generations"]
+
+
+def _admission_response(raw):
+    """Require a complete attempt before reading its admission response."""
+    from .adapter_client import raise_item_error
+
+    raise_item_error(raw)
+    return raw["response"]
+
+
 def _validated_attempt_generations(raw_generations, local, store_incarnation, settlement_sequences):
     generations = []
     for generation in raw_generations:
@@ -240,7 +255,7 @@ def _load_attempts(
         if (
             carrier_id is not None
             and getattr(deployment_evidence, "carrier_id", None) != carrier_id
-            and not any(row["carrier_job_id"] == carrier_id for row in raw["generations"])
+            and not any(row["carrier_job_id"] == carrier_id for row in _attempt_generations(raw))
         ):
             continue
         local = local_attempts.get(raw_id)
@@ -386,7 +401,7 @@ def _reconcile_admissions(
             UUID(raw["apply_attempt_id"])
             for snapshot in snapshots
             for raw in snapshot["attempts"]
-            if any(row["carrier_job_id"] == carrier_id for row in raw["generations"])
+            if any(row["carrier_job_id"] == carrier_id for row in _attempt_generations(raw))
         }
     )
     for snapshot in snapshots:
@@ -397,13 +412,16 @@ def _reconcile_admissions(
             head_carrier_id = head.get("carrier_job_id") if isinstance(head, dict) else None
             job = _carrier_job(management.adapter_device_id, head_carrier_id, settlement_sequences)
             with identify_evidence_stall(job, incarnation):
+                from .adapter_client import raise_item_error
+
+                raise_item_error(head)
                 if head["apply_attempt_id"] is not None:
                     try:
                         held_ids.add(UUID(str(head["apply_attempt_id"])))
                     except (ValueError, TypeError, AttributeError):
                         raise EvidenceInvariantError("admission_generation_mismatch") from None
     responses = [
-        raw.get("response")
+        _admission_response(raw)
         for snapshot in snapshots
         for raw in snapshot["attempts"]
         if carrier_id is None or UUID(raw["apply_attempt_id"]) in held_ids
@@ -438,7 +456,7 @@ def _reconcile_admissions(
             row["generation_id"]
             for snapshot in snapshots
             for attempt in snapshot["attempts"]
-            for row in attempt["generations"]
+            for row in _attempt_generations(attempt)
             if row["carrier_job_id"] == carrier_id
         }
         | {
@@ -506,7 +524,7 @@ def settle_apply_attempts(
         else {
             generation["carrier_job_id"]
             for attempt in deployment_evidence["attempts"]
-            for generation in attempt["generations"]
+            for generation in _attempt_generations(attempt)
         }
         | {generation["carrier_job_id"] for generation in getattr(deployment_evidence, "automatic_generations", ())}
     )
@@ -884,6 +902,8 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
         raise EvidenceInvariantError("evidence_epoch_changed")
     jobs = [job for job in read.feed_jobs if carrier_id is None or job["id"] == carrier_id]
     relevant = [row for row in read.generation_listing if carrier_id is None or row["carrier_job_id"] == carrier_id]
+    raise_evidence_errors(jobs)
+    raise_evidence_errors(relevant)
     evidence = dict(read)
     if carrier_id is not None:
         if evidence["head"] is not None and evidence["head"]["carrier_job_id"] != carrier_id:
@@ -891,6 +911,15 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
         evidence["attempts"] = [
             raw for raw in evidence["attempts"] if _attempt_names_carrier(management, raw, read, carrier_id)
         ]
+    for raw in evidence["attempts"]:
+        from .adapter_client import InvalidJobEvidence, raise_item_error
+
+        try:
+            raise_item_error(raw)
+        except InvalidJobEvidence as exc:
+            if exc.job_id is None and _positive_int(carrier_id):
+                exc.job_id = carrier_id
+            raise
     scoped = {
         **evidence,
         "attempts": [
@@ -905,17 +934,6 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
             for raw in evidence["attempts"]
         ],
     }
-    raise_evidence_errors(jobs)
-    raise_evidence_errors(relevant)
-    for raw in evidence["attempts"]:
-        from .adapter_client import InvalidJobEvidence, raise_item_error
-
-        try:
-            raise_item_error(raw)
-        except InvalidJobEvidence as exc:
-            if exc.job_id is None and _positive_int(carrier_id):
-                exc.job_id = carrier_id
-            raise
     raise_evidence_errors(scoped)
     _reject_unrequested_attempts(evidence, read.read_attempt_ids)
     sequences = _settlement_sequences(read.feed_jobs)
@@ -961,7 +979,7 @@ def _attempt_names_carrier(management, raw, read, carrier_id):
     """Keep attempts attached to their independently retained carrier admission."""
     from .models import NSOApplyAttempt
 
-    if any(_generation_names_carrier(row, read, carrier_id) for row in raw["generations"]):
+    if any(_generation_names_carrier(row, read, carrier_id) for row in _attempt_generations(raw)):
         return True
     head = read["head"]
     if (
@@ -1134,6 +1152,8 @@ def settle_device_apply_attempts(management):
 
 def route_policy_carriers(deployment_evidence, *, attempt_ids=None):
     """Return every exact validated carrier in settlement order, never ordered by job IDs."""
+    from .adapter_client import raise_item_error
+
     candidates = []
     allowed = None if attempt_ids is None else set(attempt_ids)
     if not isinstance(deployment_evidence, dict):
@@ -1141,6 +1161,7 @@ def route_policy_carriers(deployment_evidence, *, attempt_ids=None):
     for attempt in deployment_evidence["attempts"]:
         if allowed is not None and UUID(str(attempt["apply_attempt_id"])) not in allowed:
             continue
+        raise_item_error(attempt)
         for generation in attempt["generations"]:
             _validate_generation(generation)
             if generation["row_outcomes"] is not None and any(
@@ -1186,7 +1207,6 @@ def _bound_evidence(
     bound.settlement_sequences = _settlement_sequences(jobs) if settlement_sequences is None else settlement_sequences
     bound.feed_carrier_ids = {job["id"] for job in jobs}
     bound.automatic_generations = []
-    bound.generation_modes = {row["generation_id"]: row["mode"] for row in generations if "mode" in row}
     bound.manual_attempt_by_generation = {}
     by_id = {row["generation_id"]: row for row in generations}
     head = evidence["head"]
@@ -1218,8 +1238,22 @@ def _bound_evidence(
                     )
                 )
     _require_terminal_metadata(bound, generations, management, incarnation)
+    _bind_generation_modes(bound, generations)
     _drop_earlier_epoch_history(bound, management, incarnation)
     return bound
+
+
+def _bind_generation_modes(bound, generations):
+    """Read modes only for the carrier and generations whose evidence was required."""
+    from .adapter_client import raise_item_error
+
+    identifiers = {row["generation_id"] for row in bound.automatic_generations}
+    bound.generation_modes = {}
+    for row in generations:
+        if bound.carrier_id is None or row["carrier_job_id"] == bound.carrier_id or row["generation_id"] in identifiers:
+            raise_item_error(row)
+            if "mode" in row:
+                bound.generation_modes[row["generation_id"]] = row["mode"]
 
 
 def _carrier_generation_ids(outcomes):
@@ -1264,6 +1298,7 @@ def _match_listing_metadata(generation, evidence):
     from .adapter_client import raise_item_error
 
     raise_item_error(generation)
+    raise_item_error(evidence)
     if generation is None or any(evidence.get(key) != generation[key] for key in _IMMUTABLE_GENERATION_METADATA):
         raise EvidenceInvariantError("generation_evidence_mismatch")
 
@@ -1336,6 +1371,10 @@ def _ordered_feed_carrier(generation, carrier_id, bound):
 
 
 def _authoritative_carrier_generation(generation, generation_id, carrier, management, incarnation, *, bound):
+    from .adapter_client import raise_item_error
+
+    raise_item_error(generation)
+    raise_item_error(carrier)
     if (
         generation is not None
         and generation["carrier_job_id"] is not None
@@ -1465,6 +1504,9 @@ def _record_carrier_projection_conflict(evidence, bound, management, incarnation
 
 def terminal_carrier_requires_certificate(generation):
     """Require terminal evidence because a nullable job FK cannot prove that no carrier ran."""
+    from .adapter_client import raise_item_error
+
+    raise_item_error(generation)
     return generation["status"] not in {"pending", "running"}
 
 
@@ -1530,8 +1572,11 @@ def _execution_projection(execution):
 
 
 def _generation_from_carrier(generation, carrier):
+    from .adapter_client import raise_item_error
     from .refusal_registry import document_section_for_stream
 
+    raise_item_error(generation)
+    raise_item_error(carrier)
     return {
         "generation_id": generation["generation_id"],
         "seq": generation["seq"],
@@ -1557,7 +1602,7 @@ def carrierless_evidence_read(read):
     scoped = _BoundEvidence(read)
     scoped.__dict__.update(vars(read))
     scoped["head"] = None
-    scoped["attempts"] = [attempt for attempt in read["attempts"] if not attempt["generations"]]
+    scoped["attempts"] = [attempt for attempt in read["attempts"] if not _attempt_generations(attempt)]
     scoped.feed_jobs = []
     scoped.generation_listing = []
     scoped.read_attempt_ids = tuple(
@@ -1568,7 +1613,7 @@ def carrierless_evidence_read(read):
         {
             **snapshot,
             "head": None,
-            "attempts": [attempt for attempt in snapshot["attempts"] if not attempt["generations"]],
+            "attempts": [attempt for attempt in snapshot["attempts"] if not _attempt_generations(attempt)],
         }
         for snapshot in read.read_snapshots
     ]

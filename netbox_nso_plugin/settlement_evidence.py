@@ -38,6 +38,10 @@ def write_diagnostic(row, fence, error=None, *, cursor_written=False):
             value = getattr(error, key)
             if type(value) is int and value > 0:
                 issue[key] = value
+        if getattr(error, "evidence_identity", None) is not None:
+            issue["identity"] = error.evidence_identity
+        if getattr(error, "evidence_digest", None) is not None:
+            issue["digest"] = error.evidence_digest
     with suppress_intent_push(), mirror_refresh(row, ("settle_evidence_error",)) as locked:
         if locked.settle_evidence_error == issue:
             return

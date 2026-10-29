@@ -178,6 +178,49 @@ class TestCommittedSettlementPrefix(CoalescedCarrierHelpers, BGPSettlementHelper
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
 
+    def test_an_unrelated_failed_generation_outside_the_feed_preserves_the_complete_prefix(self):
+        generations = self.prepare_carrier()
+        self.serve_carriers(generations)
+        original = self.adapter._handle
+        identity = {
+            "device_id": self.management.adapter_device_id,
+            "generation_id": 83,
+            "seq": 6,
+            "carrier_job_id": 502,
+            "apply_attempt_id": None,
+        }
+        failed = make_evidence_envelope(None, identity=identity, error="execution_contract", digest="c" * 64)
+
+        def fail_unrelated_generation(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            body = response.json()
+            if method == "GET" and url.endswith("/jobs"):
+                body = [item for item in body if item["identity"]["id"] == 501]
+            elif method == "GET" and url.endswith("/generations"):
+                body.append(failed)
+            elif method == "POST" and url.endswith("/deployment-evidence"):
+                body["head"] = failed
+            return make_response(response.status_code, body)
+
+        self.adapter._handle = fail_unrelated_generation
+        result = consume_static_route_settlements(self.management)
+        self.assertEqual(result.consumed, 1)
+        self.assertEqual(result.cursor, 1)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_cursor_seq, 1)
+        issue = settlement_stall_projection(self.management)
+        self.assertEqual(issue["job_id"], 502)
+        self.assertEqual(issue["identity"], identity)
+        self.assertEqual(issue["digest"], "c" * 64)
+        self.assertEqual(issue["store_incarnation"], "00000000-0000-4000-8000-000000000004")
+        self.assertEqual(NSOApplyExecution.objects.filter(carrier_job_id=501, consumption_state="consumed").count(), 2)
+        self.assertFalse(NSOApplyExecution.objects.filter(carrier_job_id=502).exists())
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "in_sync")
+
     def test_a_diagnostic_write_failure_cannot_roll_back_the_committed_carrier(self):
         generations = self.prepare_carrier()
         self.serve_carriers(generations)

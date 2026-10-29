@@ -601,6 +601,52 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(NSOApplyExecution.objects.count(), 2)
         self.assertEqual(self.adapter.apply_requests, [])
 
+    def test_failed_retry_metadata_records_an_identified_stall_before_older_carrier_reconstruction(self):
+        from netbox_nso_plugin.refusal_display import settlement_stall_projection
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_evidence_envelope, make_response
+
+        self.prepare_automatic()
+        first = self.terminal(refused=None)
+        retry = self.terminal()
+        retry["carrier_job_id"] = 502
+        self._serve_retry_evidence(first, retry)
+        original = self.adapter._handle
+
+        def fail_retry(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            body = response.json()
+            if method == "GET" and url.endswith(("/jobs", "/generations")):
+                for index, item in enumerate(body):
+                    identity = item["identity"]
+                    if identity.get("id", identity.get("carrier_job_id")) == 502:
+                        body[index] = make_evidence_envelope(
+                            None, identity=identity, error="execution_contract", digest="b" * 64
+                        )
+            elif method == "POST" and url.endswith("/deployment-evidence"):
+                body["head"] = make_evidence_envelope(
+                    None, identity=body["head"]["identity"], error="execution_contract", digest="b" * 64
+                )
+            return make_response(response.status_code, body)
+
+        self.adapter._handle = fail_retry
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertEqual(result.consumed, 0)
+        self.assertIsNone(result.cursor)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertFalse(NSOApplyExecution.objects.exists())
+        issue = settlement_stall_projection(self.management)
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["job_id"], 502)
+        self.assertEqual(issue["settle_seq"], 2)
+        self.assertEqual(issue["store_incarnation"], "00000000-0000-4000-8000-000000000004")
+        self.assertEqual(issue["reason"], "invalid settlement evidence")
+        self.assertEqual(issue["digest"], "b" * 64)
+
     def test_changed_historical_carrier_stalls_before_retry_owner_writes(self):
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
         from netbox_nso_plugin.settlement import settle_static_routes

@@ -364,6 +364,66 @@ class EvidenceItem(dict):
         self.evidence_identity = dict(identity)
         self.evidence_error = error
         self.evidence_digest = digest
+        self.evidence_generations = []
+        error.evidence_identity = self.evidence_identity
+        error.evidence_digest = digest
+
+    def __getitem__(self, key):
+        if key not in self.evidence_identity:
+            raise self.evidence_error
+        return self.evidence_identity[key]
+
+    def get(self, key, default=None):
+        return self[key]
+
+    def __contains__(self, key):
+        self[key]
+        return True
+
+    def __iter__(self):
+        raise self.evidence_error
+
+    def __reversed__(self):
+        raise self.evidence_error
+
+    def keys(self):
+        raise self.evidence_error
+
+    def values(self):
+        raise self.evidence_error
+
+    def items(self):
+        raise self.evidence_error
+
+    def setdefault(self, key, default=None):
+        return self[key]
+
+    def pop(self, key, *default):
+        self[key]
+        return super().pop(key, *default)
+
+    def __or__(self, other):
+        raise self.evidence_error
+
+    def __ror__(self, other):
+        raise self.evidence_error
+
+    def __copy__(self):
+        copied = type(self)(self.evidence_identity, self.evidence_error, digest=self.evidence_digest)
+        copied.evidence_generations = self.evidence_generations
+        return copied
+
+    def copy(self):
+        return self.__copy__()
+
+    def __deepcopy__(self, memo):
+        from copy import deepcopy
+
+        copied = type(self).__new__(type(self))
+        memo[id(self)] = copied
+        dict.__init__(copied, deepcopy(self.evidence_identity, memo))
+        copied.__dict__.update(deepcopy(self.__dict__, memo))
+        return copied
 
 
 def raise_item_error(item):

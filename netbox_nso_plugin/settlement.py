@@ -125,7 +125,12 @@ def _align_carrier_read(read, row, jobs, incarnation):
 
 def _complete_evidence_result(result, read, management, fence, expected_fence, epoch):
     """Resolve carrierless admissions only after the ordered walk has drained."""
-    from .apply_settlement import carrierless_evidence_read, prepare_carrier_evidence
+    from .apply_settlement import (
+        _settlement_sequences,
+        carrierless_evidence_read,
+        identify_evidence_stall,
+        prepare_carrier_evidence,
+    )
     from .durable_capture import mapping_epoch
 
     if fence != expected_fence:
@@ -143,7 +148,12 @@ def _complete_evidence_result(result, read, management, fence, expected_fence, e
             persist_cursor=False,
             seen=set(),
         )
-    evidence = prepare_carrier_evidence(management, read)
+    with identify_evidence_stall(
+        {"device_id": management.adapter_device_id},
+        read.store_incarnation,
+        sequences=_settlement_sequences(read.feed_jobs),
+    ):
+        evidence = prepare_carrier_evidence(management, read)
     if mapping_epoch(management) == epoch:
         return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
     return result
@@ -174,6 +184,7 @@ class _SettlementReadChanged(Exception):
 def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fence, *, persist_cursor, seen):
     """Commit one complete carrier after its receipt claims and owner footprint are locked."""
     from .apply_settlement import (
+        _settlement_sequences,
         _validate_feed_page,
         identify_evidence_stall,
         prepare_carrier_evidence,
@@ -185,7 +196,8 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
 
     identity = job or {"id": carrier_id, "device_id": management.adapter_device_id}
     stalled = False
-    with identify_evidence_stall(identity, incarnation):
+    sequences = _settlement_sequences(read.feed_jobs) if read is not None else {}
+    with identify_evidence_stall(identity, incarnation, sequences=sequences):
         if job is not None:
             _validate_feed_page([job], management.adapter_device_id, cursor, seen, incarnation)
         evidence = prepare_carrier_evidence(management, read, carrier_id) if read is not None else None
@@ -227,6 +239,8 @@ def _validate_locked_carrier(read, job):
     if read is None or job is None:
         return
     retained = next((item for item in read.feed_jobs if item["id"] == job["id"]), None)
+    adapter_client.raise_item_error(retained)
+    adapter_client.raise_item_error(job)
     if retained is not None and any(
         retained[key] != job[key]
         for key in ("id", "device_id", "type", "status", "settle_seq", "result", "error", "row_outcomes", "refusals")
@@ -236,18 +250,14 @@ def _validate_locked_carrier(read, job):
 
 def _historical_carriers(read, management):
     """Require durable positive order before treating absent feed work as history."""
-    from .apply_settlement import _cursor_epoch_executions
+    from .apply_settlement import _attempt_generations, _cursor_epoch_executions
 
     feed_ids = {job["id"] for job in read.feed_jobs}
     rows = list(read.generation_listing)
-    rows.extend(row for attempt in read["attempts"] for row in attempt["generations"])
+    rows.extend(row for attempt in read["attempts"] for row in _attempt_generations(attempt))
     if read["head"] is not None:
         rows.append(read["head"])
-    candidates = {
-        row["carrier_job_id"]
-        for row in rows
-        if row.get("status") not in {"pending", "running"} and row["carrier_job_id"] not in feed_ids
-    }
+    candidates = {row["carrier_job_id"] for row in rows if row["carrier_job_id"] not in feed_ids}
     if (
         management.settle_cursor_incarnation != read.store_incarnation
         or management.settle_cursor_device_id != management.adapter_device_id

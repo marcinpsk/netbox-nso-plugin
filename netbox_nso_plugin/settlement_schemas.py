@@ -183,10 +183,14 @@ def validate_settlement_item(component, item, device_id, *, depth=1):
         if not isinstance(generations, list):
             decoded = EvidenceItem(identity, error, digest=safe_digest)
             generations = []
-        decoded["generations"] = [
+        children = [
             validate_settlement_item("DeploymentGenerationEvidenceOut", row, device_id, depth=depth + 2)
             for row in generations
         ]
+        if isinstance(decoded, EvidenceItem):
+            decoded.evidence_generations = children
+        else:
+            decoded["generations"] = children
     return decoded
 
 

@@ -215,11 +215,13 @@ def test_strict_evidence_consumers_refuse_nested_failed_items():
     }
     with _serve_response(make_response(200, body)):
         evidence = _read_response("get_deployment_evidence")
-    assert evidence["attempts"][0]["generations"][0] == generation
+    assert evidence["attempts"][0].evidence_generations[0] == generation
     assert evidence["attempts"][0].evidence_identity == identity
     assert evidence["attempts"][0].evidence_digest == "a" * 64
-    assert evidence["attempts"][0]["generations"][0].evidence_identity == generation
-    assert evidence["attempts"][0]["generations"][0].evidence_digest == "a" * 64
+    assert evidence["attempts"][0].evidence_generations[0].evidence_identity == generation
+    assert evidence["attempts"][0].evidence_generations[0].evidence_digest == "a" * 64
+    with pytest.raises(adapter_client.InvalidJobEvidence):
+        evidence["attempts"][0]["generations"]
     with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
         adapter_client.raise_evidence_errors(evidence)
     assert raised.value.reason == "invalid settlement evidence"
@@ -295,6 +297,35 @@ def test_failed_item_survives_copy_without_losing_its_identity():
     assert raised.value is not error
     assert raised.value.store_incarnation == error.store_incarnation
     assert copied.evidence_digest == "a" * 64
+
+
+@pytest.mark.parametrize(
+    "access",
+    [
+        lambda item: item["status"],
+        lambda item: item.get("status"),
+        lambda item: item.get("status", "pending"),
+        lambda item: "status" in item,
+        lambda item: iter(item),
+        lambda item: item.keys(),
+        lambda item: item.values(),
+        lambda item: item.items(),
+        lambda item: dict(item),
+        lambda item: {**item},
+    ],
+    ids=["index", "get", "default", "membership", "iteration", "keys", "values", "items", "dict", "unpack"],
+)
+def test_failed_item_projection_access_raises_its_typed_error(access):
+    identity = {"id": 502, "device_id": 7, "settle_seq": 2}
+    error = adapter_client.InvalidJobEvidence(identity, "invalid job envelope")
+    item = adapter_client.EvidenceItem(identity, error, digest="b" * 64)
+    assert item["id"] == item.get("id") == 502
+    assert "id" in item
+    assert item.evidence_identity == identity
+    assert item.evidence_digest == "b" * 64
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        access(item)
+    assert raised.value is error
 
 
 def test_strict_evidence_validation_traverses_nested_projection_collections():
@@ -455,7 +486,10 @@ def test_deployment_item_wire_bounds_use_the_absolute_response_depth(location, p
     with _serve_response(make_response(200, body)):
         evidence = _read_response("get_deployment_evidence")
     decoded = _deployment_target(evidence, location)
-    children = evidence["attempts"][0]["generations"]
+    attempt = evidence["attempts"][0]
+    children = (
+        attempt.evidence_generations if isinstance(attempt, adapter_client.EvidenceItem) else attempt["generations"]
+    )
     assert children[0] == body["attempts"][0]["generations"][0]["projection"]
     adapter_client.raise_item_error(children[0])
     if location != "generation":
