@@ -26,8 +26,10 @@ SETTLEMENT_EVIDENCE_READERS = frozenset(
     }
 )
 ADAPTER_LOCAL_HELPERS = frozenset({"InvalidJobEvidence", "capture_wire_body", "static_route_deletions"})
-# Complete JSON that json.loads rejects with RecursionError, not ValueError.
+# Complete JSON that json.loads rejects with RecursionError on an 8 MiB stack; a larger stack decodes it.
 DEEP_JSON = b"[" * 100_000 + b"0" + b"]" * 100_000
+# Complete JSON that json.loads decodes on any stack but that nests past MAX_NESTING.
+NESTED_ARRAY_JSON = b"[" * (MAX_NESTING * 16) + b"0" + b"]" * (MAX_NESTING * 16)
 # Complete JSON that decodes but nests past what jsonschema can render on Python 3.14.
 NESTED_OBJECT_JSON = b'{"device_id":' + b'{"a":' * 40_000 + b"0" + b"}" * 40_000 + b"}"
 
@@ -66,9 +68,11 @@ def _serve_response(response, *, error=None):
 
 @pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
 @pytest.mark.parametrize(
-    "content", [b"", b"{", b"<html>placeholder</html>", DEEP_JSON], ids=["empty", "truncated", "html", "deep"]
+    "content",
+    [b"", b"{", b"<html>placeholder</html>", DEEP_JSON, NESTED_ARRAY_JSON],
+    ids=["empty", "truncated", "html", "deep", "nested"],
 )
-def test_reader_json_decode_failures_keep_the_declared_caller_contract(reader, content):
+def test_reader_undecodable_or_unbounded_bodies_keep_the_declared_caller_contract(reader, content):
     response = make_response(200, content=content)
     response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
     if reader == "trigger_apply" and content == b"":

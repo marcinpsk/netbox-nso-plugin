@@ -21,7 +21,7 @@ from datetime import datetime
 import requests
 from django.conf import settings
 
-from .settlement_schemas import valid_store_incarnation
+from .settlement_schemas import valid_store_incarnation, within_wire_bounds
 from .vault_refs import is_secret_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -1874,11 +1874,15 @@ def trigger_apply(adapter_device_id, apply_attempt_id, selected):
 
     Raise AdapterError when a device job is already queued or running.
     """
-    return _request(
+    body = _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/actions/apply",
         json={"apply_attempt_id": str(apply_attempt_id), "selected": dict(selected)},
     )
+    # The decoder depth limit follows the C stack size, so bound the body explicitly.
+    if body is not None and not within_wire_bounds(body):
+        raise AdapterError("Adapter returned a response outside the wire bounds.", code="invalid_response")
+    return body
 
 
 def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
