@@ -1512,9 +1512,13 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
         raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid settlement evidence")
     try:
         jobs = _settlement_response(resp, "JobEvidenceOut", adapter_device_id)
-        for job in jobs:
-            if type(job["settle_seq"]) is not int or job["settle_seq"] <= 0 or type(job["device_id"]) is not int:
-                raise InvalidJobEvidence(job, "invalid job envelope")
+        for index, job in enumerate(jobs):
+            if type(job["device_id"]) is not int:
+                raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid job envelope")
+            if type(job["settle_seq"]) is not int or job["settle_seq"] <= 0:
+                error = InvalidJobEvidence({"id": job["id"], "device_id": job["device_id"]}, "invalid job envelope")
+                job = EvidenceItem(job.evidence_identity, error, digest=job.evidence_digest)
+                jobs[index] = job
             if isinstance(job, EvidenceItem):
                 job.evidence_error.store_incarnation = incarnation
     except InvalidJobEvidence as exc:
