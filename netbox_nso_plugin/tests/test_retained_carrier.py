@@ -142,7 +142,8 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = response.json()
                 row = document["attempts"][0]["generations"][0] if manual else document["head"]
-                row.update(change)
+                row["projection"].update(change)
+                row["identity"].update({key: value for key, value in change.items() if key in row["identity"]})
                 return make_response(200, document)
             return response
 

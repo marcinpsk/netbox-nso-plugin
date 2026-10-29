@@ -238,6 +238,7 @@ class TestProbeAdmissionListing(DeploymentCase):
             if method == "GET" and url.endswith("/generations"):
                 rows = response.json()
                 rows[0]["projection"].update(change)
+                rows[0]["identity"].update({key: value for key, value in change.items() if key in rows[0]["identity"]})
                 return make_response(200, rows)
             return response
 

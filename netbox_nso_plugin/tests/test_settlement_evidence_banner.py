@@ -121,9 +121,14 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             "heartbeat_at": None,
         }
 
-    def serve_feed(self, jobs, incarnation="00000000-0000-4000-8000-000000000001"):
+    def job_identity(self):
+        job = self.job()
+        return {key: job[key] for key in ("id", "device_id", "settle_seq")}
+
+    def serve_feed(self, jobs, incarnation="00000000-0000-4000-8000-000000000001", *, identities=None):
         """Serve each response's store marker on the real HTTP transport."""
         marker = threading.local()
+        identities = {} if identities is None else identities
         self.feed_incarnation = incarnation
         self.feed_response = lambda: (incarnation, jobs)
         case = self
@@ -141,7 +146,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             marker.incarnation = case.feed_incarnation
             if method == "GET" and url.endswith("/jobs"):
                 marker.incarnation, page = case.feed_response()
-                return make_response(200, [job_wire(job) for job in page])
+                return make_response(200, [job_wire(job, identity=identities.get(job.get("id"))) for job in page])
             if method == "GET" and url.endswith("/generations"):
                 return make_response(
                     200,
@@ -596,7 +601,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 )
                 job = self.job(kind="sync", status="succeeded")
                 del job[field]
-                self.serve_feed([job])
+                self.serve_feed([job], identities={501: self.job_identity()})
                 self.assert_stalled_carrier_banner(cursor=40)
 
     def test_missing_feed_fields_show_the_carrier_after_a_concurrent_cursor_advance(self):
@@ -612,7 +617,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 job = self.job(kind="sync", status="succeeded")
                 del job[field]
                 advanced_job = {**self.job(kind="sync", status="succeeded"), "id": 502, "settle_seq": 41}
-                self.serve_feed([])
+                self.serve_feed([], identities={501: self.job_identity()})
                 calls = 0
                 advanced = []
                 requests = []
@@ -649,6 +654,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_cursor_seq, cursor)
         self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+        self.assertEqual(self.management.settle_evidence_error["settle_seq"], 42)
         self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, "Settlement is paused", count=1)
@@ -671,7 +677,10 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                         settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
                         settle_evidence_error={},
                     )
-                    self.serve_feed([{**self.job(kind="sync", status="succeeded"), field: value}])
+                    self.serve_feed(
+                        [{**self.job(kind="sync", status="succeeded"), field: value}],
+                        identities={501: self.job_identity()},
+                    )
                     self.assert_stalled_carrier_banner(cursor=40)
 
     def test_current_ordering_failure_at_the_cursor_keeps_a_rendered_banner(self):
@@ -793,8 +802,10 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
 
     def test_out_of_range_evidence_integers_stall_with_a_rendered_banner(self):
         feed, generations, deployment = self.settlement_responses()
+        oversized_generation = copy.deepcopy(generations)
+        oversized_generation[0]["projection"]["generation_id"] = 2**63
         cases = [
-            ("generation id", feed, [{**generations[0], "generation_id": 2**63}], deployment),
+            ("generation id", feed, oversized_generation, deployment),
             ("pending generations", feed, generations, {**deployment, "pending_generations": 2**63}),
         ]
         for label, jobs, rows, snapshot in cases:

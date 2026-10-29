@@ -273,7 +273,14 @@ def _record_invariant(management, generation, incarnation, attempt, code):
     generation_id, carrier_id = generation.get("generation_id"), generation.get("carrier_job_id")
     if type(generation_id) is not int or type(carrier_id) is not int or generation_id <= 0 or carrier_id <= 0:
         return
+    from .models import NSODeviceManagement
+    from .settlement_evidence import matches_request_fence, request_fence
+
+    fence = request_fence(management)
     with transaction.atomic():
+        management = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
+        if not matches_request_fence(management, fence):
+            return
         identity = dict(
             management=management,
             mapping_epoch=capture.mapping_epoch(management),
@@ -376,6 +383,8 @@ def settle_terminal_generations(
     modes=None,
     restorations=(),
     receipt_recoveries=None,
+    before_settle=None,
+    after_settle=None,
 ):
     """Commit all generation authorities in each carrier as one owner transaction."""
     from .intent_state import MutationFootprint, SourceRow, mirror_transaction
@@ -419,6 +428,17 @@ def settle_terminal_generations(
             authoritative_bookkeeping(),
             mirror_transaction(footprint),
         ):
+            if before_settle is not None:
+                before_settle()
+            for generation in generations:
+                _validated_join(
+                    management,
+                    generation,
+                    store_incarnation,
+                    attempts.get((generation["generation_id"], generation["carrier_job_id"])),
+                    authorities[generation["carrier_job_id"]],
+                    receipt_recoveries,
+                )
             acknowledge_recoveries(management, receipt_recoveries, store_incarnation, states)
             for attempt_id, keep in restorations:
                 capture.restore_attempt(attempt_id, keep_streams=keep)
@@ -437,6 +457,8 @@ def settle_terminal_generations(
                             authorities=authorities[generation["carrier_job_id"]],
                         )
                     )
+            if after_settle is not None:
+                after_settle()
             return executions
     except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
         code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"

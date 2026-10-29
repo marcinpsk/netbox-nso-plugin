@@ -113,9 +113,11 @@ def _parse_time(value):
 
 
 def _validate_generation(raw) -> dict:
+    from .adapter_client import raise_item_error
     from .refusal_contract import validate_generation
 
     with identify_generation_stall(raw):
+        raise_item_error(raw)
         return validate_generation(raw)
 
 
@@ -137,7 +139,10 @@ def _response_generation_ids(response) -> set[int]:
     return ids
 
 
-def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequences=None) -> dict:
+def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequences=None, carrier_id=None) -> dict:
+    from .adapter_client import raise_item_error
+
+    raise_item_error(raw)
     try:
         attempt_id = UUID(str(raw["apply_attempt_id"]))
     except (TypeError, ValueError, AttributeError):
@@ -162,13 +167,17 @@ def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequence
             or not isinstance(skipped, dict)
         ):
             raise EvidenceInvariantError("deployment evidence has an invalid admitted response")
-    generations = _validated_attempt_generations(
-        raw["generations"], local, store_incarnation, settlement_sequences or {}
-    )
-    if len({generation["generation_id"] for generation in generations}) != len(generations):
+    identities = [generation["generation_id"] for generation in raw["generations"]]
+    if len(set(identities)) != len(identities):
         raise EvidenceInvariantError("deployment evidence repeats a generation identity")
-    if _response_generation_ids(response) != {generation["generation_id"] for generation in generations}:
+    if _response_generation_ids(response) != set(identities):
         raise EvidenceInvariantError("deployment evidence is incomplete for its stored response")
+    generations = _validated_attempt_generations(
+        [row for row in raw["generations"] if carrier_id is None or row["carrier_job_id"] == carrier_id],
+        local,
+        store_incarnation,
+        settlement_sequences or {},
+    )
     if local.response is not None and (local.http_status != raw["http_status"] or local.response != response):
         raise EvidenceInvariantError("local and adapter Apply responses disagree")
     return {**raw, "id": attempt_id, "generations": generations}
@@ -191,7 +200,13 @@ def _validated_attempt_generations(raw_generations, local, store_incarnation, se
 
 
 def _load_attempts(
-    management, deployment_evidence, required_attempt_ids=(), *, store_incarnation=None, settlement_sequences
+    management,
+    deployment_evidence,
+    required_attempt_ids=(),
+    *,
+    store_incarnation=None,
+    settlement_sequences,
+    carrier_id=None,
 ):
     from .models import NSOApplyAttempt
 
@@ -222,6 +237,8 @@ def _load_attempts(
     ).in_bulk()
     validated = {}
     for raw, raw_id in zip(raw_attempts, raw_ids, strict=True):
+        if carrier_id is not None and not any(row["carrier_job_id"] == carrier_id for row in raw["generations"]):
+            continue
         local = local_attempts.get(raw_id)
         if local is None:
             continue
@@ -229,7 +246,9 @@ def _load_attempts(
             raise EvidenceInvariantError("deployment evidence repeats an Apply attempt")
         if local.adapter_device_id != management.adapter_device_id:
             continue
-        validated[raw_id] = _validate_attempt(raw, local, store_incarnation, settlement_sequences=settlement_sequences)
+        validated[raw_id] = _validate_attempt(
+            raw, local, store_incarnation, settlement_sequences=settlement_sequences, carrier_id=carrier_id
+        )
 
     if unknown_ids & set(validated):
         raise EvidenceInvariantError("an Apply attempt is both known and unknown")
@@ -317,7 +336,7 @@ def promoted_stream_coverage(generations, expected_selected, skipped):
 _ADMISSION_GENERATION_METADATA = ("generation_id", "seq", "digest", "mode", "stream_revisions", "source_push_seq")
 
 
-def reconcile_admission_links(responses, generations):
+def reconcile_admission_links(responses, generations, *, generation_ids=None):
     """Match immutable admission links with the complete generation listing."""
     by_id = {row["generation_id"]: row for row in generations}
     for response in responses:
@@ -325,8 +344,13 @@ def reconcile_admission_links(responses, generations):
             raise EvidenceInvariantError("admission_generation_mismatch")
         _response_generation_ids(response)
         for link in response.get("generations") or ():
+            if generation_ids is not None and link["generation_id"] not in generation_ids:
+                continue
             generation = by_id.get(link["generation_id"])
             with identify_generation_stall(generation):
+                from .adapter_client import raise_item_error
+
+                raise_item_error(generation)
                 if generation is None:
                     raise EvidenceInvariantError("admission_generation_mismatch")
                 for key in _ADMISSION_GENERATION_METADATA:
@@ -334,31 +358,53 @@ def reconcile_admission_links(responses, generations):
                         raise EvidenceInvariantError(f"admission_generation_mismatch: {key}")
 
 
-def _reconcile_admissions(management, attempt_ids, snapshots, answers, generations, incarnation, settlement_sequences):
+def _reconcile_admissions(
+    management, attempt_ids, snapshots, answers, generations, incarnation, settlement_sequences, *, carrier_id=None
+):
     from django.db.models import F
 
     from .models import NSOApplyAttempt
 
-    held_ids = set(attempt_ids)
+    held_ids = (
+        set(attempt_ids)
+        if carrier_id is None
+        else {
+            UUID(raw["apply_attempt_id"])
+            for snapshot in snapshots
+            for raw in snapshot["attempts"]
+            if any(row["carrier_job_id"] == carrier_id for row in raw["generations"])
+        }
+    )
     for snapshot in snapshots:
         head = snapshot["head"]
+        if carrier_id is not None and head is not None and head["carrier_job_id"] != carrier_id:
+            head = None
         if head is not None:
-            carrier_id = head.get("carrier_job_id") if isinstance(head, dict) else None
-            job = _carrier_job(management.adapter_device_id, carrier_id, settlement_sequences)
+            head_carrier_id = head.get("carrier_job_id") if isinstance(head, dict) else None
+            job = _carrier_job(management.adapter_device_id, head_carrier_id, settlement_sequences)
             with identify_evidence_stall(job, incarnation):
                 if head["apply_attempt_id"] is not None:
                     try:
                         held_ids.add(UUID(str(head["apply_attempt_id"])))
                     except (ValueError, TypeError, AttributeError):
                         raise EvidenceInvariantError("admission_generation_mismatch") from None
-    responses = [raw.get("response") for snapshot in snapshots for raw in snapshot["attempts"]]
-    responses.extend(result for _attempt, result, _error in answers if result is not None)
+    responses = [
+        raw.get("response")
+        for snapshot in snapshots
+        for raw in snapshot["attempts"]
+        if carrier_id is None or any(row["carrier_job_id"] == carrier_id for row in raw["generations"])
+    ]
+    responses.extend(
+        result
+        for attempt, result, _error in answers
+        if result is not None and (carrier_id is None or attempt.pk in held_ids)
+    )
     if not all(isinstance(response, dict) for response in responses):
         raise EvidenceInvariantError("deployment evidence has an invalid stored response")
     responses.extend(
         error.rejection_response
-        for _attempt, _result, error in answers
-        if error is not None and error.definitely_not_enqueued
+        for attempt, _result, error in answers
+        if error is not None and error.definitely_not_enqueued and (carrier_id is None or attempt.pk in held_ids)
     )
     responses.extend(
         NSOApplyAttempt.objects.filter(
@@ -370,7 +416,19 @@ def _reconcile_admissions(management, attempt_ids, snapshots, answers, generatio
             response__isnull=False,
         ).values_list("response", flat=True)
     )
-    reconcile_admission_links(responses, generations)
+    selected = (
+        None
+        if carrier_id is None
+        else {row["generation_id"] for row in generations if row["carrier_job_id"] == carrier_id}
+        | {
+            row["generation_id"]
+            for snapshot in snapshots
+            for attempt in snapshot["attempts"]
+            for row in attempt["generations"]
+            if row["carrier_job_id"] == carrier_id
+        }
+    )
+    reconcile_admission_links(responses, generations, generation_ids=selected)
 
 
 def _admission_keep_streams(attempt, response, *, rejected=False):
@@ -411,8 +469,45 @@ def settle_apply_attempts(
     *,
     required_attempt_ids=(),
     store_incarnation=None,
+    before_settle=None,
+    after_settle=None,
 ) -> None:
-    """Consume complete logical batches; counts never choose owner status."""
+    """Commit each complete carrier independently in settlement order."""
+    sequences = getattr(deployment_evidence, "settlement_sequences", {})
+    carrier_id = getattr(deployment_evidence, "carrier_id", None)
+    carriers = (
+        {carrier_id}
+        if carrier_id is not None
+        else {
+            generation["carrier_job_id"]
+            for attempt in deployment_evidence["attempts"]
+            for generation in attempt["generations"]
+        }
+        | {generation["carrier_job_id"] for generation in getattr(deployment_evidence, "automatic_generations", ())}
+    )
+    for carrier in sorted(carriers or {None}, key=lambda value: sequences.get(value, 0)):
+        _settle_apply_carrier(
+            management,
+            deployment_evidence,
+            carrier,
+            required_attempt_ids=required_attempt_ids,
+            store_incarnation=store_incarnation,
+            before_settle=before_settle,
+            after_settle=after_settle,
+        )
+
+
+def _settle_apply_carrier(
+    management,
+    deployment_evidence,
+    carrier_id,
+    *,
+    required_attempt_ids=(),
+    store_incarnation=None,
+    before_settle=None,
+    after_settle=None,
+):
+    """Keep all generations, certificates and cursor effects in one owner transaction."""
     from .models import NSOApplyAttempt
     from .outcome_settlement import settle_terminal_generations
 
@@ -428,6 +523,7 @@ def settle_apply_attempts(
         required_attempt_ids,
         store_incarnation=incarnation,
         settlement_sequences=sequences,
+        carrier_id=carrier_id,
     )
     generations = []
     generation_modes = dict(getattr(deployment_evidence, "generation_modes", {}))
@@ -445,30 +541,27 @@ def settle_apply_attempts(
             generations.append((generation, local))
             seen.add(identity)
     for generation in getattr(deployment_evidence, "automatic_generations", ()):
+        if carrier_id is not None and generation["carrier_job_id"] != carrier_id:
+            continue
         identity = generation["generation_id"], generation["carrier_job_id"]
         if identity not in seen:
             local = getattr(deployment_evidence, "manual_attempt_by_generation", {}).get(identity)
             generations.append((generation, local))
             seen.add(identity)
-    restorations.extend(_retained_admission_restorations(local_attempts, validated))
-    # Every envelope and terminal batch is checked before the first local status write.
-    from .outcome_settlement import validate_terminal_generation
-
-    authorities = {}
+    if carrier_id is None:
+        restorations.extend(_retained_admission_restorations(local_attempts, validated))
     receipt_recoveries = getattr(deployment_evidence, "receipt_recoveries", {})
-    for generation, _local in generations:
-        authorities.setdefault(generation["carrier_job_id"], {})[generation["generation_id"]] = generation
-    for generation, local in generations:
-        job = _carrier_job(management.adapter_device_id, generation["carrier_job_id"], sequences)
-        with identify_evidence_stall(job, incarnation):
-            validate_terminal_generation(
-                management,
-                generation,
-                incarnation,
-                attempt=local,
-                authorities=authorities[generation["carrier_job_id"]],
-                receipt_recoveries=receipt_recoveries,
-            )
+
+    def finish():
+        for attempt_id, evidence in validated.items():
+            local = local_attempts[attempt_id]
+            if local.response is None:
+                NSOApplyAttempt.objects.filter(pk=attempt_id, response__isnull=True).update(
+                    http_status=evidence["http_status"], response=evidence["response"]
+                )
+        if after_settle is not None:
+            after_settle()
+
     settle_terminal_generations(
         management,
         [item[0] for item in sorted(generations, key=lambda item: sequences.get(item[0]["carrier_job_id"], 0))],
@@ -480,13 +573,9 @@ def settle_apply_attempts(
         modes=generation_modes,
         restorations=list(dict.fromkeys((attempt_id, tuple(keep)) for attempt_id, keep in restorations)),
         receipt_recoveries=receipt_recoveries,
+        before_settle=before_settle,
+        after_settle=finish,
     )
-    for attempt_id, evidence in validated.items():
-        local = local_attempts[attempt_id]
-        if local.response is None:
-            NSOApplyAttempt.objects.filter(pk=attempt_id, response__isnull=True).update(
-                http_status=evidence["http_status"], response=evidence["response"]
-            )
 
 
 def deploying_attempt_ids(management) -> tuple[UUID, ...]:
@@ -616,7 +705,36 @@ def _replay_apply_answer(management, attempt):
     return attempt, result, None
 
 
-def load_deployment_evidence(management, *, attempt_ids=None):
+def _replay_unknown_attempts(management, unknown, incarnation):
+    """Recover eligible manual admission answers without restoring their owners."""
+    from .models import NSOApplyAttempt
+
+    replayed = False
+    replay_answers = []
+    for attempt in NSOApplyAttempt.objects.filter(
+        pk__in=unknown,
+        management=management,
+        adapter_device_id=management.adapter_device_id,
+        trigger_kind="manual",
+        adapter_apply_attempt_id__isnull=False,
+    ):
+        if attempt.response is not None and attempt.http_status not in (200, 202):
+            continue
+        if (
+            attempt.overlay_snapshots.filter(selection__binding_state="invalidated").exists()
+            or attempt.overlay_snapshots.filter(selection__store_incarnation__isnull=False)
+            .exclude(selection__store_incarnation=incarnation)
+            .exists()
+        ):
+            continue
+        answer = _replay_apply_answer(management, attempt)
+        if answer is not None:
+            replay_answers.append(answer)
+        replayed = True
+    return replay_answers, replayed
+
+
+def load_deployment_evidence(management, *, attempt_ids=None, defer_carriers=False):
     """Fetch attempt evidence and recover unknown UUIDs by replaying their exact request."""
     from . import adapter_client as client
     from .models import NSOApplyAttempt
@@ -639,8 +757,6 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     from .durable_capture import mapping_epoch
 
     epoch = mapping_epoch(management)
-    from .models import NSOAcceptedSelection
-
     cursor = (
         management.settle_cursor_seq or 0
         if management.settle_cursor_device_id == management.adapter_device_id and management.settle_cursor_incarnation
@@ -657,87 +773,233 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     sequences = {}
     with identify_evidence_stall({"device_id": management.adapter_device_id}, incarnation, sequences=sequences):
         seen_jobs = set()
-        last_sequence = _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs, incarnation)
+        last_sequence = (
+            max((job["settle_seq"] for job in feed if _positive_int(job["settle_seq"])), default=cursor)
+            if defer_carriers
+            else _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs, incarnation)
+        )
         page = feed
-        while len(page) == SETTLE_FEED_PAGE:
+        while len(page) == SETTLE_FEED_PAGE and _positive_int(page[-1]["settle_seq"]):
             page, next_incarnation = client.get_settlement_feed(
                 management.adapter_device_id, after_settle_seq=page[-1]["settle_seq"], limit=SETTLE_FEED_PAGE
             )
             if next_incarnation != incarnation:
                 raise EvidenceInvariantError("evidence_epoch_changed")
-            last_sequence = _validate_feed_page(
-                page, management.adapter_device_id, last_sequence, seen_jobs, incarnation
+            last_sequence = (
+                max((job["settle_seq"] for job in page if _positive_int(job["settle_seq"])), default=last_sequence)
+                if defer_carriers
+                else _validate_feed_page(page, management.adapter_device_id, last_sequence, seen_jobs, incarnation)
             )
             feed.extend(page)
             if len(feed) > 10000:
                 raise EvidenceInvariantError("settlement_feed_not_bounded")
-        sequences.update({job["id"]: job["settle_seq"] for job in feed})
+        sequences.update(_settlement_sequences(feed))
         evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
         snapshots = [evidence]
-        _reject_unrequested_attempts(evidence, attempt_ids)
+        if not defer_carriers:
+            client.raise_evidence_errors(evidence)
+            _reject_unrequested_attempts(evidence, attempt_ids)
         unknown = _validated_unknown_attempt_ids(evidence, attempt_ids)
-        replayed = False
-        replay_answers = []
-        for attempt in NSOApplyAttempt.objects.filter(
-            pk__in=unknown,
-            management=management,
-            adapter_device_id=management.adapter_device_id,
-            trigger_kind="manual",
-            adapter_apply_attempt_id__isnull=False,
-        ):
-            # A retained overlay reference or explicit selection cannot reopen a refusal.
-            if attempt.response is not None and attempt.http_status not in (200, 202):
-                continue
-            if (
-                attempt.overlay_snapshots.filter(selection__binding_state="invalidated").exists()
-                or attempt.overlay_snapshots.filter(selection__store_incarnation__isnull=False)
-                .exclude(selection__store_incarnation=incarnation)
-                .exists()
-            ):
-                continue
-            answer = _replay_apply_answer(management, attempt)
-            if answer is not None:
-                replay_answers.append(answer)
-            replayed = True
+        replay_answers, replayed = _replay_unknown_attempts(management, unknown, incarnation)
         if replayed:
             evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
-            _reject_unrequested_attempts(evidence, attempt_ids)
+            if not defer_carriers:
+                client.raise_evidence_errors(evidence)
+                _reject_unrequested_attempts(evidence, attempt_ids)
             _validated_unknown_attempt_ids(evidence, attempt_ids)
             snapshots.append(evidence)
         generations = client.list_device_generations(management.adapter_device_id)
-        _reconcile_admissions(
-            management,
-            attempt_ids,
-            snapshots,
-            replay_answers,
-            generations,
-            incarnation,
-            sequences,
-        )
-        unacknowledged, receipt_document = _load_pending_receipts(management, evidence, generations)
         _last_page, final_incarnation = client.get_settlement_feed(
             management.adapter_device_id, after_settle_seq=last_sequence, limit=1
         )
-        _validate_feed_page(_last_page, management.adapter_device_id, last_sequence, set(), final_incarnation)
+        if not defer_carriers:
+            _validate_feed_page(_last_page, management.adapter_device_id, last_sequence, set(), final_incarnation)
         management.refresh_from_db()
         if incarnation != final_incarnation or mapping_epoch(management) != epoch:
             raise EvidenceInvariantError("evidence_epoch_changed")
-        bound = _bound_evidence(evidence, feed, generations, incarnation, management=management)
-        _restore_consumed_sequences(bound, management, incarnation)
-        bound.receipt_recoveries = _prepare_receipt_recoveries(
-            management, bound, unacknowledged, receipt_document, incarnation
-        )
+        read = _BoundEvidence(evidence)
+        read.store_incarnation = incarnation
+        read.feed_jobs = feed
+        read.generation_listing = generations
+        read.read_attempt_ids = attempt_ids
+        read.read_snapshots = snapshots
+        read.replay_answers = replay_answers
+        read.mapping_epoch = epoch
+        if defer_carriers:
+            return read
+        bound = prepare_carrier_evidence(management, read)
         from .intent_state import MutationFootprint, mirror_transaction
 
         with mirror_transaction(MutationFootprint(device_ids=(management.device_id,))):
             management.refresh_from_db()
-            if mapping_epoch(management) != epoch:
-                raise EvidenceInvariantError("evidence_epoch_changed")
-            NSOAcceptedSelection.objects.filter(management=management, binding_state="bound").exclude(
-                store_incarnation=incarnation
-            ).update(binding_state="invalidated")
-            bound.replay_restorations = _record_replay_answers(replay_answers)
+            validate_carrier_under_lock(management, bound)
         return bound
+
+
+def prepare_carrier_evidence(management, read, carrier_id=None):
+    """Validate only the carrier being committed; retain sibling failures for their turn."""
+    from .adapter_client import raise_evidence_errors
+    from .durable_capture import mapping_epoch
+
+    if mapping_epoch(management) != read.mapping_epoch:
+        raise EvidenceInvariantError("evidence_epoch_changed")
+    jobs = [job for job in read.feed_jobs if carrier_id is None or job["id"] == carrier_id]
+    relevant = [row for row in read.generation_listing if carrier_id is None or row["carrier_job_id"] == carrier_id]
+    evidence = dict(read)
+    if carrier_id is not None:
+        if evidence["head"] is not None and evidence["head"]["carrier_job_id"] != carrier_id:
+            evidence["head"] = None
+        evidence["attempts"] = [
+            raw for raw in evidence["attempts"] if _attempt_names_carrier(management, raw, read, carrier_id)
+        ]
+    scoped = {
+        **evidence,
+        "attempts": [
+            {
+                **raw,
+                "generations": [
+                    row
+                    for row in raw["generations"]
+                    if carrier_id is None or _generation_names_carrier(row, read, carrier_id)
+                ],
+            }
+            for raw in evidence["attempts"]
+        ],
+    }
+    raise_evidence_errors(jobs)
+    raise_evidence_errors(relevant)
+    for raw in evidence["attempts"]:
+        from .adapter_client import raise_item_error
+
+        raise_item_error(raw)
+    raise_evidence_errors(scoped)
+    _reject_unrequested_attempts(evidence, read.read_attempt_ids)
+    sequences = _settlement_sequences(read.feed_jobs)
+    _reconcile_admissions(
+        management,
+        read.read_attempt_ids,
+        read.read_snapshots,
+        read.replay_answers,
+        read.generation_listing,
+        read.store_incarnation,
+        sequences,
+        carrier_id=carrier_id,
+    )
+    bound = _bound_evidence(
+        evidence,
+        jobs,
+        read.generation_listing,
+        read.store_incarnation,
+        management=management,
+        carrier_id=carrier_id,
+        settlement_sequences=sequences,
+    )
+    bound.settlement_sequences.update(sequences)
+    _restore_consumed_sequences(bound, management, read.store_incarnation)
+    _require_ordered_terminal_evidence(bound, management, read.store_incarnation)
+    pending, document = _load_pending_receipts(management, scoped, relevant)
+    bound.receipt_recoveries = _prepare_receipt_recoveries(management, bound, pending, document, read.store_incarnation)
+    bound.read = read
+    held_ids = {UUID(raw["apply_attempt_id"]) for raw in evidence["attempts"]}
+    bound.replay_answers = [answer for answer in read.replay_answers if carrier_id is None or answer[0].pk in held_ids]
+    bound.replay_restorations = []
+    for attempt, result, error in bound.replay_answers:
+        response = result if result is not None else error.rejection_response if error.definitely_not_enqueued else None
+        if response is not None:
+            keep = _admission_keep_streams(attempt, response, rejected=error is not None)
+            if keep is not None:
+                bound.replay_restorations.append((attempt.pk, keep))
+    return bound
+
+
+def _attempt_names_carrier(management, raw, read, carrier_id):
+    """Keep failed attempt envelopes attached to their independently retained admission."""
+    from .adapter_client import EvidenceItem
+    from .models import NSOApplyAttempt
+
+    if any(_generation_names_carrier(row, read, carrier_id) for row in raw["generations"]):
+        return True
+    if not isinstance(raw, EvidenceItem) and not any(isinstance(row, EvidenceItem) for row in raw["generations"]):
+        return False
+    head = read["head"]
+    if (
+        head is not None
+        and head.get("apply_attempt_id") == raw["apply_attempt_id"]
+        and head["carrier_job_id"] == carrier_id
+    ):
+        return True
+    local = NSOApplyAttempt.objects.filter(
+        management=management,
+        adapter_device_id=management.adapter_device_id,
+        pk=raw["apply_attempt_id"],
+        trigger_kind="manual",
+        adapter_apply_attempt_id=raw["apply_attempt_id"],
+    ).first()
+    if local is None or local.response is None:
+        return False
+    generation_ids = _response_generation_ids(local.response)
+    if any(link["job_id"] == carrier_id for link in local.response.get("generations") or ()):
+        return True
+    if any(
+        row["generation_id"] in generation_ids
+        for job in read.feed_jobs
+        if job["id"] == carrier_id
+        for row in job.get("row_outcomes") or ()
+    ):
+        return True
+    return any(
+        row["generation_id"] in generation_ids and row["carrier_job_id"] == carrier_id
+        for row in read.generation_listing
+    )
+
+
+def _generation_names_carrier(row, read, carrier_id):
+    """Retain failed generation projections through the listing's independent carrier."""
+    from .adapter_client import EvidenceItem
+
+    return (
+        row["carrier_job_id"] == carrier_id
+        or isinstance(row, EvidenceItem)
+        and any(
+            generation["generation_id"] == row["generation_id"] and generation["carrier_job_id"] == carrier_id
+            for generation in read.generation_listing
+        )
+    )
+
+
+def validate_carrier_under_lock(management, evidence):
+    """Recheck immutable certificates and mapping under the carrier's owner locks."""
+    from .durable_capture import mapping_epoch
+    from .models import NSOAcceptedSelection
+
+    read = evidence.read
+    if mapping_epoch(management) != read.mapping_epoch:
+        raise EvidenceInvariantError("evidence_epoch_changed")
+    _require_terminal_metadata(evidence, read.generation_listing, management, read.store_incarnation)
+    _drop_earlier_epoch_history(evidence, management, read.store_incarnation)
+    _restore_consumed_sequences(evidence, management, read.store_incarnation)
+    _require_ordered_terminal_evidence(evidence, management, read.store_incarnation)
+    NSOAcceptedSelection.objects.filter(management=management, binding_state="bound").exclude(
+        store_incarnation=read.store_incarnation
+    ).update(binding_state="invalidated")
+    _record_replay_answers(evidence.replay_answers)
+
+
+def _require_ordered_terminal_evidence(evidence, management, incarnation):
+    """Keep unsequenced remote terminal evidence from authorizing local effects."""
+    generations = list(evidence.automatic_generations)
+    generations.extend(
+        generation
+        for attempt in evidence["attempts"]
+        for generation in attempt["generations"]
+        if evidence.carrier_id is None or generation["carrier_job_id"] == evidence.carrier_id
+    )
+    for generation in generations:
+        if terminal_carrier_requires_certificate(generation) and not _positive_int(
+            evidence.settlement_sequences.get(generation["carrier_job_id"])
+        ):
+            with identify_generation_stall(generation):
+                _missing_generation_evidence(management, incarnation, generation)
 
 
 def _restore_consumed_sequences(bound, management, incarnation):
@@ -749,7 +1011,8 @@ def _restore_consumed_sequences(bound, management, incarnation):
         generation
         for attempt in bound["attempts"]
         for generation in attempt["generations"]
-        if generation["row_outcomes"] is not None
+        if (getattr(bound, "carrier_id", None) is None or generation["carrier_job_id"] == bound.carrier_id)
+        and generation["row_outcomes"] is not None
     )
     by_identity = {}
     for generation in generations:
@@ -871,13 +1134,17 @@ class _BoundEvidence(dict):
     """The validated HTTP body with its separately fetched store epoch."""
 
 
-def _bound_evidence(evidence, jobs, generations, incarnation, *, management):
+def _bound_evidence(
+    evidence, jobs, generations, incarnation, *, management, carrier_id=None, settlement_sequences=None
+):
     """Join jobs to authoritative generation sequences, including automatic heads."""
     bound = _BoundEvidence(evidence)
     bound.store_incarnation = incarnation
-    bound.settlement_sequences = {job["id"]: job["settle_seq"] for job in jobs}
+    bound.carrier_id = carrier_id
+    bound.settlement_sequences = _settlement_sequences(jobs) if settlement_sequences is None else settlement_sequences
+    bound.feed_carrier_ids = {job["id"] for job in jobs}
     bound.automatic_generations = []
-    bound.generation_modes = {row["generation_id"]: row["mode"] for row in generations}
+    bound.generation_modes = {row["generation_id"]: row["mode"] for row in generations if "mode" in row}
     bound.manual_attempt_by_generation = {}
     by_id = {row["generation_id"]: row for row in generations}
     head = evidence["head"]
@@ -905,7 +1172,7 @@ def _bound_evidence(evidence, jobs, generations, incarnation, *, management):
             for generation_id in identifiers:
                 bound.automatic_generations.append(
                     _authoritative_carrier_generation(
-                        by_id.get(generation_id), generation_id, carrier, management, incarnation
+                        by_id.get(generation_id), generation_id, carrier, management, incarnation, bound=bound
                     )
                 )
     _require_terminal_metadata(bound, generations, management, incarnation)
@@ -940,7 +1207,9 @@ def _append_head_evidence(bound, head, by_id, management, incarnation):
     identifiers = _carrier_generation_ids(head["row_outcomes"]) | {head["generation_id"]}
     for generation_id in identifiers:
         bound.automatic_generations.append(
-            _authoritative_carrier_generation(by_id.get(generation_id), generation_id, head, management, incarnation)
+            _authoritative_carrier_generation(
+                by_id.get(generation_id), generation_id, head, management, incarnation, bound=bound
+            )
         )
         if local is not None and generation_id in manual_generations:
             bound.manual_attempt_by_generation[(generation_id, head["carrier_job_id"])] = local
@@ -950,6 +1219,9 @@ _IMMUTABLE_GENERATION_METADATA = ("generation_id", "seq", "stream_revisions", "s
 
 
 def _match_listing_metadata(generation, evidence):
+    from .adapter_client import raise_item_error
+
+    raise_item_error(generation)
     if generation is None or any(evidence.get(key) != generation[key] for key in _IMMUTABLE_GENERATION_METADATA):
         raise EvidenceInvariantError("generation_evidence_mismatch")
 
@@ -1012,7 +1284,16 @@ def _historical_certificate(management, incarnation, generation_id, carrier_id):
     return _execution_projection(candidates[0])
 
 
-def _authoritative_carrier_generation(generation, generation_id, carrier, management, incarnation):
+def _ordered_feed_carrier(generation, carrier_id, bound):
+    """Prove that a retained feed carrier precedes the listing's current retry."""
+    if generation is None or carrier_id not in bound.feed_carrier_ids:
+        return False
+    previous = bound.settlement_sequences.get(carrier_id)
+    current = bound.settlement_sequences.get(generation["carrier_job_id"])
+    return _positive_int(previous) and _positive_int(current) and previous < current
+
+
+def _authoritative_carrier_generation(generation, generation_id, carrier, management, incarnation, *, bound):
     if (
         generation is not None
         and generation["carrier_job_id"] is not None
@@ -1027,6 +1308,14 @@ def _authoritative_carrier_generation(generation, generation_id, carrier, manage
         if any(cached[key] != carrier[key] for key in _CARRIER_EVIDENCE_FIELDS):
             raise EvidenceInvariantError("consumed_execution_changed")
         return cached
+    if _ordered_feed_carrier(generation, carrier["carrier_job_id"], bound):
+        # The retained result proves outcomes, but the retry owns the listed generation state.
+        projection = {
+            **_generation_from_carrier(generation, carrier),
+            "status": "outcome_unknown",
+            "updated_at": carrier["updated_at"],
+        }
+        return _validate_generation(projection)
     return _missing_generation_evidence(
         management,
         incarnation,
@@ -1048,8 +1337,10 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         generation
         for attempt in bound["attempts"]
         for generation in attempt["generations"]
-        if generation["row_outcomes"] is not None
+        if (getattr(bound, "carrier_id", None) is None or generation["carrier_job_id"] == bound.carrier_id)
+        and generation["row_outcomes"] is not None
     )
+    _require_matching_carrier_projections(evidence, bound, management, incarnation)
     for row in evidence:
         job = _carrier_job(management.adapter_device_id, row["carrier_job_id"], bound.settlement_sequences)
         with identify_evidence_stall(job, incarnation):
@@ -1061,13 +1352,16 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
             else:
                 cached = _historical_certificate(management, incarnation, row["generation_id"], row["carrier_job_id"])
                 if cached is None:
-                    _missing_generation_evidence(management, incarnation, row)
-                if immutable_execution_projection(cached) != immutable_execution_projection(row):
+                    if not _ordered_feed_carrier(generation, row["carrier_job_id"], bound):
+                        _missing_generation_evidence(management, incarnation, row)
+                    _validate_generation(row)
+                elif immutable_execution_projection(cached) != immutable_execution_projection(row):
                     raise EvidenceInvariantError("consumed_execution_changed")
     pending = [
         generation
         for generation in generations
-        if terminal_carrier_requires_certificate(generation)
+        if (getattr(bound, "carrier_id", None) is None or generation["carrier_job_id"] == bound.carrier_id)
+        and terminal_carrier_requires_certificate(generation)
         and (generation["generation_id"], generation["carrier_job_id"]) not in present
     ]
     certificates = generation_certificate_candidates(management, incarnation, pending)
@@ -1081,6 +1375,50 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
             if projection is None:
                 _missing_generation_evidence(management, incarnation, generation)
             bound.automatic_generations.append(projection)
+
+
+def _require_matching_carrier_projections(evidence, bound, management, incarnation):
+    """Reject conflicting projections before deduplication can select an owner outcome."""
+    from .outcome_settlement import immutable_execution_projection
+
+    projections = {}
+    carriers = {}
+    for row in evidence:
+        job = _carrier_job(management.adapter_device_id, row["carrier_job_id"], bound.settlement_sequences)
+        with identify_evidence_stall(job, incarnation):
+            _validate_generation(row)
+            identity = row["generation_id"], row["carrier_job_id"]
+            projection = immutable_execution_projection(row)
+            carrier = {key: row[key] for key in _CARRIER_EVIDENCE_FIELDS}
+            if (
+                identity in projections
+                and projections[identity] != projection
+                or row["carrier_job_id"] in carriers
+                and carriers[row["carrier_job_id"]] != carrier
+            ):
+                _record_carrier_projection_conflict(evidence, bound, management, incarnation, row["carrier_job_id"])
+                raise EvidenceInvariantError("invalid_terminal_batch")
+            projections[identity] = projection
+            carriers[row["carrier_job_id"]] = carrier
+
+
+def _record_carrier_projection_conflict(evidence, bound, management, incarnation, carrier_id):
+    """Retain the rejected carrier's complete generation diagnostics."""
+    from .models import NSOApplyAttempt
+    from .outcome_settlement import _record_invariant
+
+    attempts = {
+        row["generation_id"]: UUID(raw["apply_attempt_id"])
+        for raw in bound["attempts"]
+        for row in raw["generations"]
+        if row["carrier_job_id"] == carrier_id
+    }
+    local = NSOApplyAttempt.objects.filter(management=management, pk__in=set(attempts.values())).in_bulk()
+    generations = {row["generation_id"]: row for row in evidence if row["carrier_job_id"] == carrier_id}
+    for generation_id, generation in generations.items():
+        _record_invariant(
+            management, generation, incarnation, local.get(attempts.get(generation_id)), "invalid_terminal_batch"
+        )
 
 
 def terminal_carrier_requires_certificate(generation):
@@ -1164,10 +1502,45 @@ def _generation_from_carrier(generation, carrier):
     }
 
 
+def _settlement_sequences(jobs):
+    """Keep the first binding until the ordered walk rejects a repeated carrier."""
+    sequences = {}
+    for job in jobs:
+        sequences.setdefault(job["id"], job["settle_seq"])
+    return sequences
+
+
+def carrierless_evidence_read(read):
+    """Select admissions that have no carrier after ordered settlement has drained."""
+    scoped = _BoundEvidence(read)
+    scoped.__dict__.update(vars(read))
+    scoped["head"] = None
+    scoped["attempts"] = [attempt for attempt in read["attempts"] if not attempt["generations"]]
+    scoped.feed_jobs = []
+    scoped.generation_listing = []
+    scoped.read_attempt_ids = tuple(
+        {UUID(attempt["apply_attempt_id"]) for attempt in scoped["attempts"]}
+        | {UUID(value) for value in scoped["unknown_apply_attempt_ids"]}
+    )
+    scoped.read_snapshots = [
+        {
+            **snapshot,
+            "head": None,
+            "attempts": [attempt for attempt in snapshot["attempts"] if not attempt["generations"]],
+        }
+        for snapshot in read.read_snapshots
+    ]
+    scoped.replay_answers = [answer for answer in read.replay_answers if answer[0].pk in scoped.read_attempt_ids]
+    return scoped
+
+
 def _validate_feed_page(jobs, adapter_device_id, after, seen, incarnation):
     """Require ordered terminal carriers before any local settlement mutation."""
     for job in jobs:
         with identify_evidence_stall(job, incarnation):
+            from .adapter_client import raise_item_error
+
+            raise_item_error(job)
             sequence = job["settle_seq"]
             if (
                 type(sequence) is not int

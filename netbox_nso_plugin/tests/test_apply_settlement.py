@@ -837,7 +837,7 @@ class TestAttemptSettlement(TestCase):
                     {"apply_attempt_id": str(attempt_id), "selected": selected},
                 )
                 admitted = True
-                return make_response(200, deployment_wire(no_op))
+                return make_response(200, no_op)
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
@@ -879,7 +879,7 @@ class TestAttemptSettlement(TestCase):
 
         attempt_id = uuid4()
         row = self._vlan_row(1636, attempt_id)
-        self._local_attempt(attempt_id, 52, {"vlan": 302})
+        local = self._local_attempt(attempt_id, 52, {"vlan": 302}, answered=False)
         for field, value in (("status", []), ("generations", None)):
             with self.subTest(field=field):
                 evidence = _attempt(attempt_id, self.adapter_device_id, 52, {"vlan": 302}, "pending")
@@ -905,6 +905,9 @@ class TestAttemptSettlement(TestCase):
 
                 row.refresh_from_db()
                 self.assertEqual(row.status, "deploying")
+                local.refresh_from_db()
+                self.assertIsNone(local.http_status)
+                self.assertIsNone(local.response)
 
     def test_a_rejected_admission_with_null_generations_settles_as_empty(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts

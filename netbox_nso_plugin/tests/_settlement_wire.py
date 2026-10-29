@@ -5,8 +5,10 @@
 from ._adapter_http import make_evidence_envelope
 
 
-def job_wire(job):
-    return make_evidence_envelope(job, identity={key: job.get(key) for key in ("id", "device_id", "settle_seq")})
+def job_wire(job, *, identity=None):
+    if identity is None:
+        identity = {key: job.get(key) for key in ("id", "device_id", "settle_seq")}
+    return make_evidence_envelope(job, identity=identity)
 
 
 def generation_wire(generation, device_id):

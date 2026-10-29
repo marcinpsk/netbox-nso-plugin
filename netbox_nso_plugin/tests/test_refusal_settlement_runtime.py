@@ -317,11 +317,17 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/jobs"):
                 jobs = response.json()
+                if not jobs:
+                    return response
                 for field, value in invalid.items():
-                    if value is absent:
-                        jobs[0]["projection"].pop(field)
-                    else:
-                        jobs[0]["projection"][field] = value
+                    targets = [jobs[0]["projection"]]
+                    if field in jobs[0]["identity"]:
+                        targets.append(jobs[0]["identity"])
+                    for target in targets:
+                        if value is absent:
+                            target.pop(field)
+                        else:
+                            target[field] = value
                 return make_response(200, jobs)
             return response
 
@@ -367,13 +373,11 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                             },
                         )
                         self.assertNotIn("job_id", issue)
-                        if type(sequence) is int and sequence > 0:
-                            self.assertEqual(issue["settle_seq"], sequence)
-                        else:
-                            self.assertNotIn("settle_seq", issue)
+                        self.assertNotIn("settle_seq", issue)
                         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
                         self.assertContains(response, "Settlement is paused", count=1)
                         self.assertNotContains(response, "Adapter job")
+                        self.assertNotContains(response, "settle_seq")
 
     def test_persisted_cursor_skips_large_retained_feed_and_keeps_execution_order(self):
         from netbox_nso_plugin.settlement import settle_static_routes
@@ -542,6 +546,15 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         from ._adapter_http import make_response
 
         self.prepare_automatic()
+        before = {}
+        for row in self.owners:
+            row.refresh_from_db()
+            before[row.pk, row._meta.label_lower] = (
+                row.status,
+                row.last_apply_at,
+                row.last_apply_error,
+                row.apply_attempt_id,
+            )
         first = self.terminal(refused=None)
         self.serve_terminal_evidence(first)
         original = self.adapter._handle
@@ -560,12 +573,15 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.adapter._handle = interrupted_poll
         with self.assertRaises(AdapterError):
             settle_static_routes(self.management)
-        self.assertIsNone(NSOApplyExecution.objects.get().settle_seq)
+        self.assertFalse(NSOApplyExecution.objects.exists())
         self.management.refresh_from_db()
         self.assertIsNone(self.management.settle_cursor_seq)
         for row in self.owners:
             row.refresh_from_db()
-            self.assertEqual(row.status, "in_sync")
+            self.assertEqual(
+                (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
+                before[row.pk, row._meta.label_lower],
+            )
 
         retry = self.terminal()
         retry["carrier_job_id"] = 502
