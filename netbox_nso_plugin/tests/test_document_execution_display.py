@@ -159,6 +159,43 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(self.management.settle_evidence_error, {})
         self.assertEqual(self.management.settle_cursor_seq, 42)
 
+    def test_repaired_head_clears_a_carrier_only_banner_after_consumption(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_response
+
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), settle_seq=42)
+        self.assertTrue(consume_static_route_settlements(self.management).drained)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_cursor_seq, 42)
+        original = self.adapter._handle
+        broken = True
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if broken and method == "POST" and url.endswith("/deployment-evidence"):
+                evidence = response.json()
+                evidence["head"]["source_push_seq"] = {}
+                return make_response(200, evidence)
+            return response
+
+        self.adapter._handle = handle
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertNotContains(response, "settle_seq")
+        broken = False
+        recovered = consume_static_route_settlements(self.management)
+        self.assertTrue(recovered.drained)
+        self.assertFalse(recovered.stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertNotContains(response, "Settlement is paused")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        self.assertEqual(self.management.settle_cursor_seq, 42)
+
     def test_retained_cause_outside_frozen_contribution_stalls_with_device_banner(self):
         from netbox_nso_plugin.refusal_contract import validate_generation
         from netbox_nso_plugin.settlement import consume_static_route_settlements

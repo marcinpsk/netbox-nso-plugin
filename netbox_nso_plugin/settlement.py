@@ -16,6 +16,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from . import adapter_client
+from .settlement_evidence import request_fence, write_diagnostic
 
 logger = logging.getLogger(__name__)
 
@@ -51,114 +52,56 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
 
     pk = getattr(mgmt, "pk", mgmt)
     management = NSODeviceManagement.objects.get(pk=pk)
-    epoch = mapping_epoch(management)
-    cursor_epoch = (
-        management.settle_cursor_device_id,
-        management.settle_cursor_incarnation,
-        management.settle_cursor_seq,
-    )
+    fence = request_fence(management)
+    epoch = fence["mapping_epoch"]
     evidence = None
     if management.adapter_device_id is not None:
         try:
             evidence = settle_device_apply_attempts(management)
         except adapter_client.InvalidJobEvidence as exc:
-            return _invalid_evidence_stall(management, epoch, cursor_epoch, exc)
+            return _invalid_evidence_stall(management, fence, exc)
         except EvidenceInvariantError as exc:
             logger.warning("Settlement evidence remains unresolved for management %s", pk)
             # A backlog too long to bind still drains page by page; _settle_job stays fail-closed.
             if str(exc) != "settlement_feed_not_bounded":
-                return _invariant_evidence_stall(management, epoch, cursor_epoch, exc)
+                return _invariant_evidence_stall(management, fence, exc)
     try:
         with transaction.atomic():
             row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
+            fence = request_fence(row)
             result = _consume_locked(row)
             row.refresh_from_db()
+            write_diagnostic(row, fence, cursor_written=result.adapter_device_id is not None)
             if (
                 evidence is not None
                 and mapping_epoch(row) == epoch
                 and result.adapter_device_id == evidence["device_id"]
                 and row.settle_cursor_incarnation == evidence.store_incarnation
             ):
-                _clear_unidentified_evidence(row)
                 return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
             return result
     except adapter_client.InvalidJobEvidence as exc:
-        return _invalid_evidence_stall(management, epoch, cursor_epoch, exc)
+        return _invalid_evidence_stall(management, fence, exc)
     except EvidenceInvariantError as exc:
         # The rolled-back page stalls like an invariant from the evidence read above.
         logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
-        return _invariant_evidence_stall(management, epoch, cursor_epoch, exc)
+        return _invariant_evidence_stall(management, fence, exc)
 
 
-def _invariant_evidence_stall(management, epoch, cursor_epoch, error):
-    """Persist the invariant through the existing diagnostic fence."""
+def _invariant_evidence_stall(management, fence, error):
+    """Persist the invariant through its request fence."""
     invalid_job = getattr(error, "invalid_job", adapter_client.InvalidJobEvidence({}, "invalid settlement evidence"))
-    return _invalid_evidence_stall(management, epoch, cursor_epoch, invalid_job)
+    return _invalid_evidence_stall(management, fence, invalid_job)
 
 
-def _invalid_evidence_stall(management, epoch, cursor_epoch, error):
+def _invalid_evidence_stall(management, fence, error):
     """Retain invalid evidence without advancing its settlement cursor."""
-    from .durable_capture import mapping_epoch
-    from .intent_state import mirror_refresh
     from .models import NSODeviceManagement
-    from .signals import suppress_intent_push
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
-        identified = type(error.job_id) is int and error.job_id > 0
-        sequence_known = type(error.settle_seq) is int and error.settle_seq > 0
-        identity_valid = (
-            mapping_epoch(row) == epoch
-            and (row.settle_cursor_device_id, row.settle_cursor_incarnation) == cursor_epoch[:2]
-            and type(error.device_id) is int
-            and error.device_id == row.adapter_device_id
-            and (
-                identified
-                and (sequence_known or error.settle_seq is None)
-                or error.job_id is None
-                and error.settle_seq is None
-            )
-            and (sequence_known or row.settle_cursor_seq == cursor_epoch[2])
-            and bool(error.store_incarnation)
-        )
-        already_consumed = (
-            identity_valid
-            and identified
-            and sequence_known
-            and row.settle_cursor_seq != cursor_epoch[2]
-            and row.settle_cursor_device_id == error.device_id
-            and row.settle_cursor_incarnation == error.store_incarnation
-            and (row.settle_cursor_seq or 0) >= error.settle_seq
-        )
-        if identity_valid and not already_consumed:
-            issue = {
-                "reason": error.reason,
-                "mapping_epoch": epoch,
-                "store_incarnation": error.store_incarnation,
-                "cursor_device_id": cursor_epoch[0],
-                "cursor_incarnation": cursor_epoch[1],
-            }
-            if identified:
-                issue["job_id"] = error.job_id
-            if sequence_known:
-                issue["settle_seq"] = error.settle_seq
-            with suppress_intent_push(), mirror_refresh(row, ("settle_evidence_error",)) as locked:
-                locked.settle_evidence_error = issue
-                locked.save(update_fields=("settle_evidence_error",))
+        write_diagnostic(row, fence, error)
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
-
-
-def _clear_unidentified_evidence(management):
-    """Clear an unowned diagnostic after its full evidence snapshot validates."""
-    from .intent_state import mirror_refresh
-    from .signals import suppress_intent_push
-
-    issue = management.settle_evidence_error
-    if not issue or issue.get("job_id") is not None or issue.get("settle_seq") is not None:
-        return
-    with suppress_intent_push(), mirror_refresh(management, ("settle_evidence_error",)) as locked:
-        locked.settle_evidence_error = {}
-        locked.save(update_fields=("settle_evidence_error",))
 
 
 def settle_static_routes(mgmt) -> ConsumeResult:
@@ -270,11 +213,6 @@ def _consume_locked(row) -> ConsumeResult:
             stalled = True
             break
 
-    from .durable_capture import mapping_epoch
-
-    issue = row.settle_evidence_error
-    if issue and (issue.get("store_incarnation") != incarnation or issue.get("mapping_epoch") != mapping_epoch(row)):
-        row.settle_evidence_error = {}
     _persist(row, cursor, device_id, incarnation)
     # A full page can leave more executions pending. A short page proves the walk drained.
     drained = not stalled and len(jobs) < SETTLE_FEED_PAGE
@@ -296,7 +234,6 @@ def _clear_stall(row) -> None:
     row.settle_stall_seq = None
     row.settle_stall_attempts = 0
     row.settle_stall_first_seen_at = None
-    row.settle_evidence_error = {}
 
 
 def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
@@ -316,7 +253,6 @@ def _persist(row, cursor: int, device_id: int, incarnation: str) -> None:
         "settle_stall_seq": row.settle_stall_seq,
         "settle_stall_attempts": row.settle_stall_attempts,
         "settle_stall_first_seen_at": row.settle_stall_first_seen_at,
-        "settle_evidence_error": row.settle_evidence_error,
     }
     with transaction.atomic(), suppress_intent_push(), mirror_refresh(row, values) as locked:
         for field_name, value in values.items():

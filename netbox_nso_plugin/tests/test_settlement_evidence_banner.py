@@ -148,6 +148,61 @@ class TestSettlementEvidenceBanner(BGPCaptureCase):
         self.assertEqual(issue["store_incarnation"], "placeholder-store-b")
         self.assertEqual(self.management.settle_cursor_incarnation, "placeholder-store-a")
 
+    def test_locked_request_failure_uses_the_cursor_after_another_consumer_advanced(self):
+        mirror_update(
+            self.management,
+            settle_cursor_seq=40,
+            settle_cursor_device_id=self.management.adapter_device_id,
+            settle_cursor_incarnation="placeholder-store-a",
+        )
+        job = self.job(kind="sync", status="succeeded")
+        self.serve_feed([])
+        calls = 0
+        requests = []
+        advanced = []
+        original = self.adapter._handle
+
+        def feed():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                advanced.append(consume_static_route_settlements(self.management.pk))
+                return "placeholder-store-a", []
+            return "placeholder-store-a", [job] if calls in (3, 5, 6) else []
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs"):
+                requests.append((int(kwargs["params"]["after_settle_seq"]), int(kwargs["params"]["limit"])))
+            return original(method, url, **kwargs)
+
+        self.feed_response = feed
+        self.adapter._handle = handle
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        self.assertEqual(len(advanced), 1)
+        self.assertTrue(advanced[0].drained)
+        self.assertEqual(advanced[0].cursor, 42)
+        self.assertEqual(requests[-1], (42, 100))
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertContains(response, "settle_seq 42")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_cursor_seq, 42)
+        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+
+    def test_invalid_sequence_keeps_the_known_carrier_banner(self):
+        self.serve_feed([{**self.job(kind="sync", status="succeeded"), "settle_seq": 0}])
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "Adapter job 501")
+        self.assertContains(response, "invalid settlement evidence")
+        self.assertNotContains(response, "settle_seq")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+        self.assertNotIn("settle_seq", self.management.settle_evidence_error)
+        self.assertIsNone(self.management.settle_cursor_seq)
+
     def test_late_old_store_failure_cannot_restore_a_banner_after_an_empty_store_reset(self):
         mirror_update(
             self.management,

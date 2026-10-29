@@ -486,22 +486,13 @@ def device_execution_summaries(management):
 
 
 def settlement_stall_projection(management):
-    """Show an invalid feed job only for the mapping that fetched it."""
-    from .durable_capture import mapping_epoch
+    """Show a diagnostic only while its complete request fence is current."""
+    from .settlement_evidence import matches_request_fence
 
     if management is None:
         return None
     issue = management.settle_evidence_error
-    cursor_epoch = (management.settle_cursor_device_id, management.settle_cursor_incarnation)
-    if (
-        issue
-        and issue.get("mapping_epoch") == mapping_epoch(management)
-        and cursor_epoch
-        in (
-            (management.adapter_device_id, issue.get("store_incarnation")),
-            (issue.get("cursor_device_id"), issue.get("cursor_incarnation")),
-        )
-    ):
+    if issue and matches_request_fence(management, issue.get("request_fence")):
         return issue
     return None
 

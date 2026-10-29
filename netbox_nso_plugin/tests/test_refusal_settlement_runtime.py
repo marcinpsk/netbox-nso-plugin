@@ -286,6 +286,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(NSOApplyExecution.objects.get(carrier_job_id=502).consumption_state, "consumed")
 
     def test_malformed_feed_identity_cannot_settle_or_advance_the_cursor(self):
+        from netbox_nso_plugin.durable_capture import mapping_epoch
         from netbox_nso_plugin.settlement import settle_static_routes
 
         from ._adapter_http import make_response
@@ -320,20 +321,42 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             ("type", ""),
             ("type", True),
         ):
-            with self.subTest(field=field, value=value):
-                invalid.clear()
-                invalid[field] = value
-                result = settle_static_routes(self.management)
-                self.assertTrue(result.stalled)
-                self.assertEqual(result.consumed, 0)
-                self.management.refresh_from_db()
-                self.assertIsNone(self.management.settle_cursor_seq)
-                self.assertFalse(NSOApplyExecution.objects.exists())
-                if field == "type":
-                    self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
-                    self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
-                else:
-                    self.assertEqual(self.management.settle_evidence_error, {})
+            sequences = (1, absent, None, True, "1", 0, -1) if field == "id" else (1,)
+            for sequence in sequences:
+                with self.subTest(field=field, value=value, settle_seq=sequence):
+                    invalid.clear()
+                    invalid[field] = value
+                    invalid["settle_seq"] = sequence
+                    result = settle_static_routes(self.management)
+                    self.assertTrue(result.stalled)
+                    self.assertEqual(result.consumed, 0)
+                    self.management.refresh_from_db()
+                    self.assertIsNone(self.management.settle_cursor_seq)
+                    self.assertFalse(NSOApplyExecution.objects.exists())
+                    if field == "type":
+                        self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+                        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+                    else:
+                        issue = self.management.settle_evidence_error
+                        self.assertEqual(issue["reason"], "invalid job envelope")
+                        self.assertEqual(issue["store_incarnation"], "placeholder-store")
+                        self.assertEqual(
+                            issue["request_fence"],
+                            {
+                                "mapping_epoch": mapping_epoch(self.management),
+                                "cursor_device_id": self.management.settle_cursor_device_id,
+                                "cursor_incarnation": self.management.settle_cursor_incarnation,
+                                "cursor_seq": self.management.settle_cursor_seq,
+                            },
+                        )
+                        self.assertNotIn("job_id", issue)
+                        if type(sequence) is int and sequence > 0:
+                            self.assertEqual(issue["settle_seq"], sequence)
+                        else:
+                            self.assertNotIn("settle_seq", issue)
+                        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+                        self.assertContains(response, "Settlement is paused", count=1)
+                        self.assertNotContains(response, "Adapter job")
 
     def test_persisted_cursor_skips_large_retained_feed_and_keeps_execution_order(self):
         from netbox_nso_plugin.settlement import settle_static_routes
