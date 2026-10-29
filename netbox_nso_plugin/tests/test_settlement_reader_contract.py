@@ -27,6 +27,8 @@ SETTLEMENT_EVIDENCE_READERS = frozenset(
 ADAPTER_LOCAL_HELPERS = frozenset({"InvalidJobEvidence", "capture_wire_body", "static_route_deletions"})
 # Complete JSON that json.loads rejects with RecursionError, not ValueError.
 DEEP_JSON = b"[" * 100_000 + b"0" + b"]" * 100_000
+# Complete JSON that decodes but nests past what jsonschema can render on Python 3.14.
+NESTED_OBJECT_JSON = b'{"device_id":' + b'{"a":' * 40_000 + b"0" + b"}" * 40_000 + b"}"
 
 
 def _read_response(reader):
@@ -99,6 +101,39 @@ def test_feed_header_failures_are_device_only_evidence(header):
     assert raised.value.settle_seq is None
     assert raised.value.store_incarnation is None
     assert raised.value.reason == "invalid settlement evidence"
+
+
+def _nested(depth):
+    value = 0
+    for _ in range(depth):
+        value = {"a": value}
+    return value
+
+
+@pytest.mark.parametrize("reader", ["get_settlement_feed", "list_device_generations", "get_deployment_evidence"])
+def test_readers_reject_decodable_bodies_nested_past_the_bound(reader):
+    response = make_response(200, content=NESTED_OBJECT_JSON)
+    response.headers["X-Store-Incarnation"] = "placeholder-store-a"
+    with _serve_response(response), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        _read_response(reader)
+    assert raised.value.device_id == 7
+    assert raised.value.job_id is None
+    assert raised.value.settle_seq is None
+
+
+def test_schema_nesting_bound_accepts_the_limit_and_rejects_one_more_level():
+    from netbox_nso_plugin.settlement_schemas import MAX_NESTING, validate_settlement_response
+
+    from .test_adapter_client_ext import _JOB_OUT
+
+    # The page and the job take two levels; the result fills the rest.
+    at_limit = [{**_JOB_OUT, "result": _nested(MAX_NESTING - 2)}]
+    assert validate_settlement_response("JobOut", at_limit, 7) is at_limit
+    over = [{**_JOB_OUT, "result": _nested(MAX_NESTING - 1)}]
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        validate_settlement_response("JobOut", over, 7)
+    assert raised.value.job_id is None
+    assert raised.value.reason == "invalid job envelope"
 
 
 @pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
