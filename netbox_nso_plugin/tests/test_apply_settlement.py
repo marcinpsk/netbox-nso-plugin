@@ -290,8 +290,8 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(local.http_status, 202)
         self.assertEqual(local.response, known["response"])
 
-    def test_malformed_unknown_attempt_id_is_an_adapter_error(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
+    def test_malformed_unknown_attempt_id_is_invalid_evidence(self):
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence
 
         attempt_id = uuid4()
@@ -307,11 +307,11 @@ class TestAttemptSettlement(TestCase):
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(EvidenceSession())),
-            self.assertRaisesRegex(AdapterError, "invalid unknown attempt UUID") as raised,
+            self.assertRaises(InvalidJobEvidence) as raised,
         ):
             load_deployment_evidence(self.management)
 
-        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(raised.exception.reason, "invalid settlement evidence")
 
     def test_required_attempt_is_validated_after_its_deploying_row_reconciles(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
@@ -568,8 +568,7 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(row.status, "deploying")
 
     def test_an_unrequested_unknown_attempt_is_not_replayed(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
 
         requested_id = uuid4()
         extra_id = uuid4()
@@ -589,18 +588,16 @@ class TestAttemptSettlement(TestCase):
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(EvidenceSession())),
-            self.assertRaises(AdapterError) as raised,
+            self.assertRaisesRegex(EvidenceInvariantError, "unrequested_unknown_apply_attempt"),
         ):
             load_deployment_evidence(self.management)
-
-        self.assertEqual(raised.exception.code, "invalid_response")
 
         self.assertFalse(any(url.endswith("/actions/apply") for url in calls))
 
     def test_an_unrequested_known_attempt_in_the_initial_evidence_is_rejected(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.apply_settlement import (
             LOST_RESPONSE_REPLAY_WINDOW,
+            EvidenceInvariantError,
             settle_device_apply_attempts,
         )
         from netbox_nso_plugin.models import NSOApplyAttempt
@@ -629,19 +626,18 @@ class TestAttemptSettlement(TestCase):
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(EvidenceSession())),
-            self.assertRaises(AdapterError) as raised,
+            self.assertRaisesRegex(EvidenceInvariantError, "unrequested_apply_attempt"),
         ):
             settle_device_apply_attempts(self.management)
 
-        self.assertEqual(raised.exception.code, "invalid_response")
         extra.refresh_from_db()
         self.assertIsNone(extra.http_status)
         self.assertIsNone(extra.response)
 
     def test_an_unrequested_known_attempt_in_the_replay_refetch_is_rejected(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.apply_settlement import (
             LOST_RESPONSE_REPLAY_WINDOW,
+            EvidenceInvariantError,
             settle_device_apply_attempts,
         )
         from netbox_nso_plugin.models import NSOApplyAttempt
@@ -675,18 +671,16 @@ class TestAttemptSettlement(TestCase):
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(ReplaySession())),
-            self.assertRaises(AdapterError) as raised,
+            self.assertRaisesRegex(EvidenceInvariantError, "unrequested_apply_attempt"),
         ):
             settle_device_apply_attempts(self.management)
 
-        self.assertEqual(raised.exception.code, "invalid_response")
         extra.refresh_from_db()
         self.assertIsNone(extra.http_status)
         self.assertIsNone(extra.response)
 
     def test_a_malformed_attempt_record_is_rejected_before_any_replay(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
 
         attempt_id = uuid4()
         self._vlan_row(1652, attempt_id)
@@ -707,11 +701,10 @@ class TestAttemptSettlement(TestCase):
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(MalformedSession())),
-            self.assertRaises(AdapterError) as raised,
+            self.assertRaisesRegex(EvidenceInvariantError, "invalid_apply_attempt_uuid"),
         ):
             load_deployment_evidence(self.management)
 
-        self.assertEqual(raised.exception.code, "invalid_response")
         self.assertEqual(requests, ["deployment-evidence"])
         local.refresh_from_db()
         self.assertIsNone(local.http_status)
@@ -753,8 +746,7 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(raised.exception.code, "invalid_response")
 
     def test_invalid_unknown_attempt_in_replay_refetch_is_rejected(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
 
         for unknown_id in ("not-a-uuid", str(uuid4())):
             with self.subTest(unknown_id=unknown_id):
@@ -784,11 +776,15 @@ class TestAttemptSettlement(TestCase):
                     patch(
                         "netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(ReplaySession())
                     ),
-                    self.assertRaises(AdapterError) as raised,
+                    self.assertRaisesRegex(
+                        EvidenceInvariantError,
+                        "invalid_unknown_attempt_uuid"
+                        if unknown_id == "not-a-uuid"
+                        else "unrequested_unknown_apply_attempt",
+                    ),
                 ):
                     load_deployment_evidence(self.management, attempt_ids=[attempt_id])
 
-                self.assertEqual(raised.exception.code, "invalid_response")
                 self.assertEqual(requests, ["deployment-evidence", "apply", "deployment-evidence"])
                 local.refresh_from_db()
                 self.assertIsNone(local.http_status)
@@ -871,7 +867,8 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(row.status, "deploying")
 
     def test_malformed_generation_types_are_non_actionable_contract_errors(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
         attempt_id = uuid4()
         row = self._vlan_row(1636, attempt_id)
@@ -884,11 +881,20 @@ class TestAttemptSettlement(TestCase):
                 else:
                     evidence["generations"][0][field] = value
 
-                with self.assertRaises(EvidenceInvariantError):
-                    settle_apply_attempts(
-                        self.management,
-                        _payload(self.adapter_device_id, [evidence]),
-                    )
+                class EvidenceSession:
+                    def request(_self, method, url, **kwargs):
+                        return make_response(200, _payload(self.adapter_device_id, [evidence]))
+
+                with (
+                    patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+                    patch(
+                        "netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(EvidenceSession())
+                    ),
+                    self.assertRaises(InvalidJobEvidence) as raised,
+                ):
+                    settle_device_apply_attempts(self.management)
+
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
 
                 row.refresh_from_db()
                 self.assertEqual(row.status, "deploying")

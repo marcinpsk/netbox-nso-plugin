@@ -1379,47 +1379,55 @@ def _generation_provenance(mapping, *, nullable=False):
 
 
 def _validated_generation_listing(row):
+    from .apply_settlement import EvidenceInvariantError
     from .refusal_contract import GENERATION_STATUSES
 
-    valid = isinstance(row, dict) and set(row) == GENERATION_LISTING_FIELDS
-    if valid:
-        valid = (
-            all(_positive_generation_int(row[key]) for key in ("generation_id", "seq"))
-            and all(
-                row[key] is None or _positive_generation_int(row[key])
-                for key in ("job_id", "carrier_job_id", "settlement_cohort")
-            )
-            and isinstance(row["status"], str)
-            and row["status"] in GENERATION_STATUSES
-            and isinstance(row["mode"], str)
-            and row["mode"] in {"networked", "detach"}
-            and isinstance(row["digest"], str)
-            and _generation_provenance(row["stream_revisions"])
-            and _generation_provenance(row["source_push_seq"], nullable=True)
-            and row["stream_revisions"].keys() <= row["source_push_seq"].keys()
-            and all(_aware_generation_timestamp(row[key]) for key in ("created_at", "updated_at"))
-            and (row["carrier_job_id"] is None) == (row["carrier_job_status"] is None)
-            and (
-                row["carrier_job_status"] is None
-                or isinstance(row["carrier_job_status"], str)
-                and row["carrier_job_status"] in {"queued", "running", "succeeded", "failed"}
-            )
-            and (
-                row["status"] in {"pending", "running"}
-                or row["carrier_job_id"] is None
-                or row["job_id"] is None
-                or row["carrier_job_id"] == row["job_id"]
-            )
+    valid = (
+        all(_positive_generation_int(row[key]) for key in ("generation_id", "seq"))
+        and all(
+            row[key] is None or _positive_generation_int(row[key])
+            for key in ("job_id", "carrier_job_id", "settlement_cohort")
         )
+        and row["status"] in GENERATION_STATUSES
+        and _generation_provenance(row["stream_revisions"])
+        and _generation_provenance(row["source_push_seq"], nullable=True)
+        and row["stream_revisions"].keys() <= row["source_push_seq"].keys()
+        and all(_aware_generation_timestamp(row[key]) for key in ("created_at", "updated_at"))
+        and (row["carrier_job_id"] is None) == (row["carrier_job_status"] is None)
+        and (
+            row["carrier_job_status"] is None
+            or row["carrier_job_status"] in {"queued", "running", "succeeded", "failed"}
+        )
+        and (
+            row["status"] in {"pending", "running"}
+            or row["carrier_job_id"] is None
+            or row["job_id"] is None
+            or row["carrier_job_id"] == row["job_id"]
+        )
+    )
     if not valid:
-        raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+        raise EvidenceInvariantError("invalid_generation_listing")
     return row
+
+
+def _settlement_response(resp, component, device_id):
+    """Decode and validate successful evidence before any settlement reader uses it."""
+    from .settlement_schemas import validate_settlement_response
+
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        reason = "invalid job envelope" if component == "JobOut" else "invalid settlement evidence"
+        raise InvalidJobEvidence({"device_id": device_id}, reason) from exc
+    return validate_settlement_response(component, body, device_id)
 
 
 def list_device_generations(adapter_device_id, *, since_seq=None):
     """GET a bounded set of ascending generation pages after ``since_seq``."""
     if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
         raise ValueError("since_seq must be a non-negative integer")
+    from .apply_settlement import EvidenceInvariantError, identify_generation_stall
+
     generations = []
     generation_ids = set()
     last_seq = since_seq
@@ -1427,20 +1435,20 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
         params = {"limit": _GENERATION_PAGE_LIMIT}
         if last_seq is not None:
             params["since_seq"] = last_seq
-        page = _request("GET", f"/api/v1/devices/{adapter_device_id}/generations", params=params)
-        if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
-            raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+        resp = _request_response("GET", f"/api/v1/devices/{adapter_device_id}/generations", params=params)
+        page = _settlement_response(resp, "DeviceGenerationOut", adapter_device_id)
         for row in page:
-            _validated_generation_listing(row)
-            generation_id, seq = row["generation_id"], row["seq"]
-            if generation_id in generation_ids or last_seq is not None and seq <= last_seq:
-                raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
-            generation_ids.add(generation_id)
-            last_seq = seq
+            with identify_generation_stall(row):
+                _validated_generation_listing(row)
+                generation_id, seq = row["generation_id"], row["seq"]
+                if generation_id in generation_ids or last_seq is not None and seq <= last_seq:
+                    raise EvidenceInvariantError("invalid_generation_order")
+                generation_ids.add(generation_id)
+                last_seq = seq
         generations.extend(page)
         if len(page) < _GENERATION_PAGE_LIMIT:
             return generations
-    raise AdapterError("Adapter returned more generation pages than one read may fetch.", code="invalid_response")
+    raise EvidenceInvariantError("generation_listing_not_bounded")
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
@@ -1472,38 +1480,11 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
             f"Adapter served the settlement feed without a {STORE_INCARNATION_HEADER} header.",
             code="missing_store_incarnation",
         )
-    # This reader decodes the body itself (it needs the header too), so it owes the same
-    # typed refusal _request gives every other caller: a gateway's HTML 200 must not reach
-    # the settlement walk as a bare requests JSONDecodeError.
     try:
-        page = resp.json() if resp.content else []
-    except ValueError as exc:
-        raise AdapterError(
-            "Adapter returned a settlement feed that is not valid JSON.", code="invalid_response"
-        ) from exc
-    try:
-        if isinstance(page, list):
-            required = {
-                "settle_seq",
-                "device_id",
-                "status",
-                "row_outcomes",
-                "result",
-                "error",
-                "refusals",
-                "updated_at",
-            }
-            for job in page:
-                if (
-                    not isinstance(job, dict)
-                    or not required <= job.keys()
-                    or type(job["settle_seq"]) is not int
-                    or job["settle_seq"] <= 0
-                    or type(job["device_id"]) is not int
-                    or not isinstance(job["status"], str)
-                    or not isinstance(job["updated_at"], str)
-                ):
-                    raise InvalidJobEvidence(job, "invalid job envelope")
+        page = _settlement_response(resp, "JobOut", adapter_device_id)
+        for job in page:
+            if type(job["settle_seq"]) is not int or job["settle_seq"] <= 0 or type(job["device_id"]) is not int:
+                raise InvalidJobEvidence(job, "invalid job envelope")
         jobs = _validated_jobs(page, "settlement feed")
     except InvalidJobEvidence as exc:
         exc.store_incarnation = incarnation
@@ -1902,30 +1883,14 @@ def trigger_apply(adapter_device_id, apply_attempt_id, selected):
     )
 
 
-DEPLOYMENT_EVIDENCE_FIELDS = frozenset(
-    {
-        "device_id",
-        "head",
-        "blocked",
-        "write_work_pending",
-        "held_jobs",
-        "pending_generations",
-        "attempts",
-        "unknown_apply_attempt_ids",
-    }
-)
-
-
 def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
     """Return barrier and durable evidence for the named Apply attempts."""
-    evidence = _request(
+    resp = _request_response(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/deployment-evidence",
         json={"apply_attempt_ids": [str(attempt_id) for attempt_id in apply_attempt_ids]},
     )
-    if not isinstance(evidence, dict):
-        raise AdapterError("Adapter returned no deployment evidence body.", code="invalid_response")
-    return evidence
+    return _settlement_response(resp, "DeviceDeploymentEvidenceOut", adapter_device_id)
 
 
 def list_nso_devices(nso_instance_id: str) -> list[dict]:

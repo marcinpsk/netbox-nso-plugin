@@ -25,7 +25,6 @@ GENERATION_DISPOSITIONS = {
     "outcome_unknown": "blocked",
     "abandoned": "abandoned",
 }
-_ATTEMPT_FIELDS = frozenset({"apply_attempt_id", "admission_state", "http_status", "response", "generations"})
 _GENERATION_FIELDS = GENERATION_FIELDS
 _CARRIER_EVIDENCE_FIELDS = (
     "carrier_job_id",
@@ -48,6 +47,9 @@ def identify_evidence_stall(job, incarnation, *, sequences=None):
 
     try:
         yield
+    except InvalidJobEvidence as exc:
+        _complete_evidence_identity(exc, job, incarnation, sequences or {})
+        raise
     except (EvidenceInvariantError, ContractError) as exc:
         error = exc if isinstance(exc, EvidenceInvariantError) else EvidenceInvariantError("invalid_terminal_batch")
         if not hasattr(error, "invalid_job") and (_positive_int(job.get("id")) or job.get("device_id") is not None):
@@ -117,6 +119,8 @@ def _validate_generation(raw) -> dict:
 
 
 def _response_generation_ids(response) -> set[int]:
+    if not isinstance(response, dict):
+        raise EvidenceInvariantError("stored Apply response is not an object")
     generations = response.get("generations")
     if generations is None:
         return set()
@@ -133,21 +137,15 @@ def _response_generation_ids(response) -> set[int]:
 
 
 def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequences=None) -> dict:
-    if not isinstance(raw, dict) or set(raw) != _ATTEMPT_FIELDS:
-        raise EvidenceInvariantError("deployment evidence attempt has an invalid shape")
     try:
         attempt_id = UUID(str(raw["apply_attempt_id"]))
     except (TypeError, ValueError, AttributeError):
         raise EvidenceInvariantError("deployment evidence has an invalid attempt UUID") from None
     if attempt_id != local.pk:
         raise EvidenceInvariantError("deployment evidence names the wrong local attempt")
-    if type(raw["admission_state"]) is not str or raw["admission_state"] not in {"admitted", "rejected"}:
+    if raw["admission_state"] not in {"admitted", "rejected"}:
         raise EvidenceInvariantError("deployment evidence has an invalid admission state")
-    if (
-        type(raw["http_status"]) is not int
-        or not 100 <= raw["http_status"] <= 599
-        or not isinstance(raw["response"], dict)
-    ):
+    if not 100 <= raw["http_status"] <= 599:
         raise EvidenceInvariantError("deployment evidence has an invalid stored response")
     response = raw["response"]
     selected = response.get("selected")
@@ -157,7 +155,11 @@ def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequence
         if not isinstance(selected, dict) or selected != local.selected:
             raise EvidenceInvariantError("deployment evidence changed the Apply selection")
         skipped = response.get("skipped")
-        if response.get("outcome") not in {"promoted", "no_op"} or not isinstance(skipped, dict):
+        if (
+            not isinstance(response.get("outcome"), str)
+            or response["outcome"] not in {"promoted", "no_op"}
+            or not isinstance(skipped, dict)
+        ):
             raise EvidenceInvariantError("deployment evidence has an invalid admitted response")
     generations = _validated_attempt_generations(
         raw["generations"], local, store_incarnation, settlement_sequences or {}
@@ -172,8 +174,6 @@ def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequence
 
 
 def _validated_attempt_generations(raw_generations, local, store_incarnation, settlement_sequences):
-    if not isinstance(raw_generations, list):
-        raise EvidenceInvariantError("deployment evidence generations are not a list")
     generations = []
     for generation in raw_generations:
         carrier_id = generation.get("carrier_job_id") if isinstance(generation, dict) else None
@@ -195,8 +195,6 @@ def _load_attempts(
     from .models import NSOApplyAttempt
 
     raw_attempts = deployment_evidence["attempts"]
-    if not isinstance(raw_attempts, list) or not isinstance(deployment_evidence["unknown_apply_attempt_ids"], list):
-        raise EvidenceInvariantError("deployment evidence attempt collections are invalid")
     raw_ids = []
     for raw in raw_attempts:
         try:
@@ -247,6 +245,8 @@ _APPLY_SKIP_REASONS = frozenset(
 
 def apply_stream_partition(result, selected):
     """Validate the selector echo and return its selected and skipped stream sets."""
+    if not isinstance(result, dict):
+        return None, None, "Adapter returned an invalid Apply response."
     expected_selected = dict(selected)
     returned_selected = result.get("selected")
     skipped = result.get("skipped")
@@ -332,7 +332,7 @@ def reconcile_admission_links(responses, generations):
                 if generation is None:
                     raise EvidenceInvariantError("admission_generation_mismatch")
                 for key in _ADMISSION_GENERATION_METADATA:
-                    if key not in link or link[key] != generation[key]:
+                    if key not in link or type(link[key]) is not type(generation[key]) or link[key] != generation[key]:
                         raise EvidenceInvariantError(f"admission_generation_mismatch: {key}")
 
 
@@ -348,8 +348,6 @@ def _reconcile_admissions(management, attempt_ids, snapshots, answers, generatio
             carrier_id = head.get("carrier_job_id") if isinstance(head, dict) else None
             job = _carrier_job(management.adapter_device_id, carrier_id, settlement_sequences)
             with identify_evidence_stall(job, incarnation):
-                if not isinstance(head, dict):
-                    raise EvidenceInvariantError("admission_generation_mismatch")
                 if head["apply_attempt_id"] is not None:
                     try:
                         held_ids.add(UUID(str(head["apply_attempt_id"])))
@@ -417,12 +415,9 @@ def settle_apply_attempts(
     store_incarnation=None,
 ) -> None:
     """Consume complete logical batches; counts never choose owner status."""
-    from .adapter_client import DEPLOYMENT_EVIDENCE_FIELDS
     from .models import NSOApplyAttempt
     from .outcome_settlement import settle_terminal_generations
 
-    if not isinstance(deployment_evidence, dict) or set(deployment_evidence) != DEPLOYMENT_EVIDENCE_FIELDS:
-        raise EvidenceInvariantError("invalid_deployment_envelope")
     if deployment_evidence["device_id"] != management.adapter_device_id:
         raise EvidenceInvariantError("deployment_mapping_changed")
     incarnation = store_incarnation or getattr(deployment_evidence, "store_incarnation", None)
@@ -566,33 +561,14 @@ def _record_replay_answer(attempt, result=None, error=None):
 
 def _reject_unrequested_attempts(evidence, attempt_ids) -> None:
     """Refuse an evidence snapshot whose attempt records are malformed or unrequested."""
-    from . import adapter_client as client
-
-    raw_attempts = evidence.get("attempts")
-    if not isinstance(raw_attempts, list):
-        raise client.AdapterError(
-            "Adapter returned an invalid Apply attempt collection.",
-            code="invalid_response",
-        )
     requested = set(attempt_ids)
-    for raw in raw_attempts:
-        if not isinstance(raw, dict) or "apply_attempt_id" not in raw:
-            raise client.AdapterError(
-                "Adapter returned an invalid Apply attempt record.",
-                code="invalid_response",
-            )
+    for raw in evidence["attempts"]:
         try:
-            raw_id = UUID(str(raw["apply_attempt_id"]))
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise client.AdapterError(
-                "Adapter returned an invalid Apply attempt UUID.",
-                code="invalid_response",
-            ) from exc
+            raw_id = UUID(raw["apply_attempt_id"])
+        except ValueError:
+            raise EvidenceInvariantError("invalid_apply_attempt_uuid") from None
         if raw_id not in requested:
-            raise client.AdapterError(
-                "Adapter returned an unrequested Apply attempt.",
-                code="invalid_response",
-            )
+            raise EvidenceInvariantError("unrequested_apply_attempt")
 
 
 def _record_replay_answers(answers):
@@ -606,27 +582,12 @@ def _record_replay_answers(answers):
 
 def _validated_unknown_attempt_ids(evidence, attempt_ids) -> set[UUID]:
     """Parse unknown attempt IDs and refuse IDs outside the request."""
-    from . import adapter_client as client
-
-    raw_unknown = evidence.get("unknown_apply_attempt_ids", [])
-    if not isinstance(raw_unknown, list):
-        raise client.AdapterError(
-            "Adapter returned an invalid unknown attempt collection.",
-            code="invalid_response",
-        )
     try:
-        unknown = {UUID(str(value)) for value in raw_unknown}
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise client.AdapterError(
-            "Adapter returned an invalid unknown attempt UUID.",
-            code="invalid_response",
-        ) from exc
+        unknown = {UUID(value) for value in evidence["unknown_apply_attempt_ids"]}
+    except ValueError:
+        raise EvidenceInvariantError("invalid_unknown_attempt_uuid") from None
     if unknown - set(attempt_ids):
-        # An adapter answer we did not ask for; the caller's adapter boundary handles it.
-        raise client.AdapterError(
-            "Adapter returned an unrequested unknown Apply attempt.",
-            code="invalid_response",
-        )
+        raise EvidenceInvariantError("unrequested_unknown_apply_attempt")
     return unknown
 
 

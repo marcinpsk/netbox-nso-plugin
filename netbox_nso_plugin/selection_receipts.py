@@ -35,10 +35,7 @@ def pending_selections(management, evidence, generations):
     """Find only unacknowledged protocol sources named by terminal evidence."""
     authorities = list(generations)
     for attempt in evidence["attempts"]:
-        rows = attempt.get("generations")
-        if not isinstance(rows, list):
-            raise EvidenceInvariantError("invalid_terminal_batch")
-        authorities.extend(rows)
+        authorities.extend(attempt["generations"])
     pairs = {pair for generation in authorities for pair in _source_pairs(generation)}
     return [
         selection
@@ -54,7 +51,11 @@ def pending_selections(management, evidence, generations):
 
 def _source_pairs(generation):
     with identify_generation_stall(generation):
-        if not isinstance(generation, dict) or generation.get("status") not in GENERATION_STATUSES:
+        if (
+            not isinstance(generation, dict)
+            or not isinstance(generation.get("status"), str)
+            or generation["status"] not in GENERATION_STATUSES
+        ):
             raise EvidenceInvariantError("invalid_terminal_batch")
         if generation["status"] in {"pending", "running"}:
             return set()
