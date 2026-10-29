@@ -135,3 +135,28 @@ def make_generation_listing(*, generation_id=81, seq=4, **values):
         "updated_at": "2026-10-20T10:01:00+00:00",
         **values,
     }
+
+
+def make_evidence_envelope(projection, *, identity=None, error=None, digest="a" * 64, **values):
+    """Return the adapter's explicit per-record evidence envelope."""
+    if identity is None:
+        identity = {key: projection[key] for key in ("id", "device_id", "settle_seq")}
+    return {
+        "identity": identity,
+        "projection": projection,
+        "evidence_error": None if error is None else {"code": error, "digest": digest},
+        "digest": digest,
+        **values,
+    }
+
+
+def make_generation_envelope(projection, *, device_id=7, **values):
+    """Wrap a generation projection with its independent stored identity."""
+    identity = {
+        "device_id": device_id,
+        "generation_id": projection["generation_id"],
+        "seq": projection["seq"],
+        "carrier_job_id": projection["carrier_job_id"],
+        "apply_attempt_id": projection.get("apply_attempt_id"),
+    }
+    return make_evidence_envelope(projection, identity=identity, **values)

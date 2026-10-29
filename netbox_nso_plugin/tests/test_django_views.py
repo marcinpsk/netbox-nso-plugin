@@ -41,6 +41,7 @@ from ._outbox_case import (
     without_commit_drain,
 )
 from ._ownership_case import acquire_overlay
+from ._settlement_wire import deployment_wire, generation_wire
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 User = get_user_model()
@@ -8848,12 +8849,17 @@ class _ApplyBoundaryAdapter(ReceiptAdapter):
 
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith(("/jobs", "/generations")):
-            response = make_response(200, self.generations if url.endswith("/generations") else [])
+            response = make_response(
+                200,
+                [generation_wire(row, int(url.split("/devices/")[1].split("/")[0])) for row in self.generations]
+                if url.endswith("/generations")
+                else [],
+            )
             response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000004"
             return response
         if url.endswith("/deployment-evidence"):
             assert self.evidence is not None, "this test arranged no deployment evidence"
-            return make_response(200, self.evidence())
+            return make_response(200, deployment_wire(self.evidence()))
         if method == "POST" and url.endswith("/actions/apply"):
             self.apply_requests.append(kwargs.get("json"))
             return make_response(*self.apply_response())

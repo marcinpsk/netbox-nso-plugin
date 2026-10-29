@@ -246,7 +246,12 @@ class _AdapterDoubleMixin:
                 body = handler._body()
                 requested_ids = [UUID(str(value)) for value in body.get("apply_attempt_ids", [])]
                 device_id = handler._device_id_from_path(parsed)
-                handler._send(200, _pending_attempt_evidence(device_id, requested_ids, self.settled_evidence_scopes))
+                from ._settlement_wire import deployment_wire
+
+                handler._send(
+                    200,
+                    deployment_wire(_pending_attempt_evidence(device_id, requested_ids, self.settled_evidence_scopes)),
+                )
                 return
             real_do_post(handler)
 

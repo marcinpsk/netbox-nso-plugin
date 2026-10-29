@@ -11,6 +11,7 @@ from django.urls import reverse
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire, job_wire
 from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
 
@@ -318,9 +319,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 jobs = response.json()
                 for field, value in invalid.items():
                     if value is absent:
-                        jobs[0].pop(field)
+                        jobs[0]["projection"].pop(field)
                     else:
-                        jobs[0][field] = value
+                        jobs[0]["projection"][field] = value
                 return make_response(200, jobs)
             return response
 
@@ -388,7 +389,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         mirror_update(self.management, settle_cursor_seq=10001)
         original = self.adapter._handle
-        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0][
+            "projection"
+        ]
         starts = []
 
         def retained_history(method, url, **kwargs):
@@ -404,7 +407,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                         job.update(id=100000 + sequence, type="import", result=None, row_outcomes=None, refusals=None)
                     job["settle_seq"] = sequence
                     jobs.append(job)
-                return make_response(200, jobs)
+                return make_response(200, [job_wire(job) for job in jobs])
             return response
 
         self.adapter._handle = retained_history
@@ -505,7 +508,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.serve_terminal_evidence(retry)
         original = self.adapter._handle
-        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0][
+            "projection"
+        ]
         jobs = []
         for sequence, generation in enumerate((first, retry), start=1):
             job = copy.deepcopy(template)
@@ -525,7 +530,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/jobs"):
                 params = kwargs["params"]
                 after, limit = int(params["after_settle_seq"]), int(params["limit"])
-                return make_response(200, [job for job in jobs if job["settle_seq"] > after][:limit])
+                return make_response(200, [job_wire(job) for job in jobs if job["settle_seq"] > after][:limit])
             return original(method, url, **kwargs)
 
         self.adapter._handle = retry_feed
@@ -849,7 +854,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             response = serve(method, url, **kwargs)
             if method == "GET" and url.endswith("/jobs") and int(kwargs["params"]["after_settle_seq"]) < 1:
                 job = {
-                    **response.json()[0],
+                    **response.json()[0]["projection"],
                     "id": 501,
                     "status": original["carrier_job_status"],
                     "result": original["carrier_job_result"],
@@ -857,7 +862,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                     "refusals": original["refusals"],
                     "settle_seq": 1,
                 }
-                response = make_response(200, [job, *response.json()])
+                response = make_response(200, [job_wire(job), *response.json()])
             return response
 
         self.adapter._handle = with_original_job
@@ -1545,7 +1550,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 pending = make_generation_listing(
                     **link, status="pending", carrier_job_id=None, carrier_job_status=None
                 )
-                return make_response(200, [*response.json(), pending])
+                return make_response(
+                    200, [*response.json(), generation_wire(pending, self.management.adapter_device_id)]
+                )
             return response
 
         self.adapter._handle = handle

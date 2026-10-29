@@ -19,6 +19,7 @@ from django.utils import timezone
 from ._adapter_http import make_generation_listing, make_response
 from ._outbox_case import make_managed, mirror_update, own_vlan
 from ._ownership_case import acquire_overlay
+from ._settlement_wire import deployment_wire, generation_wire
 
 _CLIENT_CONFIG = {
     "url": "http://adapter.local",
@@ -120,7 +121,12 @@ def _epoch_session(session, *, generations=()):
     class Session:
         def request(self, method, url, **kwargs):
             if method == "GET" and url.endswith(("/jobs", "/generations")):
-                response = make_response(200, list(generations) if url.endswith("/generations") else [])
+                response = make_response(
+                    200,
+                    [generation_wire(row, int(url.split("/devices/")[1].split("/")[0])) for row in generations]
+                    if url.endswith("/generations")
+                    else [],
+                )
                 response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000004"
                 return response
             return session.request(method, url, **kwargs)
@@ -252,7 +258,7 @@ class TestAttemptSettlement(TestCase):
                 if url.endswith("/deployment-evidence"):
                     payload = _payload(self.adapter_device_id, [known] if admitted else [])
                     payload["unknown_apply_attempt_ids"] = [] if admitted else [str(attempt_id)]
-                    return make_response(200, payload)
+                    return make_response(200, deployment_wire(payload))
                 self.assertTrue(url.endswith("/actions/apply"))
                 self.assertEqual(
                     body,
@@ -302,7 +308,7 @@ class TestAttemptSettlement(TestCase):
 
         class EvidenceSession:
             def request(_self, method, url, **kwargs):
-                return make_response(200, malformed)
+                return make_response(200, deployment_wire(malformed))
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
@@ -348,7 +354,7 @@ class TestAttemptSettlement(TestCase):
             def request(_self, method, url, **kwargs):
                 requests.append((method, url))
                 if url.endswith("/deployment-evidence"):
-                    return make_response(200, unknown)
+                    return make_response(200, deployment_wire(unknown))
                 return make_response(
                     409,
                     {
@@ -392,7 +398,7 @@ class TestAttemptSettlement(TestCase):
                     def request(_self, method, url, **kwargs):
                         calls.append(url.rsplit("/", 1)[-1])
                         if url.endswith("/deployment-evidence"):
-                            return make_response(200, unknown)
+                            return make_response(200, deployment_wire(unknown))
                         self.assertTrue(url.endswith("/actions/apply"))
                         return make_response(400, payload)
 
@@ -427,7 +433,8 @@ class TestAttemptSettlement(TestCase):
                 calls.append(url.rsplit("/", 1)[-1])
                 if url.endswith("/deployment-evidence"):
                     return make_response(
-                        200, {**unknown, "unknown_apply_attempt_ids": kwargs["json"]["apply_attempt_ids"]}
+                        200,
+                        deployment_wire({**unknown, "unknown_apply_attempt_ids": kwargs["json"]["apply_attempt_ids"]}),
                     )
                 self.assertTrue(url.endswith("/actions/apply"))
                 return make_response(400, content=b"invalid JSON")
@@ -515,7 +522,7 @@ class TestAttemptSettlement(TestCase):
                 nonlocal answered
                 if url.endswith("/deployment-evidence"):
                     known = _payload(self.adapter_device_id, [admitted]) if answered else unknown
-                    return make_response(200, known)
+                    return make_response(200, deployment_wire(known))
                 applies.append(kwargs["json"])
                 if len(applies) == 1:
                     # Copied from ../nso-adapter/tests/api/openapi_snapshot.json ErrorEnvelope,
@@ -583,7 +590,7 @@ class TestAttemptSettlement(TestCase):
         class EvidenceSession:
             def request(_self, method, url, **kwargs):
                 calls.append(url)
-                return make_response(200, evidence)
+                return make_response(200, deployment_wire(evidence))
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
@@ -621,7 +628,7 @@ class TestAttemptSettlement(TestCase):
         class EvidenceSession:
             def request(_self, method, url, **kwargs):
                 self.assertTrue(url.endswith("/deployment-evidence"))
-                return make_response(200, payload)
+                return make_response(200, deployment_wire(payload))
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
@@ -663,7 +670,7 @@ class TestAttemptSettlement(TestCase):
                         [requested, unrequested] if admitted else [],
                     )
                     answered["unknown_apply_attempt_ids"] = [] if admitted else [str(requested_id)]
-                    return make_response(200, answered)
+                    return make_response(200, deployment_wire(answered))
                 self.assertTrue(url.endswith("/actions/apply"))
                 admitted = True
                 return make_response(202, requested["response"])
@@ -695,7 +702,7 @@ class TestAttemptSettlement(TestCase):
             def request(_self, method, url, **kwargs):
                 requests.append(url.rsplit("/", 1)[-1])
                 if url.endswith("/deployment-evidence"):
-                    return make_response(200, payload)
+                    return make_response(200, deployment_wire(payload))
                 return make_response(202, malformed["response"])
 
         with (
@@ -724,7 +731,7 @@ class TestAttemptSettlement(TestCase):
             def request(_self, method, url, **kwargs):
                 nonlocal replayed
                 if url.endswith("/deployment-evidence"):
-                    payload = _payload(self.adapter_device_id, [])
+                    payload = deployment_wire(_payload(self.adapter_device_id, []))
                     if replayed:
                         payload["attempts"] = {"apply_attempt_id": str(attempt_id)}
                     else:
@@ -763,7 +770,7 @@ class TestAttemptSettlement(TestCase):
                             payload["unknown_apply_attempt_ids"] = (
                                 [unknown_id] if len(requests) == 3 else [str(attempt_id)]
                             )
-                            return make_response(200, payload)
+                            return make_response(200, deployment_wire(payload))
                         self.assertTrue(url.endswith("/actions/apply"))
                         self.assertEqual(
                             kwargs["json"],
@@ -823,14 +830,14 @@ class TestAttemptSettlement(TestCase):
                 if url.endswith("/deployment-evidence"):
                     payload = _payload(self.adapter_device_id, [known] if admitted else [])
                     payload["unknown_apply_attempt_ids"] = [] if admitted else [str(attempt_id)]
-                    return make_response(200, payload)
+                    return make_response(200, deployment_wire(payload))
                 self.assertTrue(url.endswith("/actions/apply"))
                 self.assertEqual(
                     body,
                     {"apply_attempt_id": str(attempt_id), "selected": selected},
                 )
                 admitted = True
-                return make_response(200, no_op)
+                return make_response(200, deployment_wire(no_op))
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
@@ -883,7 +890,7 @@ class TestAttemptSettlement(TestCase):
 
                 class EvidenceSession:
                     def request(_self, method, url, **kwargs):
-                        return make_response(200, _payload(self.adapter_device_id, [evidence]))
+                        return make_response(200, deployment_wire(_payload(self.adapter_device_id, [evidence])))
 
                 with (
                     patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),

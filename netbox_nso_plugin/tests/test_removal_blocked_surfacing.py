@@ -27,6 +27,7 @@ from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._adapter_http import make_generation_listing, make_response, make_session
+from ._settlement_wire import generation_wire, job_wire
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
@@ -230,7 +231,7 @@ class BlockedRemovalTestBase(TestCase):
                     cursor = params.get("since_seq", 0)
                     limit = params.get("limit", 100)
                     page = [row for row in generations if row["seq"] > cursor][:limit]
-                    return make_response(200, json_data=page)
+                    return make_response(200, json_data=[generation_wire(row, 10) for row in page])
                 if lookup := re.search(r"/api/v1/jobs/(\d+)$", url):
                     job_lookups.append(int(lookup.group(1)))
                     job = stored.get(int(lookup.group(1)))
@@ -238,8 +239,8 @@ class BlockedRemovalTestBase(TestCase):
                         return make_response(
                             404, json_data={"error": {"code": "not_found", "message": "Job not found"}}
                         )
-                    return make_response(200, json_data=job)
-                return make_response(200, json_data=jobs)
+                    return make_response(200, json_data=job_wire(job))
+                return make_response(200, json_data=[job_wire(job) for job in jobs])
 
             session.request.side_effect = request
             mock_session_cls.return_value = session
@@ -770,7 +771,9 @@ class TestCategoryGridResidueBadges(BlockedRemovalTestBase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
         ):
-            mock_session_cls.return_value = make_session(response=make_response(200, json_data=jobs))
+            mock_session_cls.return_value = make_session(
+                response=make_response(200, json_data=[job_wire(job) for job in jobs])
+            )
             url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": key})
             return self.client.get(url)
 

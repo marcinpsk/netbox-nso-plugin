@@ -12,6 +12,7 @@ from netbox_nso_plugin.models import NSOApplyExecution
 from netbox_nso_plugin.refusal_display import device_execution_summaries, document_projection
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import job_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
@@ -26,7 +27,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/jobs"):
                 after = int(kwargs["params"]["after_settle_seq"])
                 params = {**kwargs["params"], "after_settle_seq": 0}
-                job = original(method, url, **{**kwargs, "params": params}).json()[0]
+                job = original(method, url, **{**kwargs, "params": params}).json()[0]["projection"]
                 sequences = range(1, 101) if full_page else [41]
                 preceding = [
                     {
@@ -41,9 +42,9 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
                     for sequence in sequences
                 ]
                 if after == 0:
-                    return make_response(200, [*preceding, job][:100])
+                    return make_response(200, [job_wire(row) for row in [*preceding, job][:100]])
                 if full_page and after == 100:
-                    return make_response(200, [job])
+                    return make_response(200, [job_wire(job)])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
@@ -191,7 +192,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             response = original(method, url, **kwargs)
             if broken and method == "POST" and url.endswith("/deployment-evidence"):
                 evidence = response.json()
-                evidence["head"]["source_push_seq"] = {}
+                evidence["head"]["projection"]["source_push_seq"] = {}
                 return make_response(200, evidence)
             return response
 
@@ -274,7 +275,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
                 params = kwargs["params"]
                 self.settlement_pages.append((int(params["after_settle_seq"]), int(params["limit"])))
                 response = original(method, url, **{**kwargs, "params": {**params, "after_settle_seq": 0}})
-                carrier = {**response.json()[0], "status": "failed"}
+                carrier = {**response.json()[0]["projection"], "status": "failed"}
                 sync = {
                     **carrier,
                     "id": 500,
@@ -287,7 +288,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
                 }
                 jobs = [job for job in (sync, carrier) if job["settle_seq"] > int(params["after_settle_seq"])]
                 jobs = jobs[: int(params["limit"])]
-                return make_response(200, jobs)
+                return make_response(200, [job_wire(job) for job in jobs])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
@@ -385,7 +386,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             response = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 evidence = response.json()
-                evidence["attempts"][0]["generations"][0]["row_outcomes"][0]["disposition"] = (
+                evidence["attempts"][0]["generations"][0]["projection"]["row_outcomes"][0]["disposition"] = (
                     "placeholder-secret-canary"
                 )
                 return make_response(200, evidence)
@@ -405,7 +406,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             response = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 evidence = response.json()
-                evidence["attempts"][0]["generations"][0]["source_push_seq"] = {}
+                evidence["attempts"][0]["generations"][0]["projection"]["source_push_seq"] = {}
                 return make_response(200, evidence)
             return response
 
@@ -440,7 +441,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/generations"):
                 generations = response.json()
-                generations[0]["digest"] = "b" * 64
+                generations[0]["projection"]["digest"] = "b" * 64
                 return make_response(200, generations)
             return response
 
@@ -533,7 +534,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             response = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 evidence = response.json()
-                evidence["head"]["apply_attempt_id"] = "placeholder-secret-canary"
+                evidence["head"]["projection"]["apply_attempt_id"] = "placeholder-secret-canary"
                 return make_response(200, evidence)
             return response
 

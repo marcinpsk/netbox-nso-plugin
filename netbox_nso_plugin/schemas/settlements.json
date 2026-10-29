@@ -177,6 +177,26 @@
         "title": "ActionApplySkippedDetailOut",
         "type": "object"
       },
+      "AttemptIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "apply_attempt_id": {
+            "format": "uuid",
+            "title": "Apply Attempt Id",
+            "type": "string"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "device_id",
+          "apply_attempt_id"
+        ],
+        "title": "AttemptIdentityOut",
+        "type": "object"
+      },
       "AttributedRefusalOut": {
         "additionalProperties": false,
         "properties": {
@@ -317,6 +337,55 @@
         "title": "CatalogRefusalOut",
         "type": "object"
       },
+      "DeploymentAttemptEvidenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "evidence_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvidenceErrorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "generations": {
+            "items": {
+              "$ref": "#/components/schemas/DeploymentGenerationEvidenceOut"
+            },
+            "title": "Generations",
+            "type": "array"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/AttemptIdentityOut"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentEvidenceAttemptOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity",
+          "projection",
+          "evidence_error",
+          "digest",
+          "generations"
+        ],
+        "title": "DeploymentAttemptEvidenceOut",
+        "type": "object"
+      },
       "DeploymentEvidenceAttemptOut": {
         "additionalProperties": false,
         "properties": {
@@ -329,11 +398,11 @@
             "title": "Apply Attempt Id",
             "type": "string"
           },
-          "generations": {
+          "generation_ids": {
             "items": {
-              "$ref": "#/components/schemas/DeploymentEvidenceGenerationOut"
+              "type": "integer"
             },
-            "title": "Generations",
+            "title": "Generation Ids",
             "type": "array"
           },
           "http_status": {
@@ -344,6 +413,13 @@
             "additionalProperties": true,
             "title": "Response",
             "type": "object"
+          },
+          "selected": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Selected",
+            "type": "object"
           }
         },
         "required": [
@@ -351,7 +427,8 @@
           "admission_state",
           "http_status",
           "response",
-          "generations"
+          "selected",
+          "generation_ids"
         ],
         "title": "DeploymentEvidenceAttemptOut",
         "type": "object"
@@ -672,12 +749,94 @@
         "title": "DeploymentEvidenceHeadOut",
         "type": "object"
       },
+      "DeploymentGenerationEvidenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "evidence_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvidenceErrorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "identity": {
+            "$ref": "#/components/schemas/GenerationIdentityOut"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentEvidenceGenerationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity",
+          "projection",
+          "evidence_error",
+          "digest"
+        ],
+        "title": "DeploymentGenerationEvidenceOut",
+        "type": "object"
+      },
+      "DeploymentHeadEvidenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "evidence_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvidenceErrorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "identity": {
+            "$ref": "#/components/schemas/GenerationIdentityOut"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeploymentEvidenceHeadOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity",
+          "projection",
+          "evidence_error",
+          "digest"
+        ],
+        "title": "DeploymentHeadEvidenceOut",
+        "type": "object"
+      },
       "DeviceDeploymentEvidenceOut": {
         "additionalProperties": false,
         "properties": {
           "attempts": {
             "items": {
-              "$ref": "#/components/schemas/DeploymentEvidenceAttemptOut"
+              "$ref": "#/components/schemas/DeploymentAttemptEvidenceOut"
             },
             "title": "Attempts",
             "type": "array"
@@ -693,7 +852,7 @@
           "head": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/DeploymentEvidenceHeadOut"
+                "$ref": "#/components/schemas/DeploymentHeadEvidenceOut"
               },
               {
                 "type": "null"
@@ -737,9 +896,50 @@
         "title": "DeviceDeploymentEvidenceOut",
         "type": "object"
       },
+      "DeviceGenerationEvidenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "evidence_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvidenceErrorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "identity": {
+            "$ref": "#/components/schemas/GenerationIdentityOut"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeviceGenerationOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity",
+          "projection",
+          "evidence_error",
+          "digest"
+        ],
+        "title": "DeviceGenerationEvidenceOut",
+        "type": "object"
+      },
       "DeviceGenerationOut": {
         "additionalProperties": false,
-        "description": "One deployment generation, with every receipt-facing field always present.",
+        "description": "Emit every receipt-facing field for one deployment generation.",
         "properties": {
           "carrier_job_id": {
             "anyOf": [
@@ -851,6 +1051,81 @@
         "title": "DeviceGenerationOut",
         "type": "object"
       },
+      "EvidenceErrorOut": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "projection_construction",
+              "schema_validation",
+              "execution_contract",
+              "attempt_generation_membership"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "digest"
+        ],
+        "title": "EvidenceErrorOut",
+        "type": "object"
+      },
+      "GenerationIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "apply_attempt_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Apply Attempt Id"
+          },
+          "carrier_job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Job Id"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "generation_id": {
+            "title": "Generation Id",
+            "type": "integer"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "device_id",
+          "generation_id",
+          "seq",
+          "carrier_job_id",
+          "apply_attempt_id"
+        ],
+        "title": "GenerationIdentityOut",
+        "type": "object"
+      },
       "GenerationMode": {
         "description": "How a deployment generation reaches NSO (#1522 \u00a7G1).\n\n``networked`` commits to the device; ``detach`` commits ``no-networking`` and re-aligns\nCDB with a sync-from, dropping service governance without touching the device (#106).\nThe mode is part of the generation's identity: two adjacent generations of different\nmodes may never be coalesced into one device write.",
         "enum": [
@@ -873,9 +1148,180 @@
         "title": "GenerationStatus",
         "type": "string"
       },
+      "IntentReceiptOut": {
+        "additionalProperties": false,
+        "description": "One ``(device, section)`` receipt \u2014 EMIT-NULL, every key always present.\n\n``section`` is the adapter's own stream vocabulary (:mod:`core.intent_protocol`). The\npusher's delivery key for the interface family is ``interface`` and maps onto\n``interface_config`` here; the other fifteen names are identical on both sides.",
+        "properties": {
+          "backfill_only": {
+            "title": "Backfill Only",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "delete_origin": {
+            "title": "Delete Origin",
+            "type": "boolean"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "generation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Id"
+          },
+          "push_seq": {
+            "title": "Push Seq",
+            "type": "integer"
+          },
+          "request_digest": {
+            "title": "Request Digest",
+            "type": "string"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          },
+          "section": {
+            "title": "Section",
+            "type": "string"
+          },
+          "status_code": {
+            "title": "Status Code",
+            "type": "integer"
+          },
+          "store_only": {
+            "title": "Store Only",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "device_id",
+          "section",
+          "push_seq",
+          "request_digest",
+          "store_only",
+          "delete_origin",
+          "backfill_only",
+          "status_code",
+          "response",
+          "generation_id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "IntentReceiptOut",
+        "type": "object"
+      },
+      "JobEvidenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "evidence_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvidenceErrorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "identity": {
+            "$ref": "#/components/schemas/JobIdentityOut"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity",
+          "projection",
+          "evidence_error",
+          "digest"
+        ],
+        "title": "JobEvidenceOut",
+        "type": "object"
+      },
+      "JobIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "settle_seq": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settle Seq"
+          }
+        },
+        "required": [
+          "id",
+          "device_id",
+          "settle_seq"
+        ],
+        "title": "JobIdentityOut",
+        "type": "object"
+      },
       "JobOut": {
         "additionalProperties": false,
-        "description": "EMIT-NULL job shape \u2014 every key always present, nullables emitted as null.",
+        "description": "Emit every job field and retain null values.",
         "properties": {
           "context": {
             "anyOf": [
@@ -1107,6 +1553,30 @@
         "title": "LogicalIdentityOut",
         "type": "object"
       },
+      "ReceiptIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "push_seq": {
+            "title": "Push Seq",
+            "type": "integer"
+          },
+          "section": {
+            "title": "Section",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "section",
+          "push_seq"
+        ],
+        "title": "ReceiptIdentityOut",
+        "type": "object"
+      },
       "RelatedSiteOut": {
         "additionalProperties": false,
         "properties": {
@@ -1264,6 +1734,189 @@
         "title": "RowRefOut",
         "type": "object"
       },
+      "SettlementAbsenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "apply_attempt_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Apply Attempt Ids",
+            "type": "array"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "receipt_sections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Receipt Sections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "job_id",
+          "apply_attempt_ids",
+          "receipt_sections"
+        ],
+        "title": "SettlementAbsenceOut",
+        "type": "object"
+      },
+      "SettlementDeviceIdentityOut": {
+        "additionalProperties": false,
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "integer"
+          },
+          "netbox_device_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Netbox Device Id"
+          },
+          "nso_device_name": {
+            "title": "Nso Device Name",
+            "type": "string"
+          },
+          "nso_instance": {
+            "title": "Nso Instance",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "netbox_device_id",
+          "nso_instance",
+          "nso_device_name"
+        ],
+        "title": "SettlementDeviceIdentityOut",
+        "type": "object"
+      },
+      "SettlementObservationIn": {
+        "additionalProperties": false,
+        "properties": {
+          "after_settle_seq": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "After Settle Seq",
+            "type": "integer"
+          },
+          "apply_attempt_ids": {
+            "description": "At most 100 DISTINCT attempt UUIDs. Duplicates are collapsed before that bound is applied; at most 10000 raw list entries.",
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 10000,
+            "title": "Apply Attempt Ids",
+            "type": "array"
+          },
+          "job_id": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 2147483647.0,
+            "title": "Job Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "apply_attempt_ids",
+          "job_id",
+          "after_settle_seq"
+        ],
+        "title": "SettlementObservationIn",
+        "type": "object"
+      },
+      "SettlementObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "absent": {
+            "$ref": "#/components/schemas/SettlementAbsenceOut"
+          },
+          "deployment": {
+            "$ref": "#/components/schemas/DeviceDeploymentEvidenceOut"
+          },
+          "device": {
+            "$ref": "#/components/schemas/SettlementDeviceIdentityOut"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "generations": {
+            "items": {
+              "$ref": "#/components/schemas/DeviceGenerationEvidenceOut"
+            },
+            "title": "Generations",
+            "type": "array"
+          },
+          "job": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobEvidenceOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_feed": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobIdentityOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/SettlementReceiptEvidenceOut"
+            },
+            "title": "Receipts",
+            "type": "array"
+          },
+          "request": {
+            "$ref": "#/components/schemas/SettlementObservationIn"
+          },
+          "store_incarnation": {
+            "format": "uuid",
+            "title": "Store Incarnation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request",
+          "store_incarnation",
+          "device",
+          "job",
+          "next_feed",
+          "generations",
+          "deployment",
+          "receipts",
+          "absent",
+          "digest"
+        ],
+        "title": "SettlementObservationOut",
+        "type": "object"
+      },
       "SettlementOwnerOut": {
         "additionalProperties": false,
         "properties": {
@@ -1340,6 +1993,47 @@
           "settlement_cohort"
         ],
         "title": "SettlementOwnerOut",
+        "type": "object"
+      },
+      "SettlementReceiptEvidenceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "evidence_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvidenceErrorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "identity": {
+            "$ref": "#/components/schemas/ReceiptIdentityOut"
+          },
+          "projection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IntentReceiptOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "identity",
+          "projection",
+          "evidence_error",
+          "digest"
+        ],
+        "title": "SettlementReceiptEvidenceOut",
         "type": "object"
       }
     }

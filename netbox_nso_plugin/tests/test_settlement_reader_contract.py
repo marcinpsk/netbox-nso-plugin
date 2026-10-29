@@ -14,7 +14,7 @@ import pytest
 from netbox_nso_plugin import adapter_client
 from netbox_nso_plugin.settlement_schemas import MAX_NESTING
 
-from ._adapter_http import make_response, make_transport_session
+from ._adapter_http import make_evidence_envelope, make_generation_envelope, make_response, make_transport_session
 
 SETTLEMENT_EVIDENCE_READERS = frozenset(
     {
@@ -25,7 +25,16 @@ SETTLEMENT_EVIDENCE_READERS = frozenset(
         "trigger_apply",
     }
 )
-ADAPTER_LOCAL_HELPERS = frozenset({"InvalidJobEvidence", "capture_wire_body", "static_route_deletions"})
+ADAPTER_LOCAL_HELPERS = frozenset(
+    {
+        "EvidenceItem",
+        "InvalidJobEvidence",
+        "_validated_job",
+        "_validated_generation_listing",
+        "capture_wire_body",
+        "static_route_deletions",
+    }
+)
 # Complete JSON that json.loads rejects with RecursionError on an 8 MiB stack; a larger stack decodes it.
 DEEP_JSON = b"[" * 100_000 + b"0" + b"]" * 100_000
 # Complete JSON that json.loads decodes on any stack but that nests past MAX_NESTING.
@@ -64,6 +73,178 @@ def _serve_response(response, *, error=None):
             yield
     finally:
         adapter_client.reset_session()
+
+
+def test_feed_keeps_valid_siblings_and_identified_error_items():
+    from .test_adapter_client_ext import _JOB_OUT
+
+    first = {**_JOB_OUT, "device_id": 7, "id": 10, "settle_seq": 1}
+    last = {**first, "id": 12, "settle_seq": 3}
+    failed = make_evidence_envelope(
+        None,
+        identity={"id": 11, "device_id": 7, "settle_seq": 2},
+        error="execution_contract",
+    )
+    response = make_response(200, [make_evidence_envelope(first), failed, make_evidence_envelope(last)])
+    response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
+    with _serve_response(response):
+        jobs, incarnation = _read_response("get_settlement_feed")
+    assert jobs[0] == first
+    assert jobs[2] == last
+    assert jobs[1] == {"id": 11, "device_id": 7, "settle_seq": 2}
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(jobs[1])
+    assert (raised.value.job_id, raised.value.settle_seq, raised.value.store_incarnation) == (11, 2, incarnation)
+    assert raised.value.reason == "invalid job envelope"
+
+
+def test_feed_semantically_invalid_job_is_an_item_failure():
+    from .test_adapter_client_ext import _JOB_OUT
+
+    job = {**_JOB_OUT, "device_id": 7, "type": "", "settle_seq": 1}
+    response = make_response(200, [make_evidence_envelope(job)])
+    response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
+    with _serve_response(response):
+        jobs, _ = _read_response("get_settlement_feed")
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(jobs[0])
+    assert raised.value.job_id == job["id"]
+    assert raised.value.reason == "invalid job envelope"
+
+
+def test_strict_evidence_consumers_refuse_nested_failed_items():
+    identity = {"device_id": 7, "apply_attempt_id": str(UUID(int=1))}
+    generation = {
+        "device_id": 7,
+        "generation_id": 81,
+        "seq": 4,
+        "carrier_job_id": 501,
+        "apply_attempt_id": identity["apply_attempt_id"],
+    }
+    failed = make_evidence_envelope(None, identity=generation, error="execution_contract")
+    attempt = make_evidence_envelope(
+        None, identity=identity, error="attempt_generation_membership", generations=[failed]
+    )
+    body = {
+        "device_id": 7,
+        "head": None,
+        "blocked": False,
+        "write_work_pending": False,
+        "held_jobs": [],
+        "pending_generations": 0,
+        "attempts": [attempt],
+        "unknown_apply_attempt_ids": [],
+    }
+    with _serve_response(make_response(200, body)):
+        evidence = _read_response("get_deployment_evidence")
+    assert evidence["attempts"][0]["generations"][0] == generation
+    assert evidence["attempts"][0].evidence_identity == identity
+    assert evidence["attempts"][0].evidence_digest == "a" * 64
+    assert evidence["attempts"][0]["generations"][0].evidence_identity == generation
+    assert evidence["attempts"][0]["generations"][0].evidence_digest == "a" * 64
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_evidence_errors(evidence)
+    assert raised.value.reason == "invalid settlement evidence"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "schema",
+        "identity",
+        "error_digest",
+        "unknown_code",
+        "missing_error_code",
+        "missing_error_digest",
+        "both",
+        "neither",
+    ],
+)
+def test_job_envelope_failures_use_only_the_stored_identity(failure):
+    from .test_adapter_client_ext import _JOB_OUT
+
+    job = {**_JOB_OUT, "device_id": 7, "settle_seq": 1}
+    envelope = make_evidence_envelope(job)
+    if failure == "schema":
+        envelope["projection"] = {**job, "context": "invalid"}
+    elif failure == "identity":
+        envelope["projection"] = {**job, "id": job["id"] + 1, "settle_seq": 2}
+    elif failure == "error_digest":
+        envelope["projection"] = None
+        envelope["evidence_error"] = {"code": "execution_contract", "digest": "b" * 64}
+    elif failure == "unknown_code":
+        envelope["projection"] = None
+        envelope["evidence_error"] = {"code": "unknown_failure", "digest": "a" * 64}
+    elif failure.startswith("missing_error_"):
+        envelope["projection"] = None
+        envelope["evidence_error"] = {"code": "execution_contract", "digest": "a" * 64}
+        del envelope["evidence_error"][failure.removeprefix("missing_error_")]
+    elif failure == "both":
+        envelope["evidence_error"] = {"code": "execution_contract", "digest": "a" * 64}
+    else:
+        envelope["projection"] = None
+    response = make_response(200, [envelope])
+    response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
+    with _serve_response(response):
+        items, _ = _read_response("get_settlement_feed")
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(items[0])
+    assert (raised.value.job_id, raised.value.settle_seq) == (job["id"], 1)
+
+
+@pytest.mark.parametrize("field", ["id", "device_id", "settle_seq"])
+def test_job_envelope_requires_independent_identity_fields(field):
+    identity = {"id": 10, "device_id": 7, "settle_seq": 1}
+    del identity[field]
+    envelope = make_evidence_envelope(None, identity=identity, error="execution_contract")
+    response = make_response(200, [envelope])
+    response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
+    with _serve_response(response), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        _read_response("get_settlement_feed")
+    assert raised.value.job_id is None
+    assert raised.value.reason == "invalid job envelope"
+
+
+def test_failed_item_survives_copy_without_losing_its_identity():
+    from copy import deepcopy
+
+    error = adapter_client.InvalidJobEvidence({"id": 10, "device_id": 7, "settle_seq": 1}, "invalid job envelope")
+    error.store_incarnation = str(UUID(int=1))
+    item = adapter_client.EvidenceItem({"id": 10, "device_id": 7, "settle_seq": 1}, error, digest="a" * 64)
+    copied = deepcopy(item)
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(copied)
+    assert raised.value is not error
+    assert raised.value.store_incarnation == error.store_incarnation
+    assert copied.evidence_digest == "a" * 64
+
+
+def test_strict_evidence_validation_traverses_nested_projection_collections():
+    error = adapter_client.InvalidJobEvidence({"id": 501, "device_id": 7}, "invalid settlement evidence")
+    item = adapter_client.EvidenceItem({"carrier_job_id": 501}, error, digest="a" * 64)
+    document = {"head": None, "attempts": [{"generations": [{"generation_id": 80}, item]}]}
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_evidence_errors(document)
+    assert raised.value is error
+
+
+def test_generation_order_failure_preserves_the_valid_prefix():
+    from ._adapter_http import make_generation_listing
+
+    first = make_generation_listing(generation_id=80, seq=3, job_id=500, carrier_job_id=500)
+    failed = make_generation_listing(generation_id=80, seq=4)
+    last = make_generation_listing(generation_id=82, seq=5, job_id=502, carrier_job_id=502)
+    page = [make_generation_envelope(item) for item in (first, failed, last)]
+    with _serve_response(make_response(200, page)):
+        rows = _read_response("list_device_generations")
+    assert rows[0] == first
+    assert len(rows) == 2
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(rows[1])
+    assert raised.value.job_id == 501
+    assert rows[1]["seq"] == 4
+    assert rows[1].evidence_identity == page[1]["identity"]
+    assert rows[1].evidence_digest == page[1]["digest"]
 
 
 @pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
@@ -142,12 +323,13 @@ def test_schema_nesting_bound_accepts_the_limit_and_rejects_one_more_level():
 
     from .test_adapter_client_ext import _JOB_OUT
 
-    # The page and the job take two levels; the result fills the rest.
-    at_limit = [{**_JOB_OUT, "result": _nested(MAX_NESTING - 2)}]
-    assert validate_settlement_response("JobOut", at_limit, 7) is at_limit
-    over = [{**_JOB_OUT, "result": _nested(MAX_NESTING - 1)}]
+    # The page, envelope and projection take three levels; the result fills the rest.
+    job = {**_JOB_OUT, "device_id": 7, "row_outcomes": None, "refusals": None}
+    at_limit = {**job, "result": _nested(MAX_NESTING - 3)}
+    assert validate_settlement_response("JobEvidenceOut", [make_evidence_envelope(at_limit)], 7) == [at_limit]
+    over = [make_evidence_envelope({**job, "result": _nested(MAX_NESTING - 2)})]
     with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
-        validate_settlement_response("JobOut", over, 7)
+        validate_settlement_response("JobEvidenceOut", over, 7)
     assert raised.value.job_id is None
     assert raised.value.reason == "invalid job envelope"
 
@@ -161,11 +343,14 @@ def test_schema_integer_bound_accepts_int64_and_rejects_values_outside_it(value)
 
     from .test_adapter_client_ext import _JOB_OUT
 
-    at_limit = [{**_JOB_OUT, "settle_seq": INT64_MAX, "result": {**_JOB_OUT["result"], "n": -INT64_MAX - 1}}]
-    assert validate_settlement_response("JobOut", at_limit, 7) is at_limit
-    for page in ([{**_JOB_OUT, "settle_seq": value}], [{**_JOB_OUT, "result": {**_JOB_OUT["result"], "n": value}}]):
+    job = {**_JOB_OUT, "device_id": 7}
+    at_limit = [{**job, "settle_seq": INT64_MAX, "result": {**job["result"], "n": -INT64_MAX - 1}}]
+    assert (
+        validate_settlement_response("JobEvidenceOut", [make_evidence_envelope(row) for row in at_limit], 7) == at_limit
+    )
+    for page in ([{**job, "settle_seq": value}], [{**job, "result": {**job["result"], "n": value}}]):
         with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
-            validate_settlement_response("JobOut", page, 7)
+            validate_settlement_response("JobEvidenceOut", [make_evidence_envelope(row) for row in page], 7)
         assert raised.value.job_id is None
         assert raised.value.reason == "invalid job envelope"
 
@@ -337,7 +522,7 @@ def test_receipt_nesting_bound_keeps_the_reader_exception_contract(depth):
 
 
 @pytest.mark.parametrize("failure", ["provenance", "timestamp", "carrier", "order"])
-def test_generation_semantic_failures_keep_the_reader_exception_contract(failure):
+def test_generation_semantic_failures_keep_trusted_item_identity(failure):
     from ._adapter_http import make_generation_listing
 
     row = make_generation_listing()
@@ -348,8 +533,11 @@ def test_generation_semantic_failures_keep_the_reader_exception_contract(failure
     elif failure == "carrier":
         row["job_id"] += 1
     page = [row, {**row, "seq": row["seq"] + 1}] if failure == "order" else [row]
-    with _serve_response(make_response(200, page)), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
-        _read_response("list_device_generations")
+    response = make_response(200, [make_generation_envelope(item) for item in page])
+    with _serve_response(response):
+        items = _read_response("list_device_generations")
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(items[-1])
     assert raised.value.device_id == 7
     assert raised.value.job_id == row["carrier_job_id"]
     assert raised.value.reason == "invalid settlement evidence"
@@ -371,11 +559,13 @@ def test_schema_bound_rejects_values_postgresql_jsonb_cannot_store(case):
 
     from .test_adapter_client_ext import _JOB_OUT
 
-    stored = [{**_JOB_OUT, "result": {**_JOB_OUT["result"], "detail": "caf\u00e9 \U0001f600", "n": 1.5}}]
-    assert validate_settlement_response("JobOut", stored, 7) is stored
-    page = [{**_JOB_OUT, "result": {**_JOB_OUT["result"], **JSONB_REJECTED[case]}}]
+    stored = [
+        {**_JOB_OUT, "device_id": 7, "result": {**_JOB_OUT["result"], "detail": "caf\u00e9 \U0001f600", "n": 1.5}}
+    ]
+    assert validate_settlement_response("JobEvidenceOut", [make_evidence_envelope(row) for row in stored], 7) == stored
+    page = [{**_JOB_OUT, "device_id": 7, "result": {**_JOB_OUT["result"], **JSONB_REJECTED[case]}}]
     with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
-        validate_settlement_response("JobOut", page, 7)
+        validate_settlement_response("JobEvidenceOut", [make_evidence_envelope(row) for row in page], 7)
     assert raised.value.job_id is None
     assert raised.value.reason == "invalid job envelope"
 

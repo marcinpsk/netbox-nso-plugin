@@ -6,6 +6,7 @@ from netbox_nso_plugin.models import NSOApplyExecution
 
 from . import test_durable_bgp_capture as bgp_case
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire, job_wire
 
 
 class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
@@ -148,7 +149,9 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         self.attempt = manual
         self.serve_terminal_evidence(bgp, manual=True)
         original = self.adapter._handle
-        base_job = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        base_job = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0][
+            "projection"
+        ]
         invalid_receipt = True
 
         def mixed_evidence(method, url, **kwargs):
@@ -170,27 +173,30 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
                 )
                 params = kwargs["params"]
                 after, limit = int(params["after_settle_seq"]), int(params["limit"])
-                return make_response(200, [job for job in jobs if job["settle_seq"] > after][:limit])
+                return make_response(200, [job_wire(job) for job in jobs if job["settle_seq"] > after][:limit])
             if url.endswith("/generations"):
                 generations = response.json()
                 generations.append(
-                    {
-                        **generations[0],
-                        **{
-                            key: automatic[key]
-                            for key in (
-                                "generation_id",
-                                "seq",
-                                "status",
-                                "stream_revisions",
-                                "source_push_seq",
-                                "updated_at",
-                            )
+                    generation_wire(
+                        {
+                            **generations[0]["projection"],
+                            **{
+                                key: automatic[key]
+                                for key in (
+                                    "generation_id",
+                                    "seq",
+                                    "status",
+                                    "stream_revisions",
+                                    "source_push_seq",
+                                    "updated_at",
+                                )
+                            },
+                            "job_id": automatic["carrier_job_id"],
+                            "carrier_job_id": automatic["carrier_job_id"],
+                            "carrier_job_status": automatic["carrier_job_status"],
                         },
-                        "job_id": automatic["carrier_job_id"],
-                        "carrier_job_id": automatic["carrier_job_id"],
-                        "carrier_job_status": automatic["carrier_job_status"],
-                    }
+                        self.management.adapter_device_id,
+                    )
                 )
                 return make_response(200, generations)
             if url.endswith("/intent-receipts") and invalid_receipt:
@@ -308,16 +314,18 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         def handle(method, url, **kwargs):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/generations"):
-                return make_response(200, [reissue, *response.json()])
+                return make_response(
+                    200, [generation_wire(reissue, self.management.adapter_device_id), *response.json()]
+                )
             if method == "GET" and url.endswith("/jobs"):
-                template = original(method, url, params={"after_settle_seq": 0}).json()[0]
+                template = original(method, url, params={"after_settle_seq": 0}).json()[0]["projection"]
                 jobs = [
                     {**template, "id": 500, "result": result, "row_outcomes": [], "refusals": [], "settle_seq": 1},
                     {**template, "settle_seq": 2},
                 ]
                 after = int(kwargs["params"]["after_settle_seq"])
                 return make_response(
-                    200, [job for job in jobs if job["settle_seq"] > after][: int(kwargs["params"]["limit"])]
+                    200, [job_wire(job) for job in jobs if job["settle_seq"] > after][: int(kwargs["params"]["limit"])]
                 )
             return response
 
@@ -484,9 +492,9 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
             if method == "GET" and url.endswith("/generations"):
                 rows = response.json()
                 if invalid is missing:
-                    rows[0].pop("source_push_seq")
+                    rows[0]["projection"].pop("source_push_seq")
                 else:
-                    rows[0]["source_push_seq"] = invalid
+                    rows[0]["projection"]["source_push_seq"] = invalid
                 return make_response(200, rows)
             return response
 

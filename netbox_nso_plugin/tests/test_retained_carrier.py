@@ -7,6 +7,7 @@ from netbox_nso_plugin.models import NSOApplyExecution
 
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
@@ -18,7 +19,10 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/generations"):
                 limit = int(kwargs["params"]["limit"])
                 offset = limit if "since_seq" in kwargs["params"] else 0
-                return make_response(200, rows[offset : offset + limit])
+                return make_response(
+                    200,
+                    [generation_wire(row, self.management.adapter_device_id) for row in rows[offset : offset + limit]],
+                )
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle

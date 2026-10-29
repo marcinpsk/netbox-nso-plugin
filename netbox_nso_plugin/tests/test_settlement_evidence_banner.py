@@ -17,6 +17,7 @@ from netbox_nso_plugin.settlement import consume_static_route_settlements
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import mirror_update
+from ._settlement_wire import deployment_wire, generation_wire, job_wire
 from .test_apply_settlement import _attempt, _payload
 from .test_durable_bgp_capture import BGPCaptureCase, _CaptureHandler
 from .test_settlement_reader_contract import DEEP_JSON, NESTED_OBJECT_JSON
@@ -78,6 +79,29 @@ def _structural_mutations(root, schema):
             yield kind, value
 
 
+def _required_success_fields(root, components):
+    schemas = root["components"]["schemas"]
+    reachable = set()
+
+    def visit_schema(schema):
+        if isinstance(schema, dict):
+            if "$ref" in schema:
+                name = schema["$ref"].rsplit("/", 1)[-1]
+                if name == "EvidenceErrorOut" or name in reachable:
+                    return
+                reachable.add(name)
+                visit_schema(schemas[name])
+            for value in schema.values():
+                visit_schema(value)
+        elif isinstance(schema, list):
+            for value in schema:
+                visit_schema(value)
+
+    for component in components:
+        visit_schema({"$ref": f"#/components/schemas/{component}"})
+    return {(schemas[name]["title"], field) for name in reachable for field in schemas[name].get("required", ())}
+
+
 class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
     def job(self, *, kind="apply", status="failed", result=None):
         return {
@@ -117,13 +141,18 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             marker.incarnation = case.feed_incarnation
             if method == "GET" and url.endswith("/jobs"):
                 marker.incarnation, page = case.feed_response()
-                return make_response(200, page)
+                return make_response(200, [job_wire(job) for job in page])
             if method == "GET" and url.endswith("/generations"):
-                return make_response(200, case.generation_page if hasattr(case, "generation_page") else [])
+                return make_response(
+                    200,
+                    [generation_wire(row, case.management.adapter_device_id) for row in case.generation_page]
+                    if hasattr(case, "generation_page")
+                    else [],
+                )
             if method == "POST" and url.endswith("/deployment-evidence"):
                 return make_response(
                     200,
-                    case.deployment_body
+                    deployment_wire(case.deployment_body)
                     if hasattr(case, "deployment_body")
                     else {
                         "device_id": case.management.adapter_device_id,
@@ -171,12 +200,27 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             "apply_attempt_id": str(attempt.pk),
             "created_at": generation["updated_at"],
         }
-        return [], [listing], _payload(self.management.adapter_device_id, [raw], head=head)
+        return (
+            [],
+            [generation_wire(listing, self.management.adapter_device_id)],
+            deployment_wire(_payload(self.management.adapter_device_id, [raw], head=head)),
+        )
 
     def serve_settlement_responses(self, feed, generations, deployment):
-        self.generation_page = generations
-        self.deployment_body = deployment
-        self.serve_feed(feed)
+        self.serve_feed([])
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/jobs"):
+                return make_response(200, feed)
+            if method == "GET" and url.endswith("/generations"):
+                return make_response(200, generations)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                return make_response(200, deployment)
+            return response
+
+        self.adapter._handle = handle
 
     def assert_visible_stall(self):
         result = consume_static_route_settlements(self.management)
@@ -337,11 +381,11 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         del missing_head["head"]
         cases.append(("missing head", feed, generations, missing_head))
         missing_attempt = copy.deepcopy(deployment)
-        del missing_attempt["head"]["apply_attempt_id"]
+        del missing_attempt["head"]["projection"]["apply_attempt_id"]
         cases.append(("head attempt", feed, generations, missing_attempt))
         for status in ([], {}):
             broken = copy.deepcopy(deployment)
-            broken["attempts"][0]["generations"][0]["status"] = status
+            broken["attempts"][0]["generations"][0]["projection"]["status"] = status
             cases.append((f"status {status}", feed, generations, broken))
         for label, jobs, rows, snapshot in cases:
             with self.subTest(case=label):
@@ -380,7 +424,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 ("generations", 0, "mode"),
             ):
                 broken = copy.deepcopy(deployment)
-                parent = broken["attempts"][0]["response"]
+                parent = broken["attempts"][0]["projection"]["response"]
                 for key in path[:-1]:
                     parent = parent[key]
                 parent[path[-1]] = value
@@ -395,9 +439,9 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         feed, generations, deployment = self.settlement_responses()
         cases = []
         for path in (
-            ("head", "updated_at"),
-            ("attempts", 0, "generations", 0, "updated_at"),
-            ("attempts", 0, "response"),
+            ("head", "projection", "updated_at"),
+            ("attempts", 0, "generations", 0, "projection", "updated_at"),
+            ("attempts", 0, "projection", "response"),
             ("blocked",),
         ):
             broken = copy.deepcopy(deployment)
@@ -407,7 +451,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             del parent[path[-1]]
             cases.append((path, feed, generations, broken, 901 if path[0] == "head" or "generations" in path else None))
         broken_listing = copy.deepcopy(generations)
-        del broken_listing[0]["updated_at"]
+        del broken_listing[0]["projection"]["updated_at"]
         cases.append(("listing", feed, broken_listing, deployment, 901))
         for label, jobs, rows, snapshot, job_id in cases:
             with self.subTest(path=label):
@@ -447,7 +491,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         )
         skipped = next(iter(base[3]["skipped"]))
         base[3]["skipped_detail"] = {skipped: {"generation_id": 80, "seq": 3, "status": "failed"}}
-        components = ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
+        components = ("JobEvidenceOut", "DeviceGenerationEvidenceOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
         started = time.monotonic()
         counts = {}
         visited = set()
@@ -491,11 +535,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                         count += 1
             counts[component] = count
             self.assertGreater(count, 0)
-        required = {
-            (schema["title"], name)
-            for schema in validator.schema["components"]["schemas"].values()
-            for name in schema.get("required", ())
-        }
+        required = _required_success_fields(validator.schema, components)
         self.assertEqual(visited, required)
         elapsed = time.monotonic() - started
         print(f"settlement structural mutants: {counts}; total={sum(counts.values())}; runtime={elapsed:.2f}s")
