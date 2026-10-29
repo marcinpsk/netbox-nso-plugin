@@ -21,6 +21,7 @@ from datetime import datetime
 import requests
 from django.conf import settings
 
+from .settlement_schemas import valid_store_incarnation
 from .vault_refs import is_secret_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -1381,8 +1382,7 @@ def _generation_provenance(mapping, *, nullable=False):
     )
 
 
-def _validated_generation_listing(row):
-    from .apply_settlement import EvidenceInvariantError
+def _validated_generation_listing(row, device_id):
     from .refusal_contract import GENERATION_STATUSES
 
     valid = (
@@ -1409,7 +1409,7 @@ def _validated_generation_listing(row):
         )
     )
     if not valid:
-        raise EvidenceInvariantError("invalid_generation_listing")
+        raise InvalidJobEvidence({"device_id": device_id, "id": row["carrier_job_id"]}, "invalid settlement evidence")
     return row
 
 
@@ -1429,8 +1429,6 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
     """GET a bounded set of ascending generation pages after ``since_seq``."""
     if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
         raise ValueError("since_seq must be a non-negative integer")
-    from .apply_settlement import EvidenceInvariantError, identify_generation_stall
-
     generations = []
     generation_ids = set()
     last_seq = since_seq
@@ -1441,17 +1439,18 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
         resp = _request_response("GET", f"/api/v1/devices/{adapter_device_id}/generations", params=params)
         page = _settlement_response(resp, "DeviceGenerationOut", adapter_device_id)
         for row in page:
-            with identify_generation_stall(row):
-                _validated_generation_listing(row)
-                generation_id, seq = row["generation_id"], row["seq"]
-                if generation_id in generation_ids or last_seq is not None and seq <= last_seq:
-                    raise EvidenceInvariantError("invalid_generation_order")
-                generation_ids.add(generation_id)
-                last_seq = seq
+            _validated_generation_listing(row, adapter_device_id)
+            generation_id, seq = row["generation_id"], row["seq"]
+            if generation_id in generation_ids or last_seq is not None and seq <= last_seq:
+                raise InvalidJobEvidence(
+                    {"device_id": adapter_device_id, "id": row["carrier_job_id"]}, "invalid settlement evidence"
+                )
+            generation_ids.add(generation_id)
+            last_seq = seq
         generations.extend(page)
         if len(page) < _GENERATION_PAGE_LIMIT:
             return generations
-    raise EvidenceInvariantError("generation_listing_not_bounded")
+    raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid settlement evidence")
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
@@ -1476,7 +1475,7 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
         },
     )
     incarnation = resp.headers.get(STORE_INCARNATION_HEADER)
-    if not incarnation:
+    if not valid_store_incarnation(incarnation):
         # An unknown store cannot validate the cursor epoch or identify a carrier.
         raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid settlement evidence")
     try:

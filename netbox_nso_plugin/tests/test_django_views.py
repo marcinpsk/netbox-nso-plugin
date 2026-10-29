@@ -8849,7 +8849,7 @@ class _ApplyBoundaryAdapter(ReceiptAdapter):
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith(("/jobs", "/generations")):
             response = make_response(200, self.generations if url.endswith("/generations") else [])
-            response.headers["X-Store-Incarnation"] = "placeholder-store"
+            response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000004"
             return response
         if url.endswith("/deployment-evidence"):
             assert self.evidence is not None, "this test arranged no deployment evidence"

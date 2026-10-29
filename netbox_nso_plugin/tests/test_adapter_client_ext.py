@@ -1154,8 +1154,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_device_generations_reject_a_repeated_or_out_of_order_page(self, mock_s, _cfg):
-        from netbox_nso_plugin.adapter_client import list_device_generations, reset_session
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence, list_device_generations, reset_session
 
         from ._adapter_http import make_generation_listing
 
@@ -1171,8 +1170,12 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
                 reset_session()
                 mock_s.return_value = self._make_session(200, payload)
 
-                with self.assertRaisesRegex(EvidenceInvariantError, "invalid_generation_order"):
+                with self.assertRaises(InvalidJobEvidence) as raised:
                     list_device_generations(5, since_seq=since_seq)
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertEqual(raised.exception.device_id, 5)
+                self.assertEqual(raised.exception.job_id, payload[-1]["carrier_job_id"])
 
     def test_the_page_limit_stays_within_what_the_adapter_accepts(self):
         """The one thing deriving the fixtures from the constant cannot check: its VALUE.
@@ -1231,9 +1234,9 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         from netbox_nso_plugin.adapter_client import (
             _GENERATION_PAGE_LIMIT,
             _GENERATION_PAGE_MAX,
+            InvalidJobEvidence,
             list_device_generations,
         )
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
 
         from ._adapter_http import make_generation_listing
 
@@ -1259,8 +1262,12 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         session.request.side_effect = full_page
         mock_s.return_value = session
 
-        with self.assertRaisesRegex(EvidenceInvariantError, "generation_listing_not_bounded"):
+        with self.assertRaises(InvalidJobEvidence) as raised:
             list_device_generations(5)
+        self.assertEqual(raised.exception.reason, "invalid settlement evidence")
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(raised.exception.device_id, 5)
+        self.assertIsNone(raised.exception.job_id)
 
         self.assertEqual(session.request.call_count, _GENERATION_PAGE_MAX)
 

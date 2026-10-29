@@ -163,7 +163,7 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         generation = self.terminal()
-        execution = settle_terminal_generation(self.management, generation, "placeholder-store")
+        execution = settle_terminal_generation(self.management, generation, "00000000-0000-4000-8000-000000000004")
         self.assertIsNone(execution.settle_seq)
         self.serve_terminal_evidence(generation, head=False, pruned=True)
         with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):

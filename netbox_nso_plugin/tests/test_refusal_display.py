@@ -1101,7 +1101,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         execution = settle_terminal_generation(
-            self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=2
+            self.management, generation, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
         )
         self.assertEqual(execution.consumption_state, "consumed")
         row.refresh_from_db()
@@ -1139,7 +1139,9 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.settle(generation)
         retry = self.terminal(refused=2)
         retry["carrier_job_id"] = 502
-        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        settle_terminal_generation(
+            self.management, retry, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
+        )
         row = self.owners[1]
         row.refresh_from_db()
         mirror_update(row, last_apply_error="placeholder-forged-secret-canary")
@@ -1160,7 +1162,9 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.settle(generation)
         retry = self.terminal(refused=2)
         retry["carrier_job_id"] = 502
-        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        settle_terminal_generation(
+            self.management, retry, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
+        )
         row = self.owners[1]
         mirror_update(row, last_apply_error="placeholder ordinary failure")
         (row,) = project_rows([type(row).objects.get(pk=row.pk)])
@@ -1198,7 +1202,9 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.settle(self.terminal())
         retry = self.terminal(refused=2)
         retry["carrier_job_id"] = 502
-        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        settle_terminal_generation(
+            self.management, retry, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
+        )
         refused, other = self.owners[1], self.owners[2]
         snapshot = NSOApplyOverlaySnapshot.objects.get(
             attempt=self.attempt, overlay_pk=refused.pk, settlement_disposition="refused"

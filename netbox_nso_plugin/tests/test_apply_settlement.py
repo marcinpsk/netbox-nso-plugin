@@ -96,7 +96,7 @@ def _attempt(attempt_id, adapter_device_id, generation_id, selected, status, *, 
 
 
 class _Evidence(dict):
-    store_incarnation = "placeholder-store"
+    store_incarnation = "00000000-0000-4000-8000-000000000004"
 
 
 def _payload(adapter_device_id, attempts, *, head=None):
@@ -121,7 +121,7 @@ def _epoch_session(session, *, generations=()):
         def request(self, method, url, **kwargs):
             if method == "GET" and url.endswith(("/jobs", "/generations")):
                 response = make_response(200, list(generations) if url.endswith("/generations") else [])
-                response.headers["X-Store-Incarnation"] = "placeholder-store"
+                response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000004"
                 return response
             return session.request(method, url, **kwargs)
 

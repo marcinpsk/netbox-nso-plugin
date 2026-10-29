@@ -285,6 +285,43 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
         self.assertIn("deleted=1", output.getvalue())
 
+    def test_duplicate_generations_retain_one_device_and_continue_the_batch(self):
+        from urllib.parse import urlsplit
+
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        from ._adapter_http import make_generation_listing, make_response, make_transport_session
+
+        _device, other = make_managed("ledger-retention-invalid", 1768, index=2)
+        other.refresh_from_db()
+        retained, _execution = self.history(days=32, management=other)
+        removable, _execution = self.history()
+        row = make_generation_listing()
+        requests = []
+        session = make_transport_session(make_response(200, []))
+
+        def send(request, **kwargs):
+            requests.append(request.url)
+            path = urlsplit(request.url).path
+            body = [row, {**row, "seq": row["seq"] + 1}] if path.endswith("/1768/generations") else []
+            response = make_response(200, body)
+            response.headers["X-Store-Incarnation"] = self.adapter.store.incarnation
+            return response
+
+        session.send.side_effect = send
+        adapter_client.reset_session()
+        try:
+            with patch("netbox_nso_plugin.adapter_client.requests.Session", autospec=True, return_value=session):
+                result = prune_apply_ledger(execute=True)
+        finally:
+            adapter_client.reset_session()
+        self.assertEqual((result.examined, result.eligible, result.deleted), (2, 1, 1))
+        self.assertFalse(result.adapter_unavailable)
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=retained.pk).exists())
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
+        self.assertTrue(any("/1767/generations" in url for url in requests))
+
     def test_unreachable_adapter_stops_the_batch_at_the_first_device(self):
         from netbox_nso_plugin import apply_retention
         from netbox_nso_plugin.apply_retention import prune_apply_ledger

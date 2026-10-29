@@ -107,6 +107,15 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
             with self.subTest(content=content):
                 self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, content=content))
 
+    def test_deep_receipt_response_stalls_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+        from .test_settlement_reader_contract import _nested
+
+        self.capture_lost_publication()
+        receipt = {**self.receipt, "response": _nested(600)}
+        document = {"receipts": [receipt], "global_max_push_seq": None, "global_max_route_id": None}
+        self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, document))
+
     def test_corrected_automatic_receipt_retains_the_original_manual_attempt(self):
         import copy
 

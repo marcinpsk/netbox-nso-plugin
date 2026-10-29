@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 
 from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.settlement_schemas import MAX_NESTING
 
 from ._adapter_http import make_response, make_transport_session
 
@@ -69,7 +70,7 @@ def _serve_response(response, *, error=None):
 )
 def test_reader_json_decode_failures_keep_the_declared_caller_contract(reader, content):
     response = make_response(200, content=content)
-    response.headers["X-Store-Incarnation"] = "placeholder-store-a"
+    response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
     if reader == "trigger_apply" and content == b"":
         with _serve_response(response):
             assert _read_response(reader) is None
@@ -89,7 +90,18 @@ def test_reader_json_decode_failures_keep_the_declared_caller_contract(reader, c
         )
 
 
-@pytest.mark.parametrize("header", [None, ""])
+@pytest.mark.parametrize(
+    "header",
+    [
+        None,
+        "",
+        "x" * 65,
+        "placeholder-invalid",
+        "00000000000040008000000000000001",
+        "{00000000-0000-4000-8000-000000000001}",
+        "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    ],
+)
 def test_feed_header_failures_are_device_only_evidence(header):
     response = make_response(200, [])
     if header is not None:
@@ -113,7 +125,7 @@ def _nested(depth):
 @pytest.mark.parametrize("reader", ["get_settlement_feed", "list_device_generations", "get_deployment_evidence"])
 def test_readers_reject_decodable_bodies_nested_past_the_bound(reader):
     response = make_response(200, content=NESTED_OBJECT_JSON)
-    response.headers["X-Store-Incarnation"] = "placeholder-store-a"
+    response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
     with _serve_response(response), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
         _read_response(reader)
     assert raised.value.device_id == 7
@@ -122,7 +134,7 @@ def test_readers_reject_decodable_bodies_nested_past_the_bound(reader):
 
 
 def test_schema_nesting_bound_accepts_the_limit_and_rejects_one_more_level():
-    from netbox_nso_plugin.settlement_schemas import MAX_NESTING, validate_settlement_response
+    from netbox_nso_plugin.settlement_schemas import validate_settlement_response
 
     from .test_adapter_client_ext import _JOB_OUT
 
@@ -165,12 +177,14 @@ def test_readers_decode_valid_json_without_a_content_type_precondition(reader, c
     }
     assert bodies.keys() == SETTLEMENT_EVIDENCE_READERS
     response = make_response(200, bodies[reader])
-    response.headers["X-Store-Incarnation"] = "placeholder-store-a"
+    response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000001"
     if content_type is not None:
         response.headers["Content-Type"] = content_type
     with _serve_response(response):
         result = _read_response(reader)
-    assert result == (([], "placeholder-store-a") if reader == "get_settlement_feed" else bodies[reader])
+    assert result == (
+        ([], "00000000-0000-4000-8000-000000000001") if reader == "get_settlement_feed" else bodies[reader]
+    )
 
 
 @pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
@@ -264,3 +278,56 @@ def test_reader_guard_detects_a_new_reader_through_import_aliases():
     readers = _settlement_adapter_calls(sources, "netbox_nso_plugin.settlement.consume")
     assert readers == {"get_intent_receipts", "new_reader"}
     assert readers - SETTLEMENT_EVIDENCE_READERS == {"new_reader"}
+
+
+@pytest.mark.parametrize("depth", [MAX_NESTING - 3, MAX_NESTING - 2, 600])
+def test_receipt_nesting_bound_keeps_the_reader_exception_contract(depth):
+    from netbox_nso_plugin.intent_receipt_contract import validate_intent_receipts
+    from netbox_nso_plugin.refusal_contract import ContractError
+
+    receipt = {
+        "device_id": 7,
+        "section": "bgp",
+        "push_seq": 1,
+        "request_digest": "a" * 64,
+        "store_only": False,
+        "delete_origin": False,
+        "backfill_only": False,
+        "status_code": 200,
+        "response": _nested(depth),
+        "generation_id": 1,
+        "created_at": "2026-01-02T03:04:05+00:00",
+        "updated_at": None,
+    }
+    document = {"receipts": [receipt], "global_max_push_seq": None, "global_max_route_id": None}
+    response = make_response(200, document)
+    if depth == MAX_NESTING - 3:
+        assert validate_intent_receipts(document) is document
+        with _serve_response(response):
+            assert _read_response("get_intent_receipts") == document
+    else:
+        with pytest.raises(ContractError, match="invalid receipt nesting"):
+            validate_intent_receipts(document)
+        with _serve_response(response), pytest.raises(adapter_client.AdapterError) as raised:
+            _read_response("get_intent_receipts")
+        assert type(raised.value) is adapter_client.AdapterError
+        assert raised.value.code == "invalid_response"
+
+
+@pytest.mark.parametrize("failure", ["provenance", "timestamp", "carrier", "order"])
+def test_generation_semantic_failures_keep_the_reader_exception_contract(failure):
+    from ._adapter_http import make_generation_listing
+
+    row = make_generation_listing()
+    if failure == "provenance":
+        row["source_push_seq"] = {}
+    elif failure == "timestamp":
+        row["updated_at"] = "2026-01-02T03:04:05"
+    elif failure == "carrier":
+        row["job_id"] += 1
+    page = [row, {**row, "seq": row["seq"] + 1}] if failure == "order" else [row]
+    with _serve_response(make_response(200, page)), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        _read_response("list_device_generations")
+    assert raised.value.device_id == 7
+    assert raised.value.job_id == row["carrier_job_id"]
+    assert raised.value.reason == "invalid settlement evidence"

@@ -4,6 +4,7 @@
 
 import json
 from importlib.resources import files
+from uuid import UUID
 
 from jsonschema import Draft202012Validator
 
@@ -24,6 +25,16 @@ VALIDATORS = {
     )
     for component in ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
 }
+
+
+def valid_store_incarnation(value):
+    """Accept only the canonical UUID string that identifies an adapter store."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
 
 
 def _error_identity(component, body, path):
@@ -56,7 +67,7 @@ def _error_identity(component, body, path):
     return (prefix, identity) if identity else None
 
 
-def _within_nesting(body):
+def within_nesting(body):
     """Return whether no container in *body* nests deeper than ``MAX_NESTING``, without recursion."""
     stack = [(body, 1)]
     while stack:
@@ -74,7 +85,7 @@ def validate_settlement_response(component, body, device_id):
 
     reason = "invalid job envelope" if component == "JobOut" else "invalid settlement evidence"
     # Bound nesting first: the validator and later comparisons recurse through open objects.
-    if not _within_nesting(body):
+    if not within_nesting(body):
         raise InvalidJobEvidence({"device_id": device_id}, reason)
     errors = list(VALIDATORS[component].iter_errors(body))
     if not errors:

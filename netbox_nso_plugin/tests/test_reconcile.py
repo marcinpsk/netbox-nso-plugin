@@ -136,7 +136,7 @@ class _CallbackEvidenceAdapter(ReceiptAdapter):
             if self.evidence_error is not None:
                 raise self.evidence_error
             response = make_response(200, [])
-            response.headers["X-Store-Incarnation"] = "callback-evidence-store"
+            response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000009"
             return response
         if method == "GET" and url.endswith(f"/devices/{self.adapter_device_id}/generations"):
             return make_response(200, [])

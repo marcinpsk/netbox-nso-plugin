@@ -62,7 +62,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             management=self.management,
             mapping_epoch=mapping_epoch(self.management),
             adapter_device_id=self.management.adapter_device_id,
-            store_incarnation="placeholder-store",
+            store_incarnation="00000000-0000-4000-8000-000000000004",
             generation_id=81,
             generation_seq=4,
             carrier_job_id=501,
@@ -405,6 +405,36 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.adapter._handle = handle
         self.assert_carrier_stall_banner()
 
+    def test_noncanonical_store_incarnations_do_not_create_execution_evidence(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation, validate_terminal_generation
+
+        self.prepare()
+        generation = self.terminal()
+        for incarnation in (
+            "placeholder-invalid",
+            "x" * 65,
+            "00000000000040008000000000000001",
+            "{00000000-0000-4000-8000-000000000001}",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        ):
+            for consume in (validate_terminal_generation, settle_terminal_generation):
+                with self.subTest(incarnation=incarnation, consume=consume.__name__), transaction.atomic():
+                    kwargs = {"settle_seq": 1} if consume is settle_terminal_generation else {}
+                    with self.assertRaises(EvidenceInvariantError):
+                        consume(self.management, generation, incarnation, attempt=self.attempt, **kwargs)
+                    self.assertFalse(NSOApplyExecution.objects.exists())
+            with self.subTest(incarnation=incarnation, consume="settle_apply_attempts"), transaction.atomic():
+                with self.assertRaisesRegex(EvidenceInvariantError, "missing_store_incarnation"):
+                    settle_apply_attempts(
+                        self.management,
+                        {"device_id": self.management.adapter_device_id},
+                        store_incarnation=incarnation,
+                    )
+                self.assertFalse(NSOApplyExecution.objects.exists())
+
     def test_generation_validation_keeps_its_carrier_until_order_is_known(self):
         from netbox_nso_plugin.apply_settlement import (
             EvidenceInvariantError,
@@ -421,8 +451,8 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         validators = (
             _validate_generation,
             _source_pairs,
-            lambda row: validate_terminal_generation(self.management, row, "placeholder-store"),
-            lambda row: settle_terminal_generation(self.management, row, "placeholder-store"),
+            lambda row: validate_terminal_generation(self.management, row, "00000000-0000-4000-8000-000000000004"),
+            lambda row: settle_terminal_generation(self.management, row, "00000000-0000-4000-8000-000000000004"),
         )
         for validate in validators:
             with self.subTest(validate=validate, ordered=False):
@@ -436,16 +466,16 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
                 job = _carrier_job(self.management.adapter_device_id, 501, {501: 42})
                 preceding = {**job, "id": 500, "settle_seq": 41}
                 with self.assertRaises(EvidenceInvariantError) as caught:
-                    with identify_evidence_stall(job, "placeholder-store"):
-                        with identify_evidence_stall(preceding, "placeholder-store"):
+                    with identify_evidence_stall(job, "00000000-0000-4000-8000-000000000004"):
+                        with identify_evidence_stall(preceding, "00000000-0000-4000-8000-000000000004"):
                             validate(generation)
                 error = caught.exception.invalid_job
                 self.assertEqual(error.job_id, 501)
                 self.assertEqual(error.settle_seq, 42)
                 self.assertEqual(error.device_id, self.management.adapter_device_id)
-                self.assertEqual(error.store_incarnation, "placeholder-store")
+                self.assertEqual(error.store_incarnation, "00000000-0000-4000-8000-000000000004")
                 with self.assertRaises(EvidenceInvariantError) as caught:
-                    with identify_evidence_stall(job, "placeholder-store"):
+                    with identify_evidence_stall(job, "00000000-0000-4000-8000-000000000004"):
                         validate({**generation, "carrier_job_id": None})
                 self.assertEqual(caught.exception.invalid_job.job_id, 501)
                 self.assertEqual(caught.exception.invalid_job.settle_seq, 42)

@@ -97,7 +97,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             "heartbeat_at": None,
         }
 
-    def serve_feed(self, jobs, incarnation="placeholder-store-a"):
+    def serve_feed(self, jobs, incarnation="00000000-0000-4000-8000-000000000001"):
         """Serve each response's store marker on the real HTTP transport."""
         marker = threading.local()
         self.feed_incarnation = incarnation
@@ -187,7 +187,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.assertIsNotNone(issue)
         self.assertEqual(issue["reason"], self.management.settle_evidence_error["reason"])
 
-    def assert_metadata_banner(self, reason, *, incarnation="placeholder-store-a"):
+    def assert_metadata_banner(self, reason, *, incarnation="00000000-0000-4000-8000-000000000001"):
         from netbox_nso_plugin.settlement_evidence import request_fence
 
         issue = settlement_stall_projection(self.management)
@@ -201,11 +201,14 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.assertContains(tab, reason)
 
     def assert_feed_header_stalls(self, header):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
         mirror_update(
             self.management,
             settle_cursor_seq=40,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-a",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
         self.serve_feed([])
 
@@ -218,7 +221,11 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 super().send_header(keyword, value)
 
         self.server.RequestHandlerClass = MetadataHandler
-        self.assert_visible_stall()
+        with CaptureQueriesContext(connection) as queries:
+            self.assert_visible_stall()
+        writes = [query["sql"] for query in queries if query["sql"].startswith("UPDATE ")]
+        self.assertTrue(writes)
+        self.assertFalse(any('"settle_cursor_seq" =' in sql for sql in writes))
         self.assertEqual(self.management.settle_cursor_seq, 40)
         self.assert_metadata_banner("invalid settlement evidence", incarnation=None)
         self.management.refresh_from_db()
@@ -236,6 +243,39 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
 
     def test_empty_feed_header_stalls_with_a_rendered_banner(self):
         self.assert_feed_header_stalls("")
+
+    def test_oversized_feed_header_stalls_with_a_rendered_banner(self):
+        self.assert_feed_header_stalls("x" * 65)
+
+    def test_non_uuid_feed_header_stalls_with_a_rendered_banner(self):
+        self.assert_feed_header_stalls("placeholder-invalid-incarnation")
+
+    def test_duplicate_generations_keep_the_carrier_banner(self):
+        self.serve_feed([])
+        row = make_generation_listing()
+        self.generation_page = [row, {**row, "seq": row["seq"] + 1}]
+        self.assert_visible_stall()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        issue = settlement_stall_projection(self.management)
+        self.assertEqual(issue["job_id"], row["carrier_job_id"])
+        self.assertEqual(issue["reason"], "invalid settlement evidence")
+        tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(tab, "Settlement is paused", count=1)
+        self.assertContains(tab, "Adapter job 501")
+
+    def test_jobs_poll_returns_controlled_json_for_duplicate_generations(self):
+        self.serve_feed([])
+        row = make_generation_listing()
+        self.generation_page = [row, {**row, "seq": row["seq"] + 1}]
+        response = self.client.get(
+            reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=(self.device.pk,)),
+            {"generation_id": row["generation_id"]},
+        )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json(),
+            {"error": "The NSO adapter returned an invalid response. See the server log."},
+        )
 
     def test_malformed_successful_apply_replays_stall_with_a_banner(self):
         from netbox_nso_plugin.models import NSOApplyAttempt
@@ -476,7 +516,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                             self.management.adapter_device_id, after_settle_seq=0, limit=100
                         )
                         self.assertEqual(served, [job])
-                        self.assertEqual(incarnation, "placeholder-store-a")
+                        self.assertEqual(incarnation, "00000000-0000-4000-8000-000000000001")
 
     def test_nonterminal_and_unrelated_jobs_do_not_require_execution_results(self):
         jobs = [
@@ -491,7 +531,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             self.management.adapter_device_id, after_settle_seq=0, limit=100
         )
         self.assertEqual(served, jobs)
-        self.assertEqual(incarnation, "placeholder-store-a")
+        self.assertEqual(incarnation, "00000000-0000-4000-8000-000000000001")
 
     def test_out_of_order_feed_records_a_closed_evidence_reason(self):
         first = self.job(kind="sync")
@@ -511,7 +551,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                     self.management,
                     settle_cursor_seq=40,
                     settle_cursor_device_id=self.management.adapter_device_id,
-                    settle_cursor_incarnation="placeholder-store-a",
+                    settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
                     settle_evidence_error={},
                 )
                 job = self.job(kind="sync", status="succeeded")
@@ -526,7 +566,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                     self.management,
                     settle_cursor_seq=40,
                     settle_cursor_device_id=self.management.adapter_device_id,
-                    settle_cursor_incarnation="placeholder-store-a",
+                    settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
                     settle_evidence_error={},
                 )
                 job = self.job(kind="sync", status="succeeded")
@@ -543,10 +583,10 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                     calls += 1
                     if calls == 2:
                         advanced.append(consume_static_route_settlements(self.management.pk))
-                        return "placeholder-store-a", []
+                        return "00000000-0000-4000-8000-000000000001", []
                     if calls in (3, 5):
-                        return "placeholder-store-a", [advanced_job]
-                    return "placeholder-store-a", [job] if calls >= 6 else []
+                        return "00000000-0000-4000-8000-000000000001", [advanced_job]
+                    return "00000000-0000-4000-8000-000000000001", [job] if calls >= 6 else []
 
                 def handle(method, url, **kwargs):
                     if method == "GET" and url.endswith("/jobs"):
@@ -588,7 +628,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                         self.management,
                         settle_cursor_seq=40,
                         settle_cursor_device_id=self.management.adapter_device_id,
-                        settle_cursor_incarnation="placeholder-store-a",
+                        settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
                         settle_evidence_error={},
                     )
                     self.serve_feed([{**self.job(kind="sync", status="succeeded"), field: value}])
@@ -599,7 +639,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             self.management,
             settle_cursor_seq=42,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-a",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
         first = self.job(kind="sync", status="succeeded")
         self.serve_feed([first, {**first, "id": 502, "settle_seq": 43}])
@@ -620,22 +660,22 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             self.management,
             settle_cursor_seq=7,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-a",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
-        self.serve_feed([self.job(result={"row_outcomes": []})], incarnation="placeholder-store-b")
+        self.serve_feed([self.job(result={"row_outcomes": []})], incarnation="00000000-0000-4000-8000-000000000002")
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         self.management.refresh_from_db()
         issue = settlement_stall_projection(self.management)
         self.assertIsNotNone(issue)
-        self.assertEqual(issue["store_incarnation"], "placeholder-store-b")
-        self.assertEqual(self.management.settle_cursor_incarnation, "placeholder-store-a")
+        self.assertEqual(issue["store_incarnation"], "00000000-0000-4000-8000-000000000002")
+        self.assertEqual(self.management.settle_cursor_incarnation, "00000000-0000-4000-8000-000000000001")
 
     def test_locked_request_failure_uses_the_cursor_after_another_consumer_advanced(self):
         mirror_update(
             self.management,
             settle_cursor_seq=40,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-a",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
         job = self.job(kind="sync", status="succeeded")
         self.serve_feed([])
@@ -649,8 +689,8 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             calls += 1
             if calls == 2:
                 advanced.append(consume_static_route_settlements(self.management.pk))
-                return "placeholder-store-a", []
-            return "placeholder-store-a", [job] if calls in (3, 5, 6) else []
+                return "00000000-0000-4000-8000-000000000001", []
+            return "00000000-0000-4000-8000-000000000001", [job] if calls in (3, 5, 6) else []
 
         def handle(method, url, **kwargs):
             if method == "GET" and url.endswith("/jobs"):
@@ -690,7 +730,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             self.management,
             settle_cursor_seq=7,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-a",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
         broken = self.job(result={"row_outcomes": [], "commit_acknowledged": "placeholder-invalid"})
         self.serve_feed([broken])
@@ -701,7 +741,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             started.set()
             if not release.wait(30):
                 raise AssertionError("the late feed response was not released")
-            return "placeholder-store-a", [broken]
+            return "00000000-0000-4000-8000-000000000001", [broken]
 
         def consume_old_store():
             try:
@@ -716,8 +756,8 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         worker.start()
         try:
             self.assertTrue(started.wait(10), "the old-store request did not start")
-            self.feed_incarnation = "placeholder-store-b"
-            self.feed_response = lambda: ("placeholder-store-b", [])
+            self.feed_incarnation = "00000000-0000-4000-8000-000000000002"
+            self.feed_response = lambda: ("00000000-0000-4000-8000-000000000002", [])
             reset = consume_static_route_settlements(self.management)
             self.assertTrue(reset.drained)
         finally:
@@ -728,22 +768,22 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             raise errors[0]
         self.assertTrue(results[0].stalled)
         self.management.refresh_from_db()
-        self.assertEqual(self.management.settle_cursor_incarnation, "placeholder-store-b")
+        self.assertEqual(self.management.settle_cursor_incarnation, "00000000-0000-4000-8000-000000000002")
         self.assertEqual(self.management.settle_evidence_error, {})
 
     def test_empty_valid_feed_clears_and_hides_an_obsolete_store_banner(self):
-        self.serve_feed([], incarnation="placeholder-store-b")
+        self.serve_feed([], incarnation="00000000-0000-4000-8000-000000000002")
         mirror_update(
             self.management,
             settle_cursor_seq=0,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-b",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000002",
             settle_evidence_error={
                 "job_id": 501,
                 "settle_seq": 42,
                 "reason": "missing structured execution evidence",
                 "mapping_epoch": mapping_epoch(self.management),
-                "store_incarnation": "placeholder-store-a",
+                "store_incarnation": "00000000-0000-4000-8000-000000000001",
             },
         )
         self.assertIsNone(settlement_stall_projection(self.management))
@@ -757,10 +797,10 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             self.management,
             settle_cursor_seq=40,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-a",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
         self.serve_feed([])
-        responses = iter((("placeholder-store-a", []), ("placeholder-store-b", [])))
+        responses = iter((("00000000-0000-4000-8000-000000000001", []), ("00000000-0000-4000-8000-000000000002", [])))
         self.feed_response = lambda: next(responses)
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         self.management.refresh_from_db()
@@ -780,7 +820,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             self.management,
             settle_cursor_seq=40,
             settle_cursor_device_id=self.management.adapter_device_id,
-            settle_cursor_incarnation="placeholder-store-a",
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000001",
         )
         job = self.job(kind="sync", status="succeeded")
         self.serve_feed([job])
@@ -798,8 +838,8 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 started.set()
                 if not release.wait(30):
                     raise AssertionError("the late snapshot was not released")
-                return "placeholder-store-b", []
-            return "placeholder-store-a", [job] if current in (3, 5) else []
+                return "00000000-0000-4000-8000-000000000002", []
+            return "00000000-0000-4000-8000-000000000001", [job] if current in (3, 5) else []
 
         def consume_late_snapshot():
             try:

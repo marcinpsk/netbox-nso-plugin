@@ -62,7 +62,7 @@ class SettlementStore:
     """One adapter store: its incarnation, its jobs and its static-route intent echo."""
 
     def __init__(self):
-        self.incarnation = uuid4().hex
+        self.incarnation = str(uuid4())
         self.jobs: list[dict] = []
         self.routes: dict[int, list[dict]] = {}
         #: adapter device rows, keyed by adapter device id

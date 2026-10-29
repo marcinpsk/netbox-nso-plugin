@@ -20,6 +20,7 @@ from .apply_settlement import (
 )
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
 from .refusal_registry import OVERLAYS
+from .settlement_schemas import valid_store_incarnation
 
 
 @dataclass(frozen=True)
@@ -266,7 +267,7 @@ def _earlier_execution(fence, generation, incarnation, settle_seq):
 
 def _record_invariant(management, generation, incarnation, attempt, code):
     """Persist safe diagnostics after the rejected batch transaction rolled back."""
-    if not isinstance(generation, dict) or not isinstance(incarnation, str) or not incarnation or len(incarnation) > 64:
+    if not isinstance(generation, dict) or not valid_store_incarnation(incarnation):
         return
     generation_id, carrier_id = generation.get("generation_id"), generation.get("carrier_job_id")
     if type(generation_id) is not int or type(carrier_id) is not int or generation_id <= 0 or carrier_id <= 0:
@@ -315,7 +316,7 @@ def validate_terminal_generation(
 
 def _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries):
     _validate_generation(generation)
-    _require(isinstance(store_incarnation, str) and 0 < len(store_incarnation) <= 64, "missing_store_incarnation")
+    _require(valid_store_incarnation(store_incarnation), "missing_store_incarnation")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
         return None
     return _join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
@@ -458,7 +459,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
     from .models import NSODeviceManagement
 
     _validate_generation(generation)
-    _require(isinstance(incarnation, str) and 0 < len(incarnation) <= 64, "missing_store_incarnation")
+    _require(valid_store_incarnation(incarnation), "missing_store_incarnation")
     _require(settle_seq is None or type(settle_seq) is int and settle_seq > 0, "invalid_settlement_sequence")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
         return None

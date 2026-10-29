@@ -176,7 +176,7 @@ class BGPSettlementHelpers:
                 super().end_headers()
 
         self.server.RequestHandlerClass = EvidenceHandler
-        self.server.evidence_incarnation = "placeholder-store"
+        self.server.evidence_incarnation = "00000000-0000-4000-8000-000000000004"
         from netbox_nso_plugin import adapter_client
 
         adapter_client.reset_session()
@@ -190,7 +190,7 @@ class BGPSettlementHelpers:
             if method == "GET" and url.endswith("/jobs"):
                 feed_requests += 1
                 if epoch_change and feed_requests > 1:
-                    self.server.evidence_incarnation = "placeholder-reset-store"
+                    self.server.evidence_incarnation = "00000000-0000-4000-8000-000000000003"
                 job = {
                     "id": generation["carrier_job_id"],
                     "type": "apply",
@@ -453,5 +453,5 @@ class BGPSettlementHelpers:
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         return settle_terminal_generation(
-            self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=1
+            self.management, generation, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=1
         )
