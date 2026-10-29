@@ -12,6 +12,8 @@ _SCHEMA = json.loads(files("netbox_nso_plugin").joinpath("schemas/settlements.js
 _ARRAY_COMPONENTS = frozenset({"JobOut", "DeviceGenerationOut"})
 # The deepest live settlement response measured 12 levels (2026-10-29).
 MAX_NESTING = 64
+# Every integer that settlement persists lands in a PostgreSQL bigint column.
+_INT64 = range(-(2**63), 2**63)
 VALIDATORS = {
     component: Draft202012Validator(
         {
@@ -67,11 +69,13 @@ def _error_identity(component, body, path):
     return (prefix, identity) if identity else None
 
 
-def within_nesting(body):
-    """Return whether no container in *body* nests deeper than ``MAX_NESTING``, without recursion."""
+def within_wire_bounds(body):
+    """Return whether *body* nests at most ``MAX_NESTING`` deep and holds only int64 integers, without recursion."""
     stack = [(body, 1)]
     while stack:
         value, depth = stack.pop()
+        if type(value) is int and value not in _INT64:
+            return False
         if isinstance(value, dict | list):
             if depth > MAX_NESTING:
                 return False
@@ -84,8 +88,8 @@ def validate_settlement_response(component, body, device_id):
     from .adapter_client import InvalidJobEvidence
 
     reason = "invalid job envelope" if component == "JobOut" else "invalid settlement evidence"
-    # Bound nesting first: the validator and later comparisons recurse through open objects.
-    if not within_nesting(body):
+    # Bound first: the validator and later comparisons recurse, and the database stores int64.
+    if not within_wire_bounds(body):
         raise InvalidJobEvidence({"device_id": device_id}, reason)
     errors = list(VALIDATORS[component].iter_errors(body))
     if not errors:

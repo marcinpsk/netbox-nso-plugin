@@ -725,6 +725,30 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.assertNotIn("settle_seq", self.management.settle_evidence_error)
         self.assertIsNone(self.management.settle_cursor_seq)
 
+    def test_out_of_range_feed_sequence_stalls_with_a_rendered_banner(self):
+        self.serve_feed([{**self.job(kind="sync", status="succeeded"), "settle_seq": 2**63}])
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Settlement is paused", count=1)
+        self.assertContains(response, "invalid job envelope")
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+
+    def test_out_of_range_evidence_integers_stall_with_a_rendered_banner(self):
+        feed, generations, deployment = self.settlement_responses()
+        cases = [
+            ("generation id", feed, [{**generations[0], "generation_id": 2**63}], deployment),
+            ("pending generations", feed, generations, {**deployment, "pending_generations": 2**63}),
+        ]
+        for label, jobs, rows, snapshot in cases:
+            with self.subTest(case=label):
+                mirror_update(self.management, settle_evidence_error={})
+                self.serve_settlement_responses(jobs, rows, snapshot)
+                self.assert_visible_stall()
+                self.assertIsNone(self.management.settle_cursor_seq)
+                tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+                self.assertContains(tab, "Settlement is paused", count=1)
+
     def test_late_old_store_failure_cannot_restore_a_banner_after_an_empty_store_reset(self):
         mirror_update(
             self.management,

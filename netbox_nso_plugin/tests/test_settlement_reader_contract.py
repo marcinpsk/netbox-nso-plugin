@@ -148,6 +148,24 @@ def test_schema_nesting_bound_accepts_the_limit_and_rejects_one_more_level():
     assert raised.value.reason == "invalid job envelope"
 
 
+INT64_MAX = 2**63 - 1
+
+
+@pytest.mark.parametrize("value", [INT64_MAX + 1, -INT64_MAX - 2], ids=["above", "below"])
+def test_schema_integer_bound_accepts_int64_and_rejects_values_outside_it(value):
+    from netbox_nso_plugin.settlement_schemas import validate_settlement_response
+
+    from .test_adapter_client_ext import _JOB_OUT
+
+    at_limit = [{**_JOB_OUT, "settle_seq": INT64_MAX, "result": {**_JOB_OUT["result"], "n": -INT64_MAX - 1}}]
+    assert validate_settlement_response("JobOut", at_limit, 7) is at_limit
+    for page in ([{**_JOB_OUT, "settle_seq": value}], [{**_JOB_OUT, "result": {**_JOB_OUT["result"], "n": value}}]):
+        with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+            validate_settlement_response("JobOut", page, 7)
+        assert raised.value.job_id is None
+        assert raised.value.reason == "invalid job envelope"
+
+
 @pytest.mark.parametrize("reader", sorted(SETTLEMENT_EVIDENCE_READERS))
 @pytest.mark.parametrize("content_type", [None, "text/plain", "application/json; charset=utf-8"])
 def test_readers_decode_valid_json_without_a_content_type_precondition(reader, content_type):
@@ -306,7 +324,7 @@ def test_receipt_nesting_bound_keeps_the_reader_exception_contract(depth):
         with _serve_response(response):
             assert _read_response("get_intent_receipts") == document
     else:
-        with pytest.raises(ContractError, match="invalid receipt nesting"):
+        with pytest.raises(ContractError, match="invalid receipt bounds"):
             validate_intent_receipts(document)
         with _serve_response(response), pytest.raises(adapter_client.AdapterError) as raised:
             _read_response("get_intent_receipts")
@@ -331,3 +349,33 @@ def test_generation_semantic_failures_keep_the_reader_exception_contract(failure
     assert raised.value.device_id == 7
     assert raised.value.job_id == row["carrier_job_id"]
     assert raised.value.reason == "invalid settlement evidence"
+
+
+@pytest.mark.parametrize("field", ["push_seq", "response"])
+def test_receipt_integer_bound_keeps_the_reader_exception_contract(field):
+    from netbox_nso_plugin.intent_receipt_contract import validate_intent_receipts
+    from netbox_nso_plugin.refusal_contract import ContractError
+
+    receipt = {
+        "device_id": 7,
+        "section": "bgp",
+        "push_seq": 1,
+        "request_digest": "a" * 64,
+        "store_only": False,
+        "delete_origin": False,
+        "backfill_only": False,
+        "status_code": 200,
+        "response": {"count": 1},
+        "generation_id": 1,
+        "created_at": "2026-01-02T03:04:05+00:00",
+        "updated_at": None,
+    }
+    assert validate_intent_receipts({"receipts": [receipt], "global_max_push_seq": None, "global_max_route_id": None})
+    receipt[field] = INT64_MAX + 1 if field == "push_seq" else {"count": INT64_MAX + 1}
+    document = {"receipts": [receipt], "global_max_push_seq": None, "global_max_route_id": None}
+    with pytest.raises(ContractError):
+        validate_intent_receipts(document)
+    with _serve_response(make_response(200, document)), pytest.raises(adapter_client.AdapterError) as raised:
+        adapter_client.get_intent_receipts(device_id=7)
+    assert type(raised.value) is adapter_client.AdapterError
+    assert raised.value.code == "invalid_response"
