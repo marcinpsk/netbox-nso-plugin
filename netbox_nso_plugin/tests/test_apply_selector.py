@@ -203,6 +203,8 @@ class _ApplyContractAdapter(ReceiptAdapter):
                         "device_id": 1558,
                         "status": "running",
                         "result": None,
+                        "row_outcomes": None,
+                        "refusals": None,
                         "error": None,
                         "context": None,
                         "created_at": "2026-08-13T10:00:00Z",

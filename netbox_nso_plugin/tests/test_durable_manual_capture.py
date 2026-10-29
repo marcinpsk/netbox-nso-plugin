@@ -31,7 +31,7 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.refusal_registry import OVERLAYS
 
-from ._adapter_http import make_response
+from ._adapter_http import make_evidence_envelope, make_response
 from ._outbox_case import (
     ReceiptAdapter,
     content_update,
@@ -74,21 +74,27 @@ class ManualAdmissionAdapter(ReceiptAdapter):
         if method == "POST" and url.endswith("/deployment-evidence"):
             body = self.apply_requests[0]
             attempt_id = body["apply_attempt_id"]
+            device_id = int(url.split("/devices/")[1].split("/")[0])
             attempts = []
             if self.rejected:
                 attempts.append(
-                    {
-                        "apply_attempt_id": attempt_id,
-                        "admission_state": "rejected",
-                        "http_status": 409,
-                        "response": self.rejection(),
-                        "generations": [],
-                    }
+                    make_evidence_envelope(
+                        {
+                            "apply_attempt_id": attempt_id,
+                            "admission_state": "rejected",
+                            "http_status": 409,
+                            "response": self.rejection(),
+                            "selected": body["selected"],
+                            "generation_ids": [],
+                        },
+                        identity={"device_id": device_id, "apply_attempt_id": attempt_id},
+                        generations=[],
+                    )
                 )
             return make_response(
                 200,
                 {
-                    "device_id": int(url.split("/devices/")[1].split("/")[0]),
+                    "device_id": device_id,
                     "head": None,
                     "blocked": False,
                     "write_work_pending": False,

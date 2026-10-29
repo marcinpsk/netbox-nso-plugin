@@ -46,6 +46,7 @@ def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T0
     """A removal job the collateral guard blocked (shape from adapter run_removal)."""
     return {
         "id": job_id,
+        "settle_seq": job_id,
         "type": "removal",
         "device_id": 10,
         "status": status,
@@ -79,6 +80,7 @@ def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=
     terminal = status in {"succeeded", "failed"}
     return {
         "id": job_id,
+        "settle_seq": job_id if terminal else None,
         "type": "removal",
         "device_id": 10,
         "status": status,
@@ -590,10 +592,13 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         """Sync/apply jobs never contribute to blocked_removals or mask a block."""
         sync = {
             "id": 70,
+            "settle_seq": 70,
             "type": "sync",
             "device_id": 10,
             "status": "succeeded",
             "result": None,
+            "row_outcomes": None,
+            "refusals": None,
             "context": None,
             "error": None,
             "created_at": "2026-07-10T08:00:00Z",
@@ -679,6 +684,7 @@ def _residue_job(job_id=60, scope="svi", residue=None, updated="2026-07-11T20:00
     """A SUCCEEDED removal whose post-retract check found device residue (#104-A)."""
     return {
         "id": job_id,
+        "settle_seq": job_id,
         "type": "removal",
         "device_id": 10,
         "status": "succeeded",
