@@ -84,6 +84,38 @@ class CarrierIsolationHelpers:
 
 
 class TestCarrierIsolation(CarrierIsolationHelpers, CoalescedCarrierHelpers, BGPSettlementHelpers, BGPCaptureCase):
+    def test_locked_feed_without_result_rolls_back_retained_success(self):
+        self.prepare()
+        before = self.owner_bookkeeping()
+        generation = self.terminal(refused=None)
+        self.serve_terminal_evidence(generation, manual=True, head=False)
+        original = self.adapter._handle
+        cursor_reads = 0
+
+        def handle(method, url, **kwargs):
+            nonlocal cursor_reads
+            if method == "GET" and url.endswith("/jobs") and int(kwargs["params"]["after_settle_seq"]) == 0:
+                cursor_reads += 1
+                if cursor_reads == 2:
+                    job = {**self.job(generation, 1), "result": None, "row_outcomes": None, "refusals": None}
+                    return make_response(200, [job_wire(job)])
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        result = consume_static_route_settlements(self.management)
+        self.assertEqual(cursor_reads, 2)
+        self.assertTrue(result.stalled)
+        self.assertEqual(result.consumed, 0)
+        self.assertFalse(NSOApplyExecution.objects.filter(consumption_state__in=("consumed", "superseded")).exists())
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        issue = settlement_stall_projection(self.management)
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["job_id"], 501)
+        self.assertEqual(issue["settle_seq"], 1)
+        self.assertEqual(self.owner_bookkeeping(), before)
+        self.assertTrue(self.attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists())
+
     def test_conflicting_historical_attempt_and_feed_cannot_publish_success(self):
         self.prepare()
         before = self.owner_bookkeeping()
@@ -117,6 +149,28 @@ class TestCarrierIsolation(CarrierIsolationHelpers, CoalescedCarrierHelpers, BGP
         self.assertEqual(historical.terminal_projection["carrier_job_result"], first["carrier_job_result"])
         self.assertFalse(historical.terminal_projection["carrier_job_result"]["commit_acknowledged"])
         for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "in_sync")
+
+    def test_manual_carrier_before_retry_uses_its_independent_admission(self):
+        self.prepare()
+        first = self.terminal(refused=None)
+        retry = self.terminal()
+        retry["carrier_job_id"] = 502
+        self.serve_retry(first, retry, attempt_generation=retry)
+        result = consume_static_route_settlements(self.management)
+        self.assertFalse(result.stalled)
+        self.assertEqual((result.consumed, result.cursor), (2, 2))
+        first_execution = NSOApplyExecution.objects.get(carrier_job_id=501)
+        retry_execution = NSOApplyExecution.objects.get(carrier_job_id=502)
+        self.assertEqual(first_execution.attempt_id, self.attempt.pk)
+        self.assertEqual(first_execution.consumption_state, "consumed")
+        self.assertNotEqual(retry_execution.attempt_id, self.attempt.pk)
+        self.assertEqual(retry_execution.attempt.trigger_kind, "explicit_retry")
+        self.assertEqual(retry_execution.consumption_state, "consumed")
+        self.assertEqual((first_execution.settle_seq, retry_execution.settle_seq), (1, 2))
+        self.assertEqual(self.owner_bookkeeping()[1][0], "apply_failed")
+        for owner in (self.owners[0], self.owners[2]):
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
 

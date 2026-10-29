@@ -237,7 +237,11 @@ def _load_attempts(
     ).in_bulk()
     validated = {}
     for raw, raw_id in zip(raw_attempts, raw_ids, strict=True):
-        if carrier_id is not None and not any(row["carrier_job_id"] == carrier_id for row in raw["generations"]):
+        if (
+            carrier_id is not None
+            and getattr(deployment_evidence, "carrier_id", None) != carrier_id
+            and not any(row["carrier_job_id"] == carrier_id for row in raw["generations"])
+        ):
             continue
         local = local_attempts.get(raw_id)
         if local is None:
@@ -359,7 +363,16 @@ def reconcile_admission_links(responses, generations, *, generation_ids=None):
 
 
 def _reconcile_admissions(
-    management, attempt_ids, snapshots, answers, generations, incarnation, settlement_sequences, *, carrier_id=None
+    management,
+    attempt_ids,
+    snapshots,
+    answers,
+    generations,
+    incarnation,
+    settlement_sequences,
+    *,
+    carrier_id=None,
+    carrier_attempt_ids=(),
 ):
     from django.db.models import F
 
@@ -368,7 +381,8 @@ def _reconcile_admissions(
     held_ids = (
         set(attempt_ids)
         if carrier_id is None
-        else {
+        else set(carrier_attempt_ids)
+        | {
             UUID(raw["apply_attempt_id"])
             for snapshot in snapshots
             for raw in snapshot["attempts"]
@@ -392,7 +406,7 @@ def _reconcile_admissions(
         raw.get("response")
         for snapshot in snapshots
         for raw in snapshot["attempts"]
-        if carrier_id is None or any(row["carrier_job_id"] == carrier_id for row in raw["generations"])
+        if carrier_id is None or UUID(raw["apply_attempt_id"]) in held_ids
     ]
     responses.extend(
         result
@@ -426,6 +440,12 @@ def _reconcile_admissions(
             for attempt in snapshot["attempts"]
             for row in attempt["generations"]
             if row["carrier_job_id"] == carrier_id
+        }
+        | {
+            link["generation_id"]
+            for response in responses
+            for link in response.get("generations") or ()
+            if link.get("job_id") == carrier_id
         }
     )
     reconcile_admission_links(responses, generations, generation_ids=selected)
@@ -546,6 +566,7 @@ def _settle_apply_carrier(
         identity = generation["generation_id"], generation["carrier_job_id"]
         if identity not in seen:
             local = getattr(deployment_evidence, "manual_attempt_by_generation", {}).get(identity)
+            local = _manual_carrier_attempt(generation, validated, local_attempts, local)
             generations.append((generation, local))
             seen.add(identity)
     if carrier_id is None:
@@ -576,6 +597,23 @@ def _settle_apply_carrier(
         before_settle=before_settle,
         after_settle=finish,
     )
+
+
+def _manual_carrier_attempt(generation, validated, local_attempts, head_attempt):
+    """Join retained carrier evidence to its immutable manual admission link."""
+    candidates = {
+        attempt_id
+        for attempt_id, evidence in validated.items()
+        for link in evidence["response"].get("generations") or ()
+        if link["generation_id"] == generation["generation_id"] and link["job_id"] == generation["carrier_job_id"]
+    }
+    if head_attempt is not None:
+        candidates.add(head_attempt.pk)
+    if len(candidates) > 1:
+        raise EvidenceInvariantError("ambiguous_manual_carrier")
+    if candidates:
+        return local_attempts.get(next(iter(candidates)), head_attempt)
+    return None
 
 
 def deploying_attempt_ids(management) -> tuple[UUID, ...]:
@@ -869,9 +907,14 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
     raise_evidence_errors(jobs)
     raise_evidence_errors(relevant)
     for raw in evidence["attempts"]:
-        from .adapter_client import raise_item_error
+        from .adapter_client import InvalidJobEvidence, raise_item_error
 
-        raise_item_error(raw)
+        try:
+            raise_item_error(raw)
+        except InvalidJobEvidence as exc:
+            if exc.job_id is None and _positive_int(carrier_id):
+                exc.job_id = carrier_id
+            raise
     raise_evidence_errors(scoped)
     _reject_unrequested_attempts(evidence, read.read_attempt_ids)
     sequences = _settlement_sequences(read.feed_jobs)
@@ -884,6 +927,7 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
         read.store_incarnation,
         sequences,
         carrier_id=carrier_id,
+        carrier_attempt_ids={UUID(raw["apply_attempt_id"]) for raw in evidence["attempts"]},
     )
     bound = _bound_evidence(
         evidence,
@@ -913,14 +957,11 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
 
 
 def _attempt_names_carrier(management, raw, read, carrier_id):
-    """Keep failed attempt envelopes attached to their independently retained admission."""
-    from .adapter_client import EvidenceItem
+    """Keep attempts attached to their independently retained carrier admission."""
     from .models import NSOApplyAttempt
 
     if any(_generation_names_carrier(row, read, carrier_id) for row in raw["generations"]):
         return True
-    if not isinstance(raw, EvidenceItem) and not any(isinstance(row, EvidenceItem) for row in raw["generations"]):
-        return False
     head = read["head"]
     if (
         head is not None

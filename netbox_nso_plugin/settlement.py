@@ -194,6 +194,7 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
             management.refresh_from_db()
             if not matches_request_fence(management, fence):
                 raise _SettlementReadChanged
+            _validate_locked_carrier(read, job)
             if evidence is not None:
                 validate_carrier_under_lock(management, evidence)
 
@@ -217,6 +218,20 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
         else:
             settle_terminal_generations(management, [], incarnation, before_settle=before_settle, after_settle=finish)
     return cursor, stalled
+
+
+def _validate_locked_carrier(read, job):
+    """Require the locked feed to retain the carrier facts used for owner settlement."""
+    from .apply_settlement import EvidenceInvariantError
+
+    if read is None or job is None:
+        return
+    retained = next((item for item in read.feed_jobs if item["id"] == job["id"]), None)
+    if retained is not None and any(
+        retained[key] != job[key]
+        for key in ("id", "device_id", "type", "status", "settle_seq", "result", "error", "row_outcomes", "refusals")
+    ):
+        raise EvidenceInvariantError("consumed_execution_changed")
 
 
 def _historical_carriers(read, management):
@@ -422,13 +437,8 @@ def _settle_job(row, job, incarnation) -> bool:
     from .apply_settlement import _cursor_epoch_executions
     from .outcome_settlement import _bind_consumed_sequences
 
-    if job["type"] not in {"apply", "removal"}:
-        return True
-    result = job["result"]
-    if not isinstance(result, dict) or "row_outcomes" not in result:
-        return False
     # A certificate from an earlier mapping epoch is still this cursor's history.
-    executions = _cursor_epoch_executions(row, incarnation).filter(carrier_job_id=job["id"])
+    executions = list(_cursor_epoch_executions(row, incarnation).filter(carrier_job_id=job["id"]))
     matching = [
         execution
         for execution in executions
@@ -438,14 +448,19 @@ def _settle_job(row, job, incarnation) -> bool:
                 ("carrier_job_result", "result"),
                 ("carrier_job_status", "status"),
                 ("carrier_job_error", "error"),
+                ("row_outcomes", "row_outcomes"),
+                ("refusals", "refusals"),
             )
         )
     ]
-    if not matching:
-        if executions.exists():
-            from .apply_settlement import EvidenceInvariantError
+    if executions and not matching:
+        from .apply_settlement import EvidenceInvariantError
 
-            raise EvidenceInvariantError("consumed_execution_changed")
+        raise EvidenceInvariantError("consumed_execution_changed")
+    if job["type"] not in {"apply", "removal"}:
+        return True
+    result = job["result"]
+    if not isinstance(result, dict) or "row_outcomes" not in result or not matching:
         return False
     _bind_consumed_sequences(matching, job["settle_seq"])
     return True
