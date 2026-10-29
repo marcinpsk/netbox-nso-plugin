@@ -9,6 +9,101 @@ from ._bgp_settlement import BGPSettlementHelpers
 
 
 class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
+    def assert_receipt_body_stalls_with_rendered_banner(self, response):
+        from django.urls import reverse
+
+        from netbox_nso_plugin.refusal_display import settlement_stall_projection
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._outbox_case import mirror_update
+
+        original = self.adapter._handle
+        reads = []
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/intent-receipts"):
+                reads.append(url)
+                return response
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        try:
+            mirror_update(self.management, settle_evidence_error={})
+            result = consume_static_route_settlements(self.management)
+            self.assertTrue(result.stalled)
+            self.assertFalse(result.drained)
+            self.assertEqual(result.consumed, 0)
+            self.management.refresh_from_db()
+            self.assertIsNone(self.management.settle_cursor_seq)
+            issue = settlement_stall_projection(self.management)
+            self.assertIsNotNone(issue)
+            self.assertEqual(issue["reason"], "invalid settlement evidence")
+            self.assertIsNone(issue.get("job_id"))
+            tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+            self.assertContains(tab, "Settlement is paused", count=1)
+            self.assertContains(tab, "invalid settlement evidence")
+            self.assertGreaterEqual(len(reads), 1)
+            self.selection.refresh_from_db()
+            self.assertIsNone(self.selection.acknowledged_at)
+            self.assertEqual(NSOApplyExecution.objects.count(), 0)
+        finally:
+            self.adapter._handle = original
+
+    def test_empty_receipt_document_stalls_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, {}))
+
+    def test_all_null_receipt_document_stalls_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        self.assert_receipt_body_stalls_with_rendered_banner(
+            make_response(200, {"receipts": None, "global_max_push_seq": None, "global_max_route_id": None})
+        )
+
+    def test_required_receipt_keys_and_collection_reject_invalid_bodies(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        valid = {"receipts": [self.receipt], "global_max_push_seq": None, "global_max_route_id": None}
+        for name in valid:
+            with self.subTest(missing=name):
+                body = dict(valid)
+                del body[name]
+                self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, body))
+        self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, {**valid, "receipts": None}))
+
+    def test_null_receipt_watermarks_allow_exact_recovery(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/intent-receipts"):
+                return make_response(
+                    200, {"receipts": [self.receipt], "global_max_push_seq": None, "global_max_route_id": None}
+                )
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.drained)
+        self.selection.refresh_from_db()
+        self.assertIsNotNone(self.selection.acknowledged_at)
+
+    def test_undecodable_receipt_bodies_stall_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        for content in (b"{", b""):
+            with self.subTest(content=content):
+                self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, content=content))
+
     def test_corrected_automatic_receipt_retains_the_original_manual_attempt(self):
         import copy
 

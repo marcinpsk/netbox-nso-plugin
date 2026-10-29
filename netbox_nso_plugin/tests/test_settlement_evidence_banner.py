@@ -30,7 +30,7 @@ def _resolve_schema(root, schema):
 
 
 def _required_paths(root, schema, value, path=(), visited=None):
-    """Visit one served array item for each schema path, including nullable refs."""
+    """Visit one served array or map item for each schema path, including nullable refs."""
     schema = _resolve_schema(root, schema)
     if "anyOf" in schema:
         from jsonschema import Draft202012Validator
@@ -46,6 +46,10 @@ def _required_paths(root, schema, value, path=(), visited=None):
                 visited.add((schema["title"], name))
             yield (*path, name), child
             yield from _required_paths(root, child, value[name], (*path, name), visited)
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict) and value:
+            name = max(value, key=lambda key: len(str(value[key])))
+            yield from _required_paths(root, additional, value[name], (*path, name), visited)
     elif isinstance(value, list) and value and "items" in schema:
         item_index = max(range(len(value)), key=lambda index: len(str(value[index])))
         yield from _required_paths(root, schema["items"], value[item_index], (*path, item_index), visited)
@@ -182,6 +186,53 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.assertIsNotNone(issue)
         self.assertEqual(issue["reason"], self.management.settle_evidence_error["reason"])
 
+    def test_malformed_successful_apply_replays_stall_with_a_banner(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            selected={"bgp": 7},
+        )
+        attempt.adapter_apply_attempt_id = attempt.pk
+        attempt.save(update_fields=("adapter_apply_attempt_id",))
+        self.deployment_body = _payload(self.management.adapter_device_id, [])
+        self.deployment_body["unknown_apply_attempt_ids"] = [str(attempt.pk)]
+        self.serve_feed([])
+        original = self.adapter._handle
+        responses = [make_response(200, body) for body in ({}, None, [], {"outcome": []})]
+        responses.extend(make_response(200, content=content) for content in (b"{", b""))
+        no_op = {
+            "device_id": self.management.adapter_device_id,
+            "outcome": "no_op",
+            "job_id": None,
+            "selected": attempt.selected,
+            "skipped": {"bgp": "already_applied"},
+            "skipped_detail": None,
+            "generations": [],
+        }
+        for key in ("device_id", "skipped_detail"):
+            body = dict(no_op)
+            del body[key]
+            responses.append(make_response(200, body))
+        for response in responses:
+            with self.subTest(body=response.content):
+                mirror_update(self.management, settle_evidence_error={})
+                calls = []
+
+                def handle(method, url, **kwargs):
+                    if method == "POST" and url.endswith("/actions/apply"):
+                        calls.append(kwargs["json"])
+                        return response
+                    return original(method, url, **kwargs)
+
+                self.adapter._handle = handle
+                self.assert_visible_stall()
+                self.assertEqual(len(calls), 1)
+                self.assertIsNone(self.management.settle_cursor_seq)
+                attempt.refresh_from_db()
+                self.assertIsNone(attempt.response)
+
     def test_malformed_response_bodies_show_a_banner(self):
         feed, generations, deployment = self.settlement_responses()
         cases = [
@@ -297,8 +348,11 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 self.server.adapter_url + "/deployment-evidence",
                 json={"apply_attempt_ids": [str(self.attempt.pk)]},
             ).json(),
+            copy.deepcopy(self.attempt.response),
         )
-        components = ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut")
+        skipped = next(iter(base[3]["skipped"]))
+        base[3]["skipped_detail"] = {skipped: {"generation_id": 80, "seq": 3, "status": "failed"}}
+        components = ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
         started = time.monotonic()
         counts = {}
         visited = set()
@@ -319,7 +373,20 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                             parent[path[-1]] = replacement
                         self.assertFalse(validator.is_valid(bodies[index]))
                         mirror_update(self.management, settle_evidence_error={})
-                        self.serve_settlement_responses(*bodies)
+                        if component == "ActionApplyOut":
+                            unknown = _payload(self.management.adapter_device_id, [])
+                            unknown["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
+                            self.serve_settlement_responses([], [], unknown)
+                            evidence_handler = self.adapter._handle
+
+                            def replay(method, url, **kwargs):
+                                if method == "POST" and url.endswith("/actions/apply"):
+                                    return make_response(200, bodies[3])
+                                return evidence_handler(method, url, **kwargs)
+
+                            self.adapter._handle = replay
+                        else:
+                            self.serve_settlement_responses(*bodies[:3])
                         self.assert_visible_stall()
                         self.assertEqual(
                             self.management.settle_evidence_error["reason"],

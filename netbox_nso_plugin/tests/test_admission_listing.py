@@ -87,6 +87,8 @@ class TestAdmissionListing(DeploymentCase):
         self.assert_admission_links_reconciled("replayed")
 
     def test_non_object_replay_response_is_invalid_before_persistence(self):
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence
+
         self.prepare()
         self.serve_terminal_evidence(self.terminal())
         NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=None, http_status=None)
@@ -106,10 +108,9 @@ class TestAdmissionListing(DeploymentCase):
         for result in ("invalid", ["invalid"], 42, False):
             with self.subTest(result=result):
                 self.adapter.apply_response = lambda selected: (202, result)
-                with self.assertRaisesRegex(
-                    EvidenceInvariantError, "deployment evidence has an invalid stored response"
-                ):
+                with self.assertRaises(InvalidJobEvidence) as raised:
                     load_deployment_evidence(self.management)
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
                 self.assertEqual(list(NSOApplyAttempt.objects.values()), before_attempts)
                 self.assertEqual(list(NSOAcceptedSelection.objects.values()), before_selections)
                 self.assertFalse(NSOApplyExecution.objects.exists())

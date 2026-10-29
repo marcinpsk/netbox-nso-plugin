@@ -30,7 +30,7 @@ FAMILIES = frozenset(
         "static_route",
     }
 )
-SETTLEMENT_COMPONENTS = ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut")
+SETTLEMENT_COMPONENTS = ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
 VENDORED = Path(__file__).resolve().parents[1] / "netbox_nso_plugin/schemas/observations.json"
 
 

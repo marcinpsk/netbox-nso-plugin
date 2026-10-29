@@ -591,6 +591,33 @@ def _validated_unknown_attempt_ids(evidence, attempt_ids) -> set[UUID]:
     return unknown
 
 
+def _replay_apply_answer(management, attempt):
+    """Validate a replay answer before reconciliation can use its admission facts."""
+    from . import adapter_client as client
+    from .settlement_schemas import validate_settlement_response
+
+    try:
+        result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
+    except client.AdapterError as exc:
+        if exc.code == "invalid_response" and exc.status_code is None:
+            raise EvidenceInvariantError("invalid_apply_replay_response") from exc
+        if exc.status_code != 409 or exc.code != "conflict":
+            return attempt, None, exc
+        job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
+        logger.info(
+            "Apply replay for adapter device %s attempt %s is waiting for adapter job %s",
+            management.adapter_device_id,
+            attempt.pk,
+            job_id,
+        )
+        return None
+    validate_settlement_response("ActionApplyOut", result, management.adapter_device_id)
+    if result["device_id"] != management.adapter_device_id:
+        raise EvidenceInvariantError("deployment_mapping_changed")
+    _admission_keep_streams(attempt, result)
+    return attempt, result, None
+
+
 def load_deployment_evidence(management, *, attempt_ids=None):
     """Fetch attempt evidence and recover unknown UUIDs by replaying their exact request."""
     from . import adapter_client as client
@@ -670,21 +697,9 @@ def load_deployment_evidence(management, *, attempt_ids=None):
                 .exists()
             ):
                 continue
-            try:
-                result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
-            except client.AdapterError as exc:
-                if exc.status_code == 409 and exc.code == "conflict":
-                    job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
-                    logger.info(
-                        "Apply replay for adapter device %s attempt %s is waiting for adapter job %s",
-                        management.adapter_device_id,
-                        attempt.pk,
-                        job_id,
-                    )
-                else:
-                    replay_answers.append((attempt, None, exc))
-            else:
-                replay_answers.append((attempt, result, None))
+            answer = _replay_apply_answer(management, attempt)
+            if answer is not None:
+                replay_answers.append(answer)
             replayed = True
         if replayed:
             evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
@@ -787,11 +802,18 @@ def _prepare_receipt_recoveries(management, bound, selections, document, incarna
 
 
 def _load_pending_receipts(management, evidence, generations):
-    from .adapter_client import get_intent_receipts
+    from .adapter_client import AdapterError, get_intent_receipts
     from .selection_receipts import pending_selections
 
     selections = pending_selections(management, evidence, generations)
-    document = get_intent_receipts(device_id=management.adapter_device_id) if selections else None
+    document = None
+    if selections:
+        try:
+            document = get_intent_receipts(device_id=management.adapter_device_id)
+        except AdapterError as exc:
+            if exc.code != "invalid_response" or exc.status_code is not None:
+                raise
+            raise EvidenceInvariantError("invalid_selection_receipt") from exc
     return selections, document
 
 

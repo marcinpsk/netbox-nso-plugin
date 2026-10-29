@@ -20,7 +20,7 @@ VALIDATORS = {
             ),
         }
     )
-    for component in ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut")
+    for component in ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
 }
 
 

@@ -8959,10 +8959,16 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         unknown = _payload(adapter_device_id, [])
         unknown["unknown_apply_attempt_ids"] = [str(attempt.pk)]
         if malformed_replay:
+            from netbox_nso_plugin.refusal_display import settlement_stall_projection
+            from netbox_nso_plugin.settlement import consume_static_route_settlements
+
             invalid_replay = _ApplyBoundaryAdapter(lambda: (202, {"outcome": "unrecognized"}), evidence=lambda: unknown)
             config, session = invalid_replay.patches()
             with config, session:
-                settle_device_apply_attempts(self.mgmt)
+                result = consume_static_route_settlements(self.mgmt)
+            self.assertTrue(result.stalled)
+            self.mgmt.refresh_from_db()
+            self.assertEqual(settlement_stall_projection(self.mgmt)["reason"], "invalid settlement evidence")
             self.assertEqual(len(invalid_replay.apply_requests), 1)
             attempt.refresh_from_db()
             self.assertIsNone(attempt.http_status)
