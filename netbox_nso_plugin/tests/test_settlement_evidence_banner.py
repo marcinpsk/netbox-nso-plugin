@@ -856,6 +856,27 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(self.management.settle_evidence_error, {})
         self.assertEqual(self.management.settle_cursor_seq, 40)
 
+    def test_an_unchanged_diagnostic_is_not_written_again(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def diagnostic_writes():
+            with CaptureQueriesContext(connection) as queries:
+                consume_static_route_settlements(self.management)
+            return [query["sql"] for query in queries if '"settle_evidence_error" =' in query["sql"]]
+
+        self.serve_feed([])
+        self.assertTrue(consume_static_route_settlements(self.management).drained)
+        self.assertEqual(diagnostic_writes(), [])
+        self.serve_feed([self.job(result={"row_outcomes": [], "commit_acknowledged": "placeholder-invalid"})])
+        self.assertEqual(len(diagnostic_writes()), 1)
+        self.management.refresh_from_db()
+        stored = copy.deepcopy(self.management.settle_evidence_error)
+        self.assertEqual(settlement_stall_projection(self.management)["reason"], stored["reason"])
+        self.assertEqual(diagnostic_writes(), [])
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, stored)
+
     def test_late_unidentified_failure_cannot_restore_a_banner_after_cursor_progress(self):
         mirror_update(
             self.management,

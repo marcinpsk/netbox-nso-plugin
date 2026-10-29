@@ -39,5 +39,7 @@ def write_diagnostic(row, fence, error=None, *, cursor_written=False):
             if type(value) is int and value > 0:
                 issue[key] = value
     with suppress_intent_push(), mirror_refresh(row, ("settle_evidence_error",)) as locked:
+        if locked.settle_evidence_error == issue:
+            return
         locked.settle_evidence_error = issue
         locked.save(update_fields=("settle_evidence_error",))
