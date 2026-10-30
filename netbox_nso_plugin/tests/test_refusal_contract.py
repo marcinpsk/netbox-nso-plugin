@@ -9,9 +9,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIGEST = "f5be2d320d5d558b2d076533d37a7a5f0bf52dcffb2b8788c8eb3d54fcfe43f2"
-MODULE_DIGEST = "e111f0c5fe73593c5da6a645d308a82210a8966a71408e9c92d9adddd00087cd"
+MODULE_DIGEST = "20c9e3224068c6dd7acf3ab25e4b16d9944ca61b46365fa0715b5afd32b84251"
 CORPUS_DIGEST = "f7a79288978d9f1d3811fc5fd6621e01a1f1d6346ba74f4495e5dd1134331836"
-SOURCE_DIGEST = "fed46e57873717f9e35f173732f2777031f91f6ea23024b4ef3d6fc512574c8f"
+SOURCE_DIGEST = "c0b0de5c6af2483fc4c88d997f8468494981c5f5ad612ef9ef5e63f3c2275352"
 
 
 def generation():
@@ -103,6 +103,70 @@ def test_refusal_protocol_corpus_messages_parse_and_validate():
         assert claims_refusal(case["message"]) is case["claims"], case["name"]
         with pytest.raises(RefusalProtocolError):
             parse_refusals(case["message"])
+
+
+@pytest.mark.parametrize(
+    ("subject", "natural_path", "field"),
+    [
+        (
+            "isis.process-config.redistribute",
+            (("process-config", ("CORE",)), ("redistribute", ("ospf", "UNDERLAY"))),
+            "isis.redist.source_ref",
+        ),
+        *[
+            (
+                "isis.process-config.flex-algo",
+                (("process-config", ("CORE",)), ("flex-algo", (128,))),
+                field,
+            )
+            for field in (
+                "isis.flex.admin_group_exclude",
+                "isis.flex.admin_group_include_any",
+                "isis.flex.admin_group_include_all",
+            )
+        ],
+        (
+            "route-policy.prefix-list.entry",
+            (("prefix-list", ("EXPORT",)), ("entry", (10,))),
+            "route-policy.prefix_list.sequence",
+        ),
+        *[
+            (
+                "route-policy.route-map.entry",
+                (("route-map", ("EXPORT",)), ("entry", (10,))),
+                field,
+            )
+            for field in (
+                "route-policy.route_map.sequence",
+                "route-policy.match.prefix_range",
+                "route-policy.match.subroutine",
+                "route-policy.set.install_to_fib",
+            )
+        ],
+    ],
+)
+def test_execution_contract_accepts_catalog_subject_fields(subject, natural_path, field):
+    from netbox_nso_plugin.refusal_contract import validate_refusals
+    from netbox_nso_plugin.refusal_protocol import MESSAGES, row_ref
+
+    family = field.split(".", 1)[0]
+    row = row_ref(family, subject, natural_path)
+    message = MESSAGES[f"{family}.ned-unsupported"]
+    raw = [
+        {
+            "family": family,
+            "row": {"subject": row.subject, "key": row.key},
+            "field": field,
+            "reason": message.reason,
+            "message_id": message.id,
+            "message": message.text,
+            "related": None,
+            "logical_rows": [],
+            "provenance": "current",
+            "sender_phase": "commit",
+        }
+    ]
+    assert validate_refusals(raw) == raw
 
 
 def test_cutover_generation_accepts_pinned_adapter_shape():
