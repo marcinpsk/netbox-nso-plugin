@@ -4,7 +4,6 @@
 
 import copy
 import threading
-import time
 
 from django.db import connections
 from django.urls import reverse
@@ -497,8 +496,6 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         skipped = next(iter(base[3]["skipped"]))
         base[3]["skipped_detail"] = {skipped: {"generation_id": 80, "seq": 3, "status": "failed"}}
         components = ("JobEvidenceOut", "DeviceGenerationEvidenceOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
-        started = time.monotonic()
-        counts = {}
         visited = set()
         for index, component in enumerate(components):
             validator = VALIDATORS[component]
@@ -538,12 +535,9 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                         )
                         self.assertIsNone(self.management.settle_cursor_seq)
                         count += 1
-            counts[component] = count
             self.assertGreater(count, 0)
         required = _required_success_fields(validator.schema, components)
         self.assertEqual(visited, required)
-        elapsed = time.monotonic() - started
-        print(f"settlement structural mutants: {counts}; total={sum(counts.values())}; runtime={elapsed:.2f}s")
         self.adapter._handle = original
         self.serve_terminal_evidence(generation, manual=True)
         result = consume_static_route_settlements(self.management)
