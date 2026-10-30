@@ -45,47 +45,238 @@ class ConsumeResult:
 
 
 def consume_static_route_settlements(mgmt) -> ConsumeResult:
-    """Settle exact row evidence before locking the durable feed cursor."""
-    from .apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
-    from .durable_capture import mapping_epoch
+    """Commit complete carriers in order and retain progress before a stalled item."""
+    from .apply_settlement import (
+        EvidenceInvariantError,
+    )
     from .models import NSODeviceManagement
 
     pk = getattr(mgmt, "pk", mgmt)
     management = NSODeviceManagement.objects.get(pk=pk)
     fence = request_fence(management)
     epoch = fence["mapping_epoch"]
-    evidence = None
-    if management.adapter_device_id is not None:
-        try:
-            evidence = settle_device_apply_attempts(management)
-        except adapter_client.InvalidJobEvidence as exc:
-            return _invalid_evidence_stall(management, fence, exc)
-        except EvidenceInvariantError as exc:
-            logger.warning("Settlement evidence remains unresolved for management %s", pk)
-            # A long backlog or a store reset is not invalid evidence; _settle_job stays fail-closed.
-            if str(exc) not in {"settlement_feed_not_bounded", "evidence_epoch_changed"}:
-                return _invariant_evidence_stall(management, fence, exc)
+    read = None
+    consumed = 0
+    epoch_reset = False
     try:
+        read = _read_device_evidence(management)
         with transaction.atomic():
             row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
             fence = request_fence(row)
-            result = _consume_locked(row)
-            row.refresh_from_db()
-            write_diagnostic(row, fence, cursor_written=result.adapter_device_id is not None)
-            if (
-                evidence is not None
-                and mapping_epoch(row) == epoch
-                and result.adapter_device_id == evidence["device_id"]
-                and row.settle_cursor_incarnation == evidence.store_incarnation
-            ):
-                return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
-            return result
+            if row.adapter_device_id is None:
+                return ConsumeResult(None, 0, False, False, row.settle_cursor_seq)
+            jobs, cursor, incarnation, epoch_reset = _read_locked_page(row)
+        read = _align_carrier_read(read, row, jobs, incarnation)
+        historical = _historical_carriers(read, row) if read is not None else []
+        work = [(carrier, None) for carrier in historical] + [(job["id"], job) for job in jobs]
+        if not work:
+            work = [(None, None)]
+        stalled = False
+        expected_fence = fence
+        seen = set()
+        for carrier_id, job in work:
+            management = NSODeviceManagement.objects.get(pk=pk)
+            fence = request_fence(management)
+            if fence != expected_fence:
+                raise _SettlementReadChanged
+            cursor, stalled = _commit_carrier(
+                management,
+                read,
+                carrier_id,
+                job,
+                cursor,
+                incarnation,
+                fence,
+                persist_cursor=job is not None or not jobs,
+                seen=seen,
+            )
+            expected_fence = request_fence(management)
+            if stalled:
+                break
+            if job is not None:
+                consumed += 1
+        drained = not stalled and len(jobs) < SETTLE_FEED_PAGE
+        result = ConsumeResult(row.adapter_device_id, consumed, stalled, epoch_reset, cursor, drained)
+        if read is not None and drained:
+            management.refresh_from_db()
+            fence = request_fence(management)
+            return _complete_evidence_result(result, read, management, fence, expected_fence, epoch)
+        return result
+    except _SettlementReadChanged:
+        management.refresh_from_db()
+        return ConsumeResult(management.adapter_device_id, consumed, True, epoch_reset, management.settle_cursor_seq)
     except adapter_client.InvalidJobEvidence as exc:
-        return _invalid_evidence_stall(management, fence, exc)
+        return replace(_invalid_evidence_stall(management, fence, exc), consumed=consumed, epoch_reset=epoch_reset)
     except EvidenceInvariantError as exc:
-        # The rolled-back page stalls like an invariant from the evidence read above.
         logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
-        return _invariant_evidence_stall(management, fence, exc)
+        return replace(_invariant_evidence_stall(management, fence, exc), consumed=consumed, epoch_reset=epoch_reset)
+
+
+def _align_carrier_read(read, row, jobs, incarnation):
+    """Bind jobs that became terminal during the evidence read before writing owners."""
+    from .durable_capture import mapping_epoch
+
+    if read is None or mapping_epoch(row) != read.mapping_epoch or incarnation != read.store_incarnation:
+        return None
+    known = {job["id"] for job in read.feed_jobs}
+    read.feed_jobs.extend(job for job in jobs if job["id"] not in known)
+    return read
+
+
+def _complete_evidence_result(result, read, management, fence, expected_fence, epoch):
+    """Resolve carrierless admissions only after the ordered walk has drained."""
+    from .apply_settlement import (
+        _settlement_sequences,
+        carrierless_evidence_read,
+        identify_evidence_stall,
+        prepare_carrier_evidence,
+    )
+    from .durable_capture import mapping_epoch
+
+    if fence != expected_fence:
+        raise _SettlementReadChanged
+    admissions = carrierless_evidence_read(read)
+    if admissions["attempts"] or admissions["unknown_apply_attempt_ids"]:
+        _commit_carrier(
+            management,
+            admissions,
+            None,
+            None,
+            result.cursor,
+            read.store_incarnation,
+            fence,
+            persist_cursor=False,
+            seen=set(),
+        )
+    with identify_evidence_stall(
+        {"device_id": management.adapter_device_id},
+        read.store_incarnation,
+        sequences=_settlement_sequences(read.feed_jobs),
+    ):
+        evidence = prepare_carrier_evidence(management, read)
+    if mapping_epoch(management) == epoch:
+        return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
+    return result
+
+
+def _read_device_evidence(management):
+    """Retain the fail-closed cursor walk when the store changes or the backlog is unbounded."""
+    from .apply_settlement import EvidenceInvariantError, load_deployment_evidence
+
+    if management.adapter_device_id is None:
+        return None
+    fence = request_fence(management)
+    try:
+        return load_deployment_evidence(management, defer_carriers=True)
+    except EvidenceInvariantError as exc:
+        logger.warning("Settlement evidence remains unresolved for management %s", management.pk)
+        if str(exc) not in {"settlement_feed_not_bounded", "evidence_epoch_changed"}:
+            raise
+        if str(exc) == "evidence_epoch_changed" and request_fence(management) != fence:
+            raise _SettlementReadChanged from exc
+        return None
+
+
+class _SettlementReadChanged(Exception):
+    """A concurrent consumer changed the cursor after this page was fetched."""
+
+
+def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fence, *, persist_cursor, seen):
+    """Commit one complete carrier after its receipt claims and owner footprint are locked."""
+    from .apply_settlement import (
+        _settlement_sequences,
+        _validate_feed_page,
+        identify_evidence_stall,
+        prepare_carrier_evidence,
+        settle_apply_attempts,
+        validate_carrier_under_lock,
+    )
+    from .outcome_settlement import settle_terminal_generations
+    from .settlement_evidence import matches_request_fence
+
+    identity = job or {"id": carrier_id, "device_id": management.adapter_device_id}
+    stalled = False
+    sequences = _settlement_sequences(read.feed_jobs) if read is not None else {}
+    with identify_evidence_stall(identity, incarnation, sequences=sequences):
+        if job is not None:
+            _validate_feed_page([job], management.adapter_device_id, cursor, seen, incarnation)
+        evidence = prepare_carrier_evidence(management, read, carrier_id) if read is not None else None
+
+        def before_settle():
+            management.refresh_from_db()
+            if not matches_request_fence(management, fence):
+                raise _SettlementReadChanged
+            _validate_locked_carrier(read, job)
+            if evidence is not None:
+                validate_carrier_under_lock(management, evidence)
+
+        def finish():
+            nonlocal cursor, stalled
+            management.refresh_from_db()
+            if job is not None:
+                if _settle_job(management, job, incarnation):
+                    cursor = job["settle_seq"]
+                    _clear_stall(management)
+                else:
+                    _record_stall(management, job["settle_seq"])
+                    stalled = True
+            if persist_cursor:
+                _persist(management, cursor, management.adapter_device_id, incarnation)
+                management.refresh_from_db()
+                write_diagnostic(management, fence, cursor_written=True)
+
+        if evidence is not None:
+            settle_apply_attempts(management, evidence, before_settle=before_settle, after_settle=finish)
+        else:
+            settle_terminal_generations(management, [], incarnation, before_settle=before_settle, after_settle=finish)
+    return cursor, stalled
+
+
+def _validate_locked_carrier(read, job):
+    """Require the locked feed to retain the carrier facts used for owner settlement."""
+    from .apply_settlement import EvidenceInvariantError
+
+    if read is None or job is None:
+        return
+    retained = next((item for item in read.feed_jobs if item["id"] == job["id"]), None)
+    adapter_client.raise_item_error(retained)
+    adapter_client.raise_item_error(job)
+    if retained is not None and any(
+        retained[key] != job[key]
+        for key in ("id", "device_id", "type", "status", "settle_seq", "result", "error", "row_outcomes", "refusals")
+    ):
+        raise EvidenceInvariantError("consumed_execution_changed")
+
+
+def _historical_carriers(read, management):
+    """Require durable positive order before treating absent feed work as history."""
+    from .apply_settlement import _attempt_generations, _cursor_epoch_executions
+
+    feed_ids = {job["id"] for job in read.feed_jobs}
+    rows = list(read.generation_listing)
+    rows.extend(row for attempt in read["attempts"] for row in _attempt_generations(attempt))
+    if read["head"] is not None:
+        rows.append(read["head"])
+    candidates = {row["carrier_job_id"] for row in rows if row["carrier_job_id"] not in feed_ids}
+    if (
+        management.settle_cursor_incarnation != read.store_incarnation
+        or management.settle_cursor_device_id != management.adapter_device_id
+    ):
+        return []
+    return list(
+        dict.fromkeys(
+            _cursor_epoch_executions(management, read.store_incarnation)
+            .filter(
+                carrier_job_id__in=candidates,
+                invariant_code="",
+                consumed_at__isnull=False,
+                settle_seq__gt=0,
+                settle_seq__lte=management.settle_cursor_seq or 0,
+            )
+            .order_by("settle_seq")
+            .values_list("carrier_job_id", flat=True)
+        )
+    )
 
 
 def _invariant_evidence_stall(management, fence, error):
@@ -156,14 +347,9 @@ def sweep_static_route_settlements() -> tuple[int, int]:
     return polled, failed
 
 
-def _consume_locked(row) -> ConsumeResult:
-    """Consume for the already-locked management row *row*."""
+def _read_locked_page(row):
+    """Read one page from the current locked cursor without settling its carriers."""
     device_id = row.adapter_device_id
-    if device_id is None:
-        # Unlinked: there is no adapter device to poll and no epoch to record. The link
-        # repair owns getting this row an id back.
-        return ConsumeResult(None, 0, False, False, row.settle_cursor_seq)
-
     cursor = row.settle_cursor_seq or 0
     jobs, incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=cursor, limit=SETTLE_FEED_PAGE)
 
@@ -189,34 +375,7 @@ def _consume_locked(row) -> ConsumeResult:
                 device_id, after_settle_seq=cursor, limit=SETTLE_FEED_PAGE
             )
 
-    consumed = 0
-    stalled = False
-    from .apply_settlement import identify_evidence_stall
-
-    for job in jobs:
-        with identify_evidence_stall(job, incarnation):
-            seq = job["settle_seq"]
-            if seq <= cursor or job["device_id"] != device_id or job["status"] not in {"succeeded", "failed"}:
-                from .apply_settlement import EvidenceInvariantError
-
-                raise EvidenceInvariantError("invalid_settlement_order")
-            if _settle_job(row, job, incarnation):
-                cursor = max(cursor, seq)
-                _clear_stall(row)
-                consumed += 1
-                continue
-
-            _record_stall(row, seq)
-
-            # Head-of-line: nothing behind an unresolved settlement may be consumed, or the
-            # cursor would advance past a result still owed to an overlay.
-            stalled = True
-            break
-
-    _persist(row, cursor, device_id, incarnation)
-    # A full page can leave more executions pending. A short page proves the walk drained.
-    drained = not stalled and len(jobs) < SETTLE_FEED_PAGE
-    return ConsumeResult(device_id, consumed, stalled, epoch_reset, cursor, drained)
+    return jobs, cursor, incarnation, epoch_reset
 
 
 def _record_stall(row, seq) -> None:
@@ -288,13 +447,8 @@ def _settle_job(row, job, incarnation) -> bool:
     from .apply_settlement import _cursor_epoch_executions
     from .outcome_settlement import _bind_consumed_sequences
 
-    if job["type"] not in {"apply", "removal"}:
-        return True
-    result = job["result"]
-    if not isinstance(result, dict) or "row_outcomes" not in result:
-        return False
     # A certificate from an earlier mapping epoch is still this cursor's history.
-    executions = _cursor_epoch_executions(row, incarnation).filter(carrier_job_id=job["id"])
+    executions = list(_cursor_epoch_executions(row, incarnation).filter(carrier_job_id=job["id"]))
     matching = [
         execution
         for execution in executions
@@ -304,10 +458,19 @@ def _settle_job(row, job, incarnation) -> bool:
                 ("carrier_job_result", "result"),
                 ("carrier_job_status", "status"),
                 ("carrier_job_error", "error"),
+                ("row_outcomes", "row_outcomes"),
+                ("refusals", "refusals"),
             )
         )
     ]
-    if not matching:
+    if executions and not matching:
+        from .apply_settlement import EvidenceInvariantError
+
+        raise EvidenceInvariantError("consumed_execution_changed")
+    if job["type"] not in {"apply", "removal"}:
+        return True
+    result = job["result"]
+    if not isinstance(result, dict) or "row_outcomes" not in result or not matching:
         return False
     _bind_consumed_sequences(matching, job["settle_seq"])
     return True

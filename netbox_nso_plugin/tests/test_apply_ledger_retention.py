@@ -305,7 +305,9 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
             requests.append(request.url)
             path = urlsplit(request.url).path
             body = [row, {**row, "seq": row["seq"] + 1}] if path.endswith("/1768/generations") else []
-            response = make_response(200, body)
+            from ._settlement_wire import generation_wire
+
+            response = make_response(200, [generation_wire(value, 1768) for value in body])
             response.headers["X-Store-Incarnation"] = self.adapter.store.incarnation
             return response
 

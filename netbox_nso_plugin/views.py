@@ -4063,6 +4063,7 @@ class NSODeviceJobsView(AuthorizedView):
             generations = (
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
+            client.raise_evidence_errors(generations)
             generations = [row for row in generations if row.get("generation_id") in generation_ids]
             generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
             unlisted = _unlisted_device_jobs(mgmt.adapter_device_id, jobs, polled_job_ids | generation_job_ids)

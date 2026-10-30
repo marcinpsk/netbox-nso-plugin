@@ -20,7 +20,7 @@ from .apply_settlement import (
 )
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
 from .refusal_registry import OVERLAYS
-from .settlement_schemas import valid_store_incarnation
+from .settlement_schemas import canonical_uuid
 
 
 @dataclass(frozen=True)
@@ -268,12 +268,19 @@ def _earlier_execution(fence, generation, incarnation, settle_seq):
 
 def _record_invariant(management, generation, incarnation, attempt, code):
     """Persist safe diagnostics after the rejected batch transaction rolled back."""
-    if not isinstance(generation, dict) or not valid_store_incarnation(incarnation):
+    if not isinstance(generation, dict) or not canonical_uuid(incarnation):
         return
     generation_id, carrier_id = generation.get("generation_id"), generation.get("carrier_job_id")
     if type(generation_id) is not int or type(carrier_id) is not int or generation_id <= 0 or carrier_id <= 0:
         return
+    from .models import NSODeviceManagement
+    from .settlement_evidence import matches_request_fence, request_fence
+
+    fence = request_fence(management)
     with transaction.atomic():
+        management = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
+        if not matches_request_fence(management, fence):
+            return
         identity = dict(
             management=management,
             mapping_epoch=capture.mapping_epoch(management),
@@ -317,7 +324,7 @@ def validate_terminal_generation(
 
 def _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries):
     _validate_generation(generation)
-    _require(valid_store_incarnation(store_incarnation), "missing_store_incarnation")
+    _require(canonical_uuid(store_incarnation), "missing_store_incarnation")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
         return None
     return _join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
@@ -376,6 +383,8 @@ def settle_terminal_generations(
     modes=None,
     restorations=(),
     receipt_recoveries=None,
+    before_settle=None,
+    after_settle=None,
 ):
     """Commit all generation authorities in each carrier as one owner transaction."""
     from .intent_state import MutationFootprint, SourceRow, mirror_transaction
@@ -419,6 +428,17 @@ def settle_terminal_generations(
             authoritative_bookkeeping(),
             mirror_transaction(footprint),
         ):
+            if before_settle is not None:
+                before_settle()
+            for generation in generations:
+                _validated_join(
+                    management,
+                    generation,
+                    store_incarnation,
+                    attempts.get((generation["generation_id"], generation["carrier_job_id"])),
+                    authorities[generation["carrier_job_id"]],
+                    receipt_recoveries,
+                )
             acknowledge_recoveries(management, receipt_recoveries, store_incarnation, states)
             for attempt_id, keep in restorations:
                 capture.restore_attempt(attempt_id, keep_streams=keep)
@@ -437,6 +457,8 @@ def settle_terminal_generations(
                             authorities=authorities[generation["carrier_job_id"]],
                         )
                     )
+            if after_settle is not None:
+                after_settle()
             return executions
     except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
         code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
@@ -460,7 +482,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
     from .models import NSODeviceManagement
 
     _validate_generation(generation)
-    _require(valid_store_incarnation(incarnation), "missing_store_incarnation")
+    _require(canonical_uuid(incarnation), "missing_store_incarnation")
     _require(settle_seq is None or type(settle_seq) is int and settle_seq > 0, "invalid_settlement_sequence")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
         return None

@@ -30,7 +30,18 @@ FAMILIES = frozenset(
         "static_route",
     }
 )
-SETTLEMENT_COMPONENTS = ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
+SETTLEMENT_COMPONENTS = (
+    "DeviceDeploymentEvidenceOut",
+    "ActionApplyOut",
+    "JobEvidenceOut",
+    "DeviceGenerationEvidenceOut",
+    "DeploymentGenerationEvidenceOut",
+    "DeploymentHeadEvidenceOut",
+    "DeploymentAttemptEvidenceOut",
+    "SettlementReceiptEvidenceOut",
+    "SettlementObservationIn",
+    "SettlementObservationOut",
+)
 VENDORED = Path(__file__).resolve().parents[1] / "netbox_nso_plugin/schemas/observations.json"
 
 
@@ -65,7 +76,7 @@ def generate(snapshot):
     families = {
         schema["properties"]["family"]["const"]: name
         for name, schema in schemas.items()
-        if name.endswith("ObservationOut") and schema["properties"]["family"]["const"] in FAMILIES
+        if name.endswith("ObservationOut") and schema.get("properties", {}).get("family", {}).get("const") in FAMILIES
     }
     if set(families) != FAMILIES:
         raise ValueError(f"Missing observation families: {sorted(FAMILIES - families.keys())}")

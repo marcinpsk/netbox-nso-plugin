@@ -7,6 +7,7 @@ from netbox_nso_plugin.models import NSOApplyExecution
 
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
@@ -18,7 +19,10 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/generations"):
                 limit = int(kwargs["params"]["limit"])
                 offset = limit if "since_seq" in kwargs["params"] else 0
-                return make_response(200, rows[offset : offset + limit])
+                return make_response(
+                    200,
+                    [generation_wire(row, self.management.adapter_device_id) for row in rows[offset : offset + limit]],
+                )
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
@@ -87,7 +91,7 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(adapter_client.list_device_generations(self.management.adapter_device_id), [row])
 
     def test_null_snapshot_blocks_until_the_terminal_carrier_is_retained(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
         self.prepare_automatic()
         generation = self.terminal(refused=None)
@@ -105,8 +109,9 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
                         )
                     ]
                 )
-                with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+                with self.assertRaises(adapter_client.InvalidJobEvidence) as raised:
                     settle_device_apply_attempts(self.management)
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
                 self.assertFalse(NSOApplyExecution.objects.filter(consumed_at__isnull=False).exists())
                 self.management.refresh_from_db()
                 self.assertIsNone(self.management.settle_cursor_seq)
@@ -138,7 +143,8 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = response.json()
                 row = document["attempts"][0]["generations"][0] if manual else document["head"]
-                row.update(change)
+                row["projection"].update(change)
+                row["identity"].update({key: value for key, value in change.items() if key in row["identity"]})
                 return make_response(200, document)
             return response
 

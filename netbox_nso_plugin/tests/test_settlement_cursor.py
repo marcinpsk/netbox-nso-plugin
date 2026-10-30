@@ -396,7 +396,10 @@ class TestUnresolvedExecution(_SettlementCase):
         execution.save(update_fields=("terminal_projection",))
         result = consume_static_route_settlements(mgmt)
         assert result.stalled
-        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert result.consumed == 0
+        assert self._cursor(mgmt).settle_cursor_seq is None
+        execution.refresh_from_db()
+        assert execution.terminal_projection == projection
 
     def test_a_queued_sibling_never_blocks_the_cursor(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
@@ -457,7 +460,7 @@ class TestUnresolvedExecution(_SettlementCase):
         row = self._cursor(mgmt)
         assert (row.settle_cursor_seq, row.settle_stall_seq, row.settle_stall_attempts) == (None, None, 0)
 
-    def test_consumer_invariant_records_the_job_after_page_rollback(self):
+    def test_consumer_invariant_keeps_the_committed_prefix(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("backloginvariant")
@@ -479,7 +482,9 @@ class TestUnresolvedExecution(_SettlementCase):
         result = consume_static_route_settlements(mgmt)
         assert result.stalled
         row = self._cursor(mgmt)
-        assert row.settle_cursor_seq is None
+        assert row.settle_cursor_seq == 1
+        assert result.consumed == 1
+        assert not result.drained
         assert row.settle_evidence_error.get("job_id") == jobs[1]["id"]
         assert row.settle_evidence_error.get("settle_seq") == 1
         assert row.settle_evidence_error.get("reason") == "invalid settlement evidence"

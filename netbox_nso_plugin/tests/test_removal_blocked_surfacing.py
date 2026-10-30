@@ -27,6 +27,7 @@ from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._adapter_http import make_generation_listing, make_response, make_session
+from ._settlement_wire import generation_wire, job_wire
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
@@ -45,6 +46,7 @@ def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T0
     """A removal job the collateral guard blocked (shape from adapter run_removal)."""
     return {
         "id": job_id,
+        "settle_seq": job_id,
         "type": "removal",
         "device_id": 10,
         "status": status,
@@ -78,6 +80,7 @@ def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=
     terminal = status in {"succeeded", "failed"}
     return {
         "id": job_id,
+        "settle_seq": job_id if terminal else None,
         "type": "removal",
         "device_id": 10,
         "status": status,
@@ -230,7 +233,7 @@ class BlockedRemovalTestBase(TestCase):
                     cursor = params.get("since_seq", 0)
                     limit = params.get("limit", 100)
                     page = [row for row in generations if row["seq"] > cursor][:limit]
-                    return make_response(200, json_data=page)
+                    return make_response(200, json_data=[generation_wire(row, 10) for row in page])
                 if lookup := re.search(r"/api/v1/jobs/(\d+)$", url):
                     job_lookups.append(int(lookup.group(1)))
                     job = stored.get(int(lookup.group(1)))
@@ -238,8 +241,8 @@ class BlockedRemovalTestBase(TestCase):
                         return make_response(
                             404, json_data={"error": {"code": "not_found", "message": "Job not found"}}
                         )
-                    return make_response(200, json_data=job)
-                return make_response(200, json_data=jobs)
+                    return make_response(200, json_data=job_wire(job))
+                return make_response(200, json_data=[job_wire(job) for job in jobs])
 
             session.request.side_effect = request
             mock_session_cls.return_value = session
@@ -424,6 +427,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             make_generation_listing(
                 generation_id=seq,
                 seq=seq,
+                status="settled" if seq == wanted else "pending",
                 job_id=wanted if seq == wanted else None,
                 carrier_job_id=wanted if seq == wanted else None,
                 carrier_job_status="succeeded" if seq == wanted else None,
@@ -492,6 +496,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             make_generation_listing(
                 generation_id=seq,
                 seq=seq,
+                status="settled" if seq == wanted else "pending",
                 job_id=wanted if seq == wanted else None,
                 carrier_job_id=wanted if seq == wanted else None,
                 carrier_job_status="succeeded" if seq == wanted else None,
@@ -589,10 +594,13 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         """Sync/apply jobs never contribute to blocked_removals or mask a block."""
         sync = {
             "id": 70,
+            "settle_seq": 70,
             "type": "sync",
             "device_id": 10,
             "status": "succeeded",
             "result": None,
+            "row_outcomes": None,
+            "refusals": None,
             "context": None,
             "error": None,
             "created_at": "2026-07-10T08:00:00Z",
@@ -678,6 +686,7 @@ def _residue_job(job_id=60, scope="svi", residue=None, updated="2026-07-11T20:00
     """A SUCCEEDED removal whose post-retract check found device residue (#104-A)."""
     return {
         "id": job_id,
+        "settle_seq": job_id,
         "type": "removal",
         "device_id": 10,
         "status": "succeeded",
@@ -770,7 +779,9 @@ class TestCategoryGridResidueBadges(BlockedRemovalTestBase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
         ):
-            mock_session_cls.return_value = make_session(response=make_response(200, json_data=jobs))
+            mock_session_cls.return_value = make_session(
+                response=make_response(200, json_data=[job_wire(job) for job in jobs])
+            )
             url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": key})
             return self.client.get(url)
 

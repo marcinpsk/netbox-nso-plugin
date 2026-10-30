@@ -21,7 +21,7 @@ from datetime import datetime
 import requests
 from django.conf import settings
 
-from .settlement_schemas import valid_store_incarnation, within_wire_bounds
+from .settlement_schemas import canonical_uuid, within_wire_bounds
 from .vault_refs import is_secret_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -350,6 +350,98 @@ class InvalidJobEvidence(AdapterError):
         self.settle_seq = job.get("settle_seq") if isinstance(job, dict) else None
         self.device_id = job.get("device_id") if isinstance(job, dict) else None
         self.store_incarnation = None
+
+    def __reduce__(self):
+        identity = {"id": self.job_id, "settle_seq": self.settle_seq, "device_id": self.device_id}
+        return type(self), (identity, self.reason), self.__dict__
+
+
+class EvidenceItem(dict):
+    """Retain a failed projection's trusted identity until its carrier is consumed."""
+
+    def __init__(self, identity, error, *, digest=None):
+        super().__init__(identity)
+        self.evidence_identity = dict(identity)
+        self.evidence_error = error
+        self.evidence_digest = digest
+        self.evidence_generations = []
+        error.evidence_identity = self.evidence_identity
+        error.evidence_digest = digest
+
+    def __getitem__(self, key):
+        if key not in self.evidence_identity:
+            raise self.evidence_error
+        return self.evidence_identity[key]
+
+    def get(self, key, default=None):
+        return self[key]
+
+    def __contains__(self, key):
+        self[key]
+        return True
+
+    def __iter__(self):
+        raise self.evidence_error
+
+    def __reversed__(self):
+        raise self.evidence_error
+
+    def keys(self):
+        raise self.evidence_error
+
+    def values(self):
+        raise self.evidence_error
+
+    def items(self):
+        raise self.evidence_error
+
+    def setdefault(self, key, default=None):
+        return self[key]
+
+    def pop(self, key, *default):
+        self[key]
+        return super().pop(key, *default)
+
+    def __or__(self, other):
+        raise self.evidence_error
+
+    def __ror__(self, other):
+        raise self.evidence_error
+
+    def __copy__(self):
+        copied = type(self)(self.evidence_identity, self.evidence_error, digest=self.evidence_digest)
+        copied.evidence_generations = self.evidence_generations
+        return copied
+
+    def copy(self):
+        return self.__copy__()
+
+    def __deepcopy__(self, memo):
+        from copy import deepcopy
+
+        copied = type(self).__new__(type(self))
+        memo[id(self)] = copied
+        dict.__init__(copied, deepcopy(self.evidence_identity, memo))
+        copied.__dict__.update(deepcopy(self.__dict__, memo))
+        return copied
+
+
+def raise_item_error(item):
+    """Refuse one failed item at the consumer's carrier boundary."""
+    if isinstance(item, EvidenceItem):
+        raise item.evidence_error
+
+
+def raise_evidence_errors(document):
+    """Require complete evidence before a consumer acts on the entire response."""
+    pending = [document]
+    while pending:
+        item = pending.pop()
+        raise_item_error(item)
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
 
 
 def _document(data, what: str) -> dict:
@@ -1299,20 +1391,6 @@ def _validated_job(job, what):
     return job
 
 
-def _validated_jobs(jobs, what):
-    """Return *jobs* once every entry matches JobOut's shape, else refuse the whole page."""
-    if not isinstance(jobs, list):
-        raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
-    for job in jobs:
-        try:
-            _validated_job(job, what)
-        except InvalidJobEvidence:
-            raise
-        except AdapterError:
-            raise InvalidJobEvidence(job, "invalid job envelope") from None
-    return jobs
-
-
 def _validated_provision_attempt(evidence, expected_attempt_id):
     """Return structurally valid provision evidence, else leave the attempt undecided."""
     import uuid
@@ -1335,31 +1413,25 @@ def _validated_provision_attempt(evidence, expected_attempt_id):
 
 def get_job(job_id):
     """GET /api/v1/jobs/{id}."""
-    return _validated_job(_request("GET", f"/api/v1/jobs/{job_id}"), "job")
+    from .settlement_schemas import validate_settlement_item
+
+    job = validate_settlement_item("JobEvidenceOut", _request("GET", f"/api/v1/jobs/{job_id}"), None)
+    raise_item_error(job)
+    if job["id"] != job_id:
+        raise InvalidJobEvidence({}, "invalid job envelope")
+    return job
 
 
 def list_jobs(adapter_device_id):
     """GET /api/v1/jobs?device_id={id} — the device's jobs, most-recent-first."""
-    return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
-
-
-GENERATION_LISTING_FIELDS = frozenset(
-    {
-        "generation_id",
-        "seq",
-        "status",
-        "job_id",
-        "carrier_job_id",
-        "carrier_job_status",
-        "mode",
-        "settlement_cohort",
-        "digest",
-        "stream_revisions",
-        "source_push_seq",
-        "created_at",
-        "updated_at",
-    }
-)
+    jobs = _settlement_response(
+        _request_response("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}),
+        "JobEvidenceOut",
+        adapter_device_id,
+    )
+    for job in jobs:
+        raise_item_error(job)
+    return jobs
 
 
 def _positive_generation_int(value):
@@ -1375,32 +1447,21 @@ def _aware_generation_timestamp(value):
         return False
 
 
-def _generation_provenance(mapping, *, nullable=False):
-    return isinstance(mapping, dict) and all(
-        isinstance(key, str) and (_positive_generation_int(value) or nullable and value is None)
-        for key, value in mapping.items()
-    )
-
-
 def _validated_generation_listing(row, device_id):
-    from .refusal_contract import GENERATION_STATUSES
+    from .execution_contract import ContractError, validate_generation_listing
+
+    try:
+        validate_generation_listing(row)
+    except ContractError as exc:
+        raise InvalidJobEvidence(
+            {"device_id": device_id, "id": row["carrier_job_id"]}, "invalid settlement evidence"
+        ) from exc
 
     valid = (
-        all(_positive_generation_int(row[key]) for key in ("generation_id", "seq"))
-        and all(
-            row[key] is None or _positive_generation_int(row[key])
-            for key in ("job_id", "carrier_job_id", "settlement_cohort")
-        )
-        and row["status"] in GENERATION_STATUSES
-        and _generation_provenance(row["stream_revisions"])
-        and _generation_provenance(row["source_push_seq"], nullable=True)
+        all(row[key] is None or _positive_generation_int(row[key]) for key in ("job_id", "settlement_cohort"))
         and row["stream_revisions"].keys() <= row["source_push_seq"].keys()
-        and all(_aware_generation_timestamp(row[key]) for key in ("created_at", "updated_at"))
+        and _aware_generation_timestamp(row["created_at"])
         and (row["carrier_job_id"] is None) == (row["carrier_job_status"] is None)
-        and (
-            row["carrier_job_status"] is None
-            or row["carrier_job_status"] in {"queued", "running", "succeeded", "failed"}
-        )
         and (
             row["status"] in {"pending", "running"}
             or row["carrier_job_id"] is None
@@ -1420,7 +1481,7 @@ def _settlement_response(resp, component, device_id):
     try:
         body = resp.json()
     except _JSON_DECODE_ERRORS as exc:
-        reason = "invalid job envelope" if component == "JobOut" else "invalid settlement evidence"
+        reason = "invalid job envelope" if component == "JobEvidenceOut" else "invalid settlement evidence"
         raise InvalidJobEvidence({"device_id": device_id}, reason) from exc
     return validate_settlement_response(component, body, device_id)
 
@@ -1437,14 +1498,15 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
         if last_seq is not None:
             params["since_seq"] = last_seq
         resp = _request_response("GET", f"/api/v1/devices/{adapter_device_id}/generations", params=params)
-        page = _settlement_response(resp, "DeviceGenerationOut", adapter_device_id)
-        for row in page:
-            _validated_generation_listing(row, adapter_device_id)
+        page = _settlement_response(resp, "DeviceGenerationEvidenceOut", adapter_device_id)
+        for index, row in enumerate(page):
             generation_id, seq = row["generation_id"], row["seq"]
             if generation_id in generation_ids or last_seq is not None and seq <= last_seq:
-                raise InvalidJobEvidence(
+                error = InvalidJobEvidence(
                     {"device_id": adapter_device_id, "id": row["carrier_job_id"]}, "invalid settlement evidence"
                 )
+                failed = EvidenceItem(row.evidence_identity, error, digest=row.evidence_digest)
+                return [*generations, *page[:index], failed]
             generation_ids.add(generation_id)
             last_seq = seq
         generations.extend(page)
@@ -1475,15 +1537,20 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
         },
     )
     incarnation = resp.headers.get(STORE_INCARNATION_HEADER)
-    if not valid_store_incarnation(incarnation):
+    if not canonical_uuid(incarnation):
         # An unknown store cannot validate the cursor epoch or identify a carrier.
         raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid settlement evidence")
     try:
-        page = _settlement_response(resp, "JobOut", adapter_device_id)
-        for job in page:
-            if type(job["settle_seq"]) is not int or job["settle_seq"] <= 0 or type(job["device_id"]) is not int:
-                raise InvalidJobEvidence(job, "invalid job envelope")
-        jobs = _validated_jobs(page, "settlement feed")
+        jobs = _settlement_response(resp, "JobEvidenceOut", adapter_device_id)
+        for index, job in enumerate(jobs):
+            if type(job["device_id"]) is not int:
+                raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid job envelope")
+            if type(job["settle_seq"]) is not int or job["settle_seq"] <= 0:
+                error = InvalidJobEvidence({"id": job["id"], "device_id": job["device_id"]}, "invalid job envelope")
+                job = EvidenceItem(job.evidence_identity, error, digest=job.evidence_digest)
+                jobs[index] = job
+            if isinstance(job, EvidenceItem):
+                job.evidence_error.store_incarnation = incarnation
     except InvalidJobEvidence as exc:
         exc.store_incarnation = incarnation
         raise

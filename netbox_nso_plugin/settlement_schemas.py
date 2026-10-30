@@ -7,10 +7,18 @@ import math
 from importlib.resources import files
 from uuid import UUID
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 _SCHEMA = json.loads(files("netbox_nso_plugin").joinpath("schemas/settlements.json").read_text(encoding="utf-8"))
-_ARRAY_COMPONENTS = frozenset({"JobOut", "DeviceGenerationOut"})
+_ARRAY_COMPONENTS = frozenset({"JobEvidenceOut", "DeviceGenerationEvidenceOut"})
+_ITEM_IDENTITIES = {
+    "JobEvidenceOut": "JobIdentityOut",
+    "DeviceGenerationEvidenceOut": "GenerationIdentityOut",
+    "DeploymentGenerationEvidenceOut": "GenerationIdentityOut",
+    "DeploymentHeadEvidenceOut": "GenerationIdentityOut",
+    "DeploymentAttemptEvidenceOut": "AttemptIdentityOut",
+    "SettlementReceiptEvidenceOut": "ReceiptIdentityOut",
+}
 APPLY_SKIP_REASONS = frozenset(
     _SCHEMA["components"]["schemas"]["ActionApplyOut"]["properties"]["skipped"]["additionalProperties"]["enum"]
 )
@@ -18,6 +26,20 @@ APPLY_SKIP_REASONS = frozenset(
 MAX_NESTING = 64
 # Every integer that settlement persists lands in a PostgreSQL bigint column.
 _INT64 = range(-(2**63), 2**63)
+_FORMAT_CHECKER = FormatChecker()
+
+
+@_FORMAT_CHECKER.checks("uuid")
+def canonical_uuid(value):
+    """Accept only canonical UUID strings for every settlement `uuid` field."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
 VALIDATORS = {
     component: Draft202012Validator(
         {
@@ -27,50 +49,28 @@ VALIDATORS = {
                 if component in _ARRAY_COMPONENTS
                 else {"$ref": f"#/components/schemas/{component}"}
             ),
-        }
+        },
+        format_checker=_FORMAT_CHECKER,
     )
-    for component in ("JobOut", "DeviceGenerationOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
+    for component in (*_ARRAY_COMPONENTS, "DeviceDeploymentEvidenceOut", "ActionApplyOut", "SettlementObservationOut")
 }
+_ITEM_VALIDATORS = {
+    name: Draft202012Validator({**_SCHEMA, "$ref": f"#/components/schemas/{name}"}, format_checker=_FORMAT_CHECKER)
+    for name in (*_ITEM_IDENTITIES, *_ITEM_IDENTITIES.values())
+}
+_DIGEST_VALIDATOR = Draft202012Validator(
+    _SCHEMA["components"]["schemas"]["EvidenceErrorOut"]["properties"]["digest"],
+    format_checker=_FORMAT_CHECKER,
+)
 
 
-def valid_store_incarnation(value):
-    """Accept only the canonical UUID string that identifies an adapter store."""
-    if not isinstance(value, str):
-        return False
-    try:
-        return str(UUID(value)) == value
-    except ValueError:
-        return False
+class _EvidenceProjection(dict):
+    """Keep the validated envelope authority for later cross-item checks."""
 
-
-def _error_identity(component, body, path):
-    """Attribute only a path inside one identified carrier element or head."""
-    path = tuple(path)
-    if component in _ARRAY_COMPONENTS:
-        if not path or type(path[0]) is not int or not isinstance(body, list):
-            return None
-        row = body[path[0]]
-        key = "id" if component == "JobOut" else "carrier_job_id"
-        prefix = path[:1]
-    elif path[:1] == ("head",):
-        row, key, prefix = body.get("head"), "carrier_job_id", path[:1]
-    elif (
-        len(path) >= 4
-        and path[0] == "attempts"
-        and type(path[1]) is int
-        and path[2] == "generations"
-        and type(path[3]) is int
-    ):
-        row = body["attempts"][path[1]]["generations"][path[3]]
-        key, prefix = "carrier_job_id", path[:4]
-    else:
-        return None
-    if not isinstance(row, dict):
-        return None
-    identity = {"settle_seq": row.get("settle_seq")} if key == "id" else {}
-    if type(row.get(key)) is int and row[key] > 0:
-        identity["id"] = row[key]
-    return (prefix, identity) if identity else None
+    def __init__(self, projection, identity, digest):
+        super().__init__(projection)
+        self.evidence_identity = dict(identity)
+        self.evidence_digest = digest
 
 
 def _jsonb_text(value):
@@ -82,9 +82,9 @@ def _jsonb_text(value):
     return "\x00" not in value
 
 
-def within_wire_bounds(body):
-    """Return whether *body* nests at most ``MAX_NESTING`` deep and PostgreSQL can store it, without recursion."""
-    stack = [(body, 1)]
+def within_wire_bounds(body, *, start_depth=1):
+    """Check absolute JSON depth and PostgreSQL value bounds without recursion."""
+    stack = [(body, start_depth)]
     while stack:
         value, depth = stack.pop()
         if type(value) is int and value not in _INT64:
@@ -106,15 +106,126 @@ def validate_settlement_response(component, body, device_id):
     """Raise a closed diagnostic for malformed successful HTTP responses."""
     from .adapter_client import InvalidJobEvidence
 
-    reason = "invalid job envelope" if component == "JobOut" else "invalid settlement evidence"
-    # Bound first: the validator and later comparisons recurse, and PostgreSQL must store every value.
+    reason = "invalid job envelope" if component == "JobEvidenceOut" else "invalid settlement evidence"
+    if component in {"JobEvidenceOut", "DeviceGenerationEvidenceOut"}:
+        if not isinstance(body, list):
+            raise InvalidJobEvidence({"device_id": device_id}, reason)
+        return [validate_settlement_item(component, item, device_id, depth=2) for item in body]
+    if component == "DeviceDeploymentEvidenceOut":
+        return _deployment_evidence(body, device_id)
+    # Bound frames before validators recurse; identified items have separate bounds.
     if not within_wire_bounds(body):
         raise InvalidJobEvidence({"device_id": device_id}, reason)
     errors = list(VALIDATORS[component].iter_errors(body))
     if not errors:
         return body
-    identities = [_error_identity(component, body, error.absolute_path) for error in errors]
-    job = {"device_id": device_id}
-    if identities[0] is not None and all(identity == identities[0] for identity in identities):
-        job.update(identities[0][1])
-    raise InvalidJobEvidence(job, reason)
+    raise InvalidJobEvidence({"device_id": device_id}, reason)
+
+
+def validate_settlement_item(component, item, device_id, *, depth=1):
+    """Keep item failures separate after validating the independent stored identity."""
+    from .adapter_client import (
+        AdapterError,
+        EvidenceItem,
+        InvalidJobEvidence,
+        _validated_generation_listing,
+        _validated_job,
+    )
+
+    reason = "invalid job envelope" if component == "JobEvidenceOut" else "invalid settlement evidence"
+    identity = item.get("identity") if isinstance(item, dict) else None
+    if (
+        not within_wire_bounds(identity, start_depth=depth + 1)
+        or not _ITEM_VALIDATORS[_ITEM_IDENTITIES[component]].is_valid(identity)
+        or device_id is not None
+        and identity.get("device_id") != device_id
+        or identity.get("device_id") is not None
+        and (type(identity["device_id"]) is not int or identity["device_id"] <= 0)
+        or any(
+            type(identity[key]) is not int or identity[key] <= 0
+            for key in ("id", "generation_id", "seq")
+            if key in identity
+        )
+        or identity.get("carrier_job_id") is not None
+        and (type(identity["carrier_job_id"]) is not int or identity["carrier_job_id"] <= 0)
+        or identity.get("settle_seq") is not None
+        and type(identity["settle_seq"]) is not int
+    ):
+        raise InvalidJobEvidence({"device_id": device_id}, reason)
+    job_identity = {**identity, "id": identity.get("id", identity.get("carrier_job_id"))}
+    error = InvalidJobEvidence(job_identity, reason)
+    valid_sequence = component != "JobEvidenceOut" or identity["settle_seq"] is None or identity["settle_seq"] > 0
+    if not valid_sequence:
+        error.settle_seq = None
+    projection = item.get("projection")
+    evidence_error = item.get("evidence_error")
+    digest = item.get("digest")
+    safe_digest = digest if _DIGEST_VALIDATOR.is_valid(digest) else None
+    candidate = {**item, "generations": []} if component == "DeploymentAttemptEvidenceOut" else item
+    valid = (
+        valid_sequence
+        and within_wire_bounds(candidate, start_depth=depth)
+        and _ITEM_VALIDATORS[component].is_valid(candidate)
+        and (projection is None) != (evidence_error is None)
+        and (evidence_error is None or evidence_error["digest"] == item["digest"])
+    )
+    if valid and projection is not None:
+        valid = all(
+            type(projection[key]) is type(value) and projection[key] == value
+            for key, value in identity.items()
+            if key in projection
+        )
+        try:
+            if valid and component == "JobEvidenceOut":
+                _validated_job(projection, "job")
+            elif valid and component == "DeviceGenerationEvidenceOut":
+                _validated_generation_listing(projection, device_id)
+        except AdapterError:
+            valid = False
+    if valid and projection is not None:
+        decoded = _EvidenceProjection(projection, identity, item["digest"])
+    else:
+        decoded = EvidenceItem(identity, error, digest=safe_digest)
+    if component == "DeploymentAttemptEvidenceOut":
+        generations = item.get("generations")
+        if not isinstance(generations, list):
+            decoded = EvidenceItem(identity, error, digest=safe_digest)
+            generations = []
+        children = [
+            validate_settlement_item("DeploymentGenerationEvidenceOut", row, device_id, depth=depth + 2)
+            for row in generations
+        ]
+        if isinstance(decoded, EvidenceItem):
+            decoded.evidence_generations = children
+        else:
+            decoded["generations"] = children
+    return decoded
+
+
+def _deployment_evidence(body, device_id):
+    """Validate the response frame and decode each independent evidence item."""
+    from .adapter_client import InvalidJobEvidence
+
+    if not isinstance(body, dict):
+        raise InvalidJobEvidence({"device_id": device_id}, "invalid settlement evidence")
+    frame = {**body}
+    if isinstance(frame.get("attempts"), list):
+        frame["attempts"] = []
+    if isinstance(frame.get("head"), dict):
+        frame["head"] = None
+    if (
+        not within_wire_bounds(frame)
+        or not VALIDATORS["DeviceDeploymentEvidenceOut"].is_valid(frame)
+        or body["device_id"] != device_id
+    ):
+        raise InvalidJobEvidence({"device_id": device_id}, "invalid settlement evidence")
+    return {
+        **body,
+        "head": None
+        if body["head"] is None
+        else validate_settlement_item("DeploymentHeadEvidenceOut", body["head"], device_id, depth=2),
+        "attempts": [
+            validate_settlement_item("DeploymentAttemptEvidenceOut", row, device_id, depth=3)
+            for row in body["attempts"]
+        ],
+    }

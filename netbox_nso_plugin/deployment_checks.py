@@ -180,6 +180,7 @@ def check_active_streams():
                 "An adapter receipt has no captured local selection",
             )
         generations = adapter_client.list_device_generations(management.adapter_device_id)
+        adapter_client.raise_evidence_errors(generations)
         terminal = [generation for generation in generations if terminal_carrier_requires_certificate(generation)]
         certificates = generation_certificate_candidates(management, incarnation, terminal)
         for generation in generations:
@@ -215,6 +216,7 @@ def check_active_streams():
                 "Adapter redistribution membership has no exact prepared ownership",
             )
         evidence = adapter_client.get_deployment_evidence(management.adapter_device_id, [])
+        adapter_client.raise_evidence_errors(evidence)
         _require(
             not evidence["held_jobs"] and not evidence["write_work_pending"] and evidence["pending_generations"] == 0,
             "Adapter work is still in flight",

@@ -45,7 +45,7 @@ class TestAdmissionListing(DeploymentCase):
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = answer.json()
                 if kind == "known":
-                    document["attempts"][0]["response"] = changed
+                    document["attempts"][0]["projection"]["response"] = changed
                 if kind == "replayed":
                     document["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
                 return make_response(200, document)
@@ -127,7 +127,8 @@ class TestAdmissionListing(DeploymentCase):
             response = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = response.json()
-                document["head"]["apply_attempt_id"] = str(self.attempt.pk)
+                document["head"]["projection"]["apply_attempt_id"] = str(self.attempt.pk)
+                document["head"]["identity"]["apply_attempt_id"] = str(self.attempt.pk)
                 return make_response(200, document)
             return response
 
@@ -153,7 +154,7 @@ class TestAdmissionListing(DeploymentCase):
             response = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = response.json()
-                document["attempts"][0]["response"] = None
+                document["attempts"][0]["projection"]["response"] = None
                 return make_response(200, document)
             return response
 
@@ -185,7 +186,8 @@ class TestAdmissionListing(DeploymentCase):
             response = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = response.json()
-                document["head"]["apply_attempt_id"] = str(rejected.pk)
+                document["head"]["projection"]["apply_attempt_id"] = str(rejected.pk)
+                document["head"]["identity"]["apply_attempt_id"] = str(rejected.pk)
                 return make_response(200, document)
             return response
 
@@ -235,7 +237,8 @@ class TestProbeAdmissionListing(DeploymentCase):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/generations"):
                 rows = response.json()
-                rows[0].update(change)
+                rows[0]["projection"].update(change)
+                rows[0]["identity"].update({key: value for key, value in change.items() if key in rows[0]["identity"]})
                 return make_response(200, rows)
             return response
 

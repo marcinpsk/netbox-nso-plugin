@@ -7,6 +7,7 @@ import copy
 import pytest
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 from .test_refusal_contract import generation
 from .test_refusal_result import refused_bgp_result
@@ -70,7 +71,7 @@ def test_coalesced_carrier_rejects_changed_secondary_authority():
         validate_carrier_generations(generations)
 
 
-class TestCoalescedOwnerSettlement(BGPSettlementHelpers, BGPCaptureCase):
+class CoalescedCarrierHelpers:
     def prepare_carrier(self):
         from uuid import UUID
 
@@ -132,6 +133,8 @@ class TestCoalescedOwnerSettlement(BGPSettlementHelpers, BGPCaptureCase):
         second["carrier_job_result"] = copy.deepcopy(result)
         return [first, second]
 
+
+class TestCoalescedOwnerSettlement(CoalescedCarrierHelpers, BGPSettlementHelpers, BGPCaptureCase):
     def settle_carrier(self, generations, *, settle_seq=1):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
@@ -169,13 +172,16 @@ class TestCoalescedOwnerSettlement(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/generations"):
                 metadata = response.json()
                 metadata.append(
-                    {
-                        **metadata[0],
-                        **{
-                            key: generations[1][key]
-                            for key in ("generation_id", "seq", "status", "stream_revisions", "source_push_seq")
+                    generation_wire(
+                        {
+                            **metadata[0]["projection"],
+                            **{
+                                key: generations[1][key]
+                                for key in ("generation_id", "seq", "status", "stream_revisions", "source_push_seq")
+                            },
                         },
-                    }
+                        self.management.adapter_device_id,
+                    )
                 )
                 return make_response(200, metadata)
             return response
@@ -201,21 +207,26 @@ class TestCoalescedOwnerSettlement(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/generations"):
                 listing = response.json()
                 listing.append(
-                    {
-                        **listing[0],
-                        "digest": self.attempt.response["generations"][1]["digest"],
-                        **{
-                            key: generations[1][key]
-                            for key in ("generation_id", "seq", "status", "stream_revisions", "source_push_seq")
+                    generation_wire(
+                        {
+                            **listing[0]["projection"],
+                            "digest": self.attempt.response["generations"][1]["digest"],
+                            **{
+                                key: generations[1][key]
+                                for key in ("generation_id", "seq", "status", "stream_revisions", "source_push_seq")
+                            },
                         },
-                    }
+                        self.management.adapter_device_id,
+                    )
                 )
                 return make_response(200, listing)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 evidence = response.json()
                 projections = copy.deepcopy(generations)
                 projections[0]["carrier_job_error"] = {"message": "placeholder-secret-canary"}
-                evidence["attempts"][0]["generations"] = projections
+                evidence["attempts"][0]["generations"] = [
+                    generation_wire(row, self.management.adapter_device_id) for row in projections
+                ]
                 return make_response(200, evidence)
             return response
 

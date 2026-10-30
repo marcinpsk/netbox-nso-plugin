@@ -41,10 +41,30 @@ from ._outbox_case import (
     without_commit_drain,
 )
 from ._ownership_case import acquire_overlay
+from ._settlement_wire import deployment_wire, generation_wire, job_wire
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
+
+
+def _queued_incumbent_job(job_type="sync"):
+    return {
+        "id": 3,
+        "type": job_type,
+        "device_id": 10,
+        "status": "queued",
+        "settle_seq": None,
+        "result": None,
+        "row_outcomes": None,
+        "refusals": None,
+        "error": None,
+        "context": None,
+        "created_at": "2026-07-10T05:59:00Z",
+        "updated_at": "2026-07-10T05:59:00Z",
+        "started_at": None,
+        "heartbeat_at": None,
+    }
 
 
 def _make_fixtures():
@@ -1457,7 +1477,7 @@ class TestNSODeviceActionView(ViewTestBase):
                     }
                 },
             ),
-            make_response(200, json_data={"id": 3, "type": "sync", "status": "queued"}),
+            make_response(200, json_data=job_wire(_queued_incumbent_job())),
         ]
         mock_session_cls.return_value = session
 
@@ -1606,7 +1626,7 @@ class TestNSODeviceActionView(ViewTestBase):
                 409,
                 json_data={"error": {"code": "conflict", "message": "busy", "detail": {"job_id": 3}}},
             ),
-            make_response(200, json_data={"id": 3, "type": supplied, "status": "queued"}),
+            make_response(200, json_data=job_wire(_queued_incumbent_job(supplied))),
         ]
         mock_session_cls.return_value = session
 
@@ -1702,7 +1722,7 @@ class TestNSODeviceActionView(ViewTestBase):
                     }
                 },
             ),
-            make_response(200, json_data={"id": 3, "type": "sync", "status": "queued"}),
+            make_response(200, json_data=job_wire(_queued_incumbent_job())),
         ]
         mock_session_cls.return_value = session
 
@@ -8839,21 +8859,28 @@ class _ApplyBoundaryAdapter(ReceiptAdapter):
     attempt's admission and the evidence that later settles it, which is what this pin needs.
     """
 
-    def __init__(self, apply_response, evidence=None, *, generations=()):
+    def __init__(self, apply_response, evidence=None, *, generations=(), jobs=()):
         super().__init__()
         self.apply_response = apply_response
         self.evidence = evidence
         self.generations = list(generations)
+        self.jobs = list(jobs)
         self.apply_requests: list[dict] = []
 
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith(("/jobs", "/generations")):
-            response = make_response(200, self.generations if url.endswith("/generations") else [])
+            if url.endswith("/generations"):
+                rows = [generation_wire(row, int(url.split("/devices/")[1].split("/")[0])) for row in self.generations]
+            else:
+                params = kwargs["params"]
+                rows = [job_wire(row) for row in self.jobs if row["settle_seq"] > params["after_settle_seq"]]
+                rows = rows[: params["limit"]]
+            response = make_response(200, rows)
             response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000004"
             return response
         if url.endswith("/deployment-evidence"):
             assert self.evidence is not None, "this test arranged no deployment evidence"
-            return make_response(200, self.evidence())
+            return make_response(200, deployment_wire(self.evidence()))
         if method == "POST" and url.endswith("/actions/apply"):
             self.apply_requests.append(kwargs.get("json"))
             return make_response(*self.apply_response())
@@ -8988,7 +9015,25 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
             carrier_job_id=terminal["carrier_job_id"],
             carrier_job_status=terminal["carrier_job_status"],
         )
-        recovery = _ApplyBoundaryAdapter(replay, evidence=lambda: known if replayed else unknown, generations=[listing])
+        job = {
+            "id": terminal["carrier_job_id"],
+            "type": "apply",
+            "device_id": adapter_device_id,
+            "status": terminal["carrier_job_status"],
+            "result": terminal["carrier_job_result"],
+            "row_outcomes": terminal["row_outcomes"],
+            "refusals": terminal["refusals"],
+            "error": terminal["carrier_job_error"],
+            "context": None,
+            "created_at": terminal["updated_at"],
+            "updated_at": terminal["updated_at"],
+            "started_at": None,
+            "heartbeat_at": None,
+            "settle_seq": 1,
+        }
+        recovery = _ApplyBoundaryAdapter(
+            replay, evidence=lambda: known if replayed else unknown, generations=[listing], jobs=[job]
+        )
         config, session = recovery.patches()
         with config, session:
             settle_device_apply_attempts(self.mgmt)

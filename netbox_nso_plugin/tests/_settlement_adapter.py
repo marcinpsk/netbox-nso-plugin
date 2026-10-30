@@ -23,6 +23,8 @@ from uuid import uuid4
 
 import requests
 
+from ._settlement_wire import deployment_wire, generation_wire, job_wire
+
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 GENERATION_RESPONSE_FIELDS = frozenset(
     {
@@ -296,7 +298,7 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path.endswith("/deployment-evidence"):
             device_id = self._device_id_from_path(parsed)
             requested = self._body()["apply_attempt_ids"]
-            self._send(200, store.deployment_evidence(device_id, requested))
+            self._send(200, deployment_wire(store.deployment_evidence(device_id, requested)))
             return
 
         if parsed.path == "/api/v1/devices":
@@ -377,7 +379,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(503, {"error": {"code": "nso_error", "message": "the jobs list is unavailable"}})
                     return
                 rows = store.recent(int(device_id), limit)
-            self._send(200, rows, headers={STORE_INCARNATION_HEADER: store.incarnation})
+            self._send(200, [job_wire(row) for row in rows], headers={STORE_INCARNATION_HEADER: store.incarnation})
             return
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/generations"):
@@ -389,7 +391,7 @@ class _Handler(BaseHTTPRequestHandler):
             cursor = int(query.get("since_seq") or 0)
             limit = int(query.get("limit") or 100)
             rows = [row for row in store.generations.get(device_id, []) if row["seq"] > cursor]
-            self._send(200, rows[:limit])
+            self._send(200, [generation_wire(row, device_id) for row in rows[:limit]])
             return
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/static-route-intent"):

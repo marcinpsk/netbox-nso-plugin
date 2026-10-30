@@ -141,6 +141,7 @@ def _remote_generations(management_id):
     try:
         _page, incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
         generations = adapter_client.list_device_generations(device_id)
+        adapter_client.raise_evidence_errors(generations)
         _page, final_incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
     except adapter_client.AdapterError as exc:
         if exc.code in ADAPTER_DOWN_CODES:
