@@ -528,16 +528,31 @@ def settle_apply_attempts(
         }
         | {generation["carrier_job_id"] for generation in getattr(deployment_evidence, "automatic_generations", ())}
     )
-    for carrier in sorted(carriers or {None}, key=lambda value: sequences.get(value, 0)):
+    passes = [(deployment_evidence, carrier) for carrier in sorted(carriers, key=lambda value: sequences.get(value, 0))]
+    if carrier_id is None:
+        # Carrier passes skip admissions that no carrier names, so an unscoped read ends with them.
+        passes.append((_carrierless_view(deployment_evidence) if carriers else deployment_evidence, None))
+    for evidence, carrier in passes:
         _settle_apply_carrier(
             management,
-            deployment_evidence,
+            evidence,
             carrier,
             required_attempt_ids=required_attempt_ids,
             store_incarnation=incarnation,
             before_settle=before_settle,
             after_settle=after_settle,
         )
+
+
+def _carrierless_view(evidence):
+    """Return bound evidence that holds only the admissions that no carrier names."""
+    view = _BoundEvidence(evidence)
+    view.__dict__.update(vars(evidence))
+    view["head"] = None
+    view["attempts"] = [attempt for attempt in evidence["attempts"] if not _attempt_generations(attempt)]
+    view.automatic_generations = []
+    view.manual_attempt_by_generation = {}
+    return view
 
 
 def _settle_apply_carrier(

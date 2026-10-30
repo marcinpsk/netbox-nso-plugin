@@ -392,3 +392,68 @@ class TestCommittedSettlementPrefix(CoalescedCarrierHelpers, BGPSettlementHelper
         self.assertEqual(vlan.status, "accepted")
         self.assertFalse(attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists())
         self.assertEqual(len(self.adapter.manual_reads), reads)
+
+    def test_direct_settlement_resolves_a_carrierless_admission_beside_a_carrier(self):
+        from uuid import UUID
+
+        import requests
+        from django.urls import reverse
+
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        from ._outbox_case import own_vlan
+        from .test_apply_selector import _no_op
+
+        self.prepare()
+        generation = self.terminal(refused=None)
+        vlan = own_vlan(self.management, 79, "carrierless")
+
+        def lost_answer(_selected):
+            raise requests.ConnectionError("The admission response was lost.")
+
+        self.adapter.apply_response = lost_answer
+        answer = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(answer.status_code, 502)
+        attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
+        self.assertIsNone(attempt.response)
+        no_op = _no_op(attempt.selected)
+        self.serve_terminal_evidence(generation, manual=True)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method != "POST" or not url.endswith("/deployment-evidence"):
+                return response
+            document = response.json()
+            document["unknown_apply_attempt_ids"] = [
+                value for value in document["unknown_apply_attempt_ids"] if value != str(attempt.pk)
+            ]
+            document["attempts"].append(
+                make_evidence_envelope(
+                    {
+                        "apply_attempt_id": str(attempt.pk),
+                        "admission_state": "admitted",
+                        "http_status": 200,
+                        "response": no_op,
+                        "selected": attempt.selected,
+                        "generation_ids": [],
+                    },
+                    identity={"device_id": self.management.adapter_device_id, "apply_attempt_id": str(attempt.pk)},
+                    generations=[],
+                )
+            )
+            return make_response(200, document)
+
+        self.adapter._handle = handle
+        settle_device_apply_attempts(self.management)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.response, no_op)
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.status, "accepted")
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "in_sync")
