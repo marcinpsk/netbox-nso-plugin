@@ -7,7 +7,7 @@ import math
 from importlib.resources import files
 from uuid import UUID
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 _SCHEMA = json.loads(files("netbox_nso_plugin").joinpath("schemas/settlements.json").read_text(encoding="utf-8"))
 _ARRAY_COMPONENTS = frozenset({"JobEvidenceOut", "DeviceGenerationEvidenceOut"})
@@ -26,6 +26,20 @@ APPLY_SKIP_REASONS = frozenset(
 MAX_NESTING = 64
 # Every integer that settlement persists lands in a PostgreSQL bigint column.
 _INT64 = range(-(2**63), 2**63)
+_FORMAT_CHECKER = FormatChecker()
+
+
+@_FORMAT_CHECKER.checks("uuid")
+def valid_store_incarnation(value):
+    """Accept only canonical UUID strings at the settlement boundary."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
 VALIDATORS = {
     component: Draft202012Validator(
         {
@@ -36,19 +50,17 @@ VALIDATORS = {
                 else {"$ref": f"#/components/schemas/{component}"}
             ),
         },
-        format_checker=Draft202012Validator.FORMAT_CHECKER,
+        format_checker=_FORMAT_CHECKER,
     )
     for component in (*_ARRAY_COMPONENTS, "DeviceDeploymentEvidenceOut", "ActionApplyOut", "SettlementObservationOut")
 }
 _ITEM_VALIDATORS = {
-    name: Draft202012Validator(
-        {**_SCHEMA, "$ref": f"#/components/schemas/{name}"}, format_checker=Draft202012Validator.FORMAT_CHECKER
-    )
+    name: Draft202012Validator({**_SCHEMA, "$ref": f"#/components/schemas/{name}"}, format_checker=_FORMAT_CHECKER)
     for name in (*_ITEM_IDENTITIES, *_ITEM_IDENTITIES.values())
 }
 _DIGEST_VALIDATOR = Draft202012Validator(
     _SCHEMA["components"]["schemas"]["EvidenceErrorOut"]["properties"]["digest"],
-    format_checker=Draft202012Validator.FORMAT_CHECKER,
+    format_checker=_FORMAT_CHECKER,
 )
 
 
@@ -59,16 +71,6 @@ class _EvidenceProjection(dict):
         super().__init__(projection)
         self.evidence_identity = dict(identity)
         self.evidence_digest = digest
-
-
-def valid_store_incarnation(value):
-    """Accept only the canonical UUID string that identifies an adapter store."""
-    if not isinstance(value, str):
-        return False
-    try:
-        return str(UUID(value)) == value
-    except ValueError:
-        return False
 
 
 def _jsonb_text(value):

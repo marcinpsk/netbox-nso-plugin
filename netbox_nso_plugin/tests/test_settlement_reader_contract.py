@@ -475,12 +475,15 @@ def _deployment_target(body, location):
     return body["attempts"][0]["generations"][1]
 
 
+@pytest.mark.parametrize(
+    "invalid_uuid", ["not-a-uuid", "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF", "abcdefab1234456789ababcdefabcdef"]
+)
 @pytest.mark.parametrize("location", ["head", "attempt", "generation"])
-def test_deployment_invalid_identity_uuid_refuses_the_response(location):
+def test_deployment_invalid_identity_uuid_refuses_the_response(location, invalid_uuid):
     body = _deployment_envelope_page()
     target = _deployment_target(body, location)
-    target["identity"]["apply_attempt_id"] = "not-a-uuid"
-    target["projection"]["apply_attempt_id"] = "not-a-uuid"
+    target["identity"]["apply_attempt_id"] = invalid_uuid
+    target["projection"]["apply_attempt_id"] = invalid_uuid
     with _serve_response(make_response(200, body)), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
         _read_response("get_deployment_evidence")
     assert raised.value.reason == "invalid settlement evidence"
@@ -488,11 +491,14 @@ def test_deployment_invalid_identity_uuid_refuses_the_response(location):
     assert raised.value.settle_seq is None
 
 
+@pytest.mark.parametrize(
+    "invalid_uuid", ["not-a-uuid", "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF", "abcdefab1234456789ababcdefabcdef"]
+)
 @pytest.mark.parametrize("location", ["head", "attempt"])
-def test_deployment_invalid_projection_uuid_keeps_the_item_identity(location):
+def test_deployment_invalid_projection_uuid_keeps_the_item_identity(location, invalid_uuid):
     body = _deployment_envelope_page()
     target = _deployment_target(body, location)
-    target["projection"]["apply_attempt_id"] = "not-a-uuid"
+    target["projection"]["apply_attempt_id"] = invalid_uuid
     with _serve_response(make_response(200, body)):
         evidence = _read_response("get_deployment_evidence")
     decoded = _deployment_target(evidence, location)
@@ -510,9 +516,12 @@ def test_deployment_invalid_projection_uuid_keeps_the_item_identity(location):
         adapter_client.raise_item_error(child)
 
 
-def test_deployment_invalid_unknown_attempt_uuid_refuses_the_response():
+@pytest.mark.parametrize(
+    "invalid_uuid", ["not-a-uuid", "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF", "abcdefab1234456789ababcdefabcdef"]
+)
+def test_deployment_invalid_unknown_attempt_uuid_refuses_the_response(invalid_uuid):
     body = _deployment_envelope_page()
-    body["unknown_apply_attempt_ids"] = ["not-a-uuid"]
+    body["unknown_apply_attempt_ids"] = [invalid_uuid]
     with _serve_response(make_response(200, body)), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
         _read_response("get_deployment_evidence")
     assert raised.value.reason == "invalid settlement evidence"

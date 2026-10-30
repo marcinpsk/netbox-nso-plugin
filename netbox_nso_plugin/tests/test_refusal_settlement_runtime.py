@@ -601,6 +601,74 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(NSOApplyExecution.objects.count(), 2)
         self.assertEqual(self.adapter.apply_requests, [])
 
+    def test_noncanonical_attempt_identity_cannot_bypass_missing_generation_validation(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_evidence_envelope, make_response
+
+        self.prepare()
+        response = copy.deepcopy(self.attempt.response)
+        NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=None)
+        self.attempt.response = None
+        self.serve_terminal_evidence(self.terminal(refused=None), head=True)
+        original = self.adapter._handle
+        attempt_id = str(self.attempt.pk)
+        self.assertNotEqual(attempt_id, attempt_id.upper())
+        before = {}
+        for row in self.owners:
+            row.refresh_from_db()
+            before[row._meta.label_lower, row.pk] = (
+                row.status,
+                row.last_apply_at,
+                row.last_apply_error,
+                row.apply_attempt_id,
+            )
+
+        def missing_generation(method, url, **kwargs):
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                body = original(method, url, **kwargs).json()
+                body["head"]["identity"]["apply_attempt_id"] = attempt_id
+                body["head"]["projection"]["apply_attempt_id"] = attempt_id
+                body["attempts"] = [
+                    make_evidence_envelope(
+                        {
+                            "apply_attempt_id": attempt_id.upper(),
+                            "admission_state": "admitted",
+                            "http_status": 202,
+                            "response": response,
+                            "selected": self.attempt.selected,
+                            "generation_ids": [row["generation_id"] for row in response["generations"]],
+                        },
+                        identity={
+                            "device_id": self.management.adapter_device_id,
+                            "apply_attempt_id": attempt_id.upper(),
+                        },
+                        generations=[],
+                    )
+                ]
+                return make_response(200, body)
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = missing_generation
+        result = consume_static_route_settlements(self.management)
+
+        self.assertEqual(result.consumed, 0)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertIsNone(result.cursor)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertFalse(NSOApplyExecution.objects.exists())
+        self.assertEqual(self.management.settle_evidence_error["reason"], "invalid settlement evidence")
+        self.attempt.refresh_from_db()
+        self.assertIsNone(self.attempt.response)
+        for row in self.owners:
+            row.refresh_from_db()
+            self.assertEqual(
+                (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
+                before[row._meta.label_lower, row.pk],
+            )
+
     def test_failed_retry_metadata_records_an_identified_stall_before_older_carrier_reconstruction(self):
         from netbox_nso_plugin.refusal_display import settlement_stall_projection
         from netbox_nso_plugin.settlement import consume_static_route_settlements
