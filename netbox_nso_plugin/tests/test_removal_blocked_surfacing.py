@@ -26,7 +26,7 @@ from django.urls import reverse
 from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-from ._adapter_http import make_generation_listing, make_response, make_session
+from ._adapter_http import make_evidence_envelope, make_generation_listing, make_response, make_session
 from ._settlement_wire import generation_wire, job_wire
 
 User = get_user_model()
@@ -201,6 +201,8 @@ class BlockedRemovalTestBase(TestCase):
         apply_state_status=200,
         job_id=None,
         stored_jobs=(),
+        failed_generation_ids=(),
+        expected_status=200,
     ):
         """Hit device_nso_jobs with the adapter's job list canned at the transport.
 
@@ -233,7 +235,14 @@ class BlockedRemovalTestBase(TestCase):
                     cursor = params.get("since_seq", 0)
                     limit = params.get("limit", 100)
                     page = [row for row in generations if row["seq"] > cursor][:limit]
-                    return make_response(200, json_data=[generation_wire(row, 10) for row in page])
+                    wired = [generation_wire(row, 10) for row in page]
+                    wired = [
+                        make_evidence_envelope(None, identity=item["identity"], error="execution_contract")
+                        if item["identity"]["generation_id"] in failed_generation_ids
+                        else item
+                        for item in wired
+                    ]
+                    return make_response(200, json_data=wired)
                 if lookup := re.search(r"/api/v1/jobs/(\d+)$", url):
                     job_lookups.append(int(lookup.group(1)))
                     job = stored.get(int(lookup.group(1)))
@@ -252,10 +261,11 @@ class BlockedRemovalTestBase(TestCase):
                 query["since_seq"] = since_seq
             if job_id is not None:
                 query["job_id"] = job_id
+            self.client.raise_request_exception = False
             response = self.client.get(url, query)
         self.generation_request_params = generation_request_params
         self.job_lookups = job_lookups
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, expected_status)
         return json.loads(response.content)
 
 
@@ -482,6 +492,26 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
 
         self.assertEqual(self.job_lookups, [501])
         self.assertEqual(data["jobs"], _served([polled]))
+
+    def test_a_failed_unrequested_generation_keeps_the_status_strip(self):
+        generations = _device_generations()
+        jobs = [_removal_job(501, "vlan", "succeeded")]
+
+        data = self._get_jobs(jobs, generations=generations, generation_ids=(81,), failed_generation_ids=(90,))
+
+        self.assertEqual(data["generations"], [generations[0]])
+        self.assertEqual(data["jobs"], _served(jobs))
+
+    def test_a_failed_requested_generation_fails_closed(self):
+        data = self._get_jobs(
+            [],
+            generations=_device_generations(),
+            generation_ids=(81,),
+            failed_generation_ids=(81,),
+            expected_status=502,
+        )
+
+        self.assertEqual(data["error"], "The NSO adapter returned an invalid response. See the server log.")
 
     def test_a_non_integer_job_id_is_rejected(self):
         with patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG):
