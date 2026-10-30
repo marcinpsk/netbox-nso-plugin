@@ -219,6 +219,23 @@ class TestAttemptSettlement(TestCase):
             response=response if answered else None,
         )
 
+    def test_carrier_attempt_selection_reads_local_attempts_once(self):
+        from netbox_nso_plugin.apply_settlement import _BoundEvidence, _carrier_attempts
+
+        named = [self._local_attempt(uuid4(), 71, {"vlan": 1}) for _ in range(3)]
+        other = self._local_attempt(uuid4(), 72, {"vlan": 1})
+        read = _BoundEvidence(
+            {
+                "head": None,
+                "attempts": [{"apply_attempt_id": str(row.pk), "generations": []} for row in (*named, other)],
+            }
+        )
+        read.feed_jobs = []
+        read.generation_listing = []
+        with self.assertNumQueries(1):
+            kept = _carrier_attempts(self.management, read, 971)
+        self.assertEqual([raw["apply_attempt_id"] for raw in kept], [str(row.pk) for row in named])
+
     def test_generation_timestamps_accept_whole_and_fractional_seconds(self):
         from netbox_nso_plugin.apply_settlement import _parse_time
 

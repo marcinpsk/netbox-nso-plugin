@@ -908,9 +908,7 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
     if carrier_id is not None:
         if evidence["head"] is not None and evidence["head"]["carrier_job_id"] != carrier_id:
             evidence["head"] = None
-        evidence["attempts"] = [
-            raw for raw in evidence["attempts"] if _attempt_names_carrier(management, raw, read, carrier_id)
-        ]
+        evidence["attempts"] = _carrier_attempts(management, read, carrier_id)
     for raw in evidence["attempts"]:
         from .adapter_client import InvalidJobEvidence, raise_item_error
 
@@ -975,10 +973,25 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
     return bound
 
 
-def _attempt_names_carrier(management, raw, read, carrier_id):
-    """Keep attempts attached to their independently retained carrier admission."""
+def _carrier_attempts(management, read, carrier_id):
+    """Keep the attempts that name *carrier_id*, with one local attempt read."""
+    from django.db.models import F
+
     from .models import NSOApplyAttempt
 
+    local = NSOApplyAttempt.objects.filter(
+        management=management,
+        adapter_device_id=management.adapter_device_id,
+        pk__in=[raw["apply_attempt_id"] for raw in read["attempts"]],
+        trigger_kind="manual",
+        adapter_apply_attempt_id=F("pk"),
+    )
+    attempts = {str(attempt.pk): attempt for attempt in local}
+    return [raw for raw in read["attempts"] if _attempt_names_carrier(attempts, raw, read, carrier_id)]
+
+
+def _attempt_names_carrier(local_attempts, raw, read, carrier_id):
+    """Keep attempts attached to their independently retained carrier admission."""
     if any(_generation_names_carrier(row, read, carrier_id) for row in _attempt_generations(raw)):
         return True
     head = read["head"]
@@ -988,13 +1001,7 @@ def _attempt_names_carrier(management, raw, read, carrier_id):
         and head["carrier_job_id"] == carrier_id
     ):
         return True
-    local = NSOApplyAttempt.objects.filter(
-        management=management,
-        adapter_device_id=management.adapter_device_id,
-        pk=raw["apply_attempt_id"],
-        trigger_kind="manual",
-        adapter_apply_attempt_id=raw["apply_attempt_id"],
-    ).first()
+    local = local_attempts.get(raw["apply_attempt_id"])
     if local is None or local.response is None:
         return False
     generation_ids = _response_generation_ids(local.response)
