@@ -398,10 +398,16 @@ def document_projection(result):
     identities = {refusal_contract.logical_key(row) for row in result["row_outcomes"]}
     phrases = set()
     for cause, catalog in zip(attributed, projected["causes"], strict=True):
-        if any(refusal_contract.logical_key(logical) in identities for logical in cause["logical_rows"]):
+        logical_rows = cause["logical_rows"]
+        foreign = [
+            logical["row"] for logical in logical_rows if refusal_contract.logical_key(logical) not in identities
+        ]
+        if len(foreign) < len(logical_rows):
             phrases.add(f"{catalog['reason']}: {catalog['message']}")
         else:
-            row = catalog["row"]
+            foreign = [catalog["row"]]
+        # A mixed cause also names each linked row outside this Apply.
+        for row in foreign:
             phrases.add(
                 f"Blocked by {catalog['family']} {row['subject']} {row['key']} "
                 f"(not part of this Apply): {catalog['message']}"

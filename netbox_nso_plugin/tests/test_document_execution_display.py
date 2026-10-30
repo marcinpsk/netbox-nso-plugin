@@ -94,6 +94,21 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertIn("nothing committed", projected["summary"])
         self.assertIn("(not part of this Apply)", projected["summary"])
 
+    def test_mixed_cause_names_each_row_outside_this_apply(self):
+        self.prepare()
+        result = self.terminal()["carrier_job_result"]
+        cause = result["refusals"][0]
+        foreign = copy.deepcopy(cause["logical_rows"][0])
+        foreign["row"]["key"] = "f" * 64
+        cause["logical_rows"].append(foreign)
+        projected = document_projection(result)
+        self.assertIn(f"{cause['reason']}: {cause['message']}", projected["summary"])
+        self.assertIn(
+            f"Blocked by {cause['family']} {foreign['row']['subject']} {'f' * 64} "
+            f"(not part of this Apply): {cause['message']}",
+            projected["summary"],
+        )
+
     def test_dry_run_refusal_says_commit_not_attempted(self):
         self.prepare()
         result = self.terminal()["carrier_job_result"]
