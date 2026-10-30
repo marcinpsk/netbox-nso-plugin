@@ -8,11 +8,12 @@ from uuid import UUID
 import requests
 from django.urls import reverse
 
+from netbox_nso_plugin import adapter_client
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
 from netbox_nso_plugin.refusal_display import settlement_stall_projection
 from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-from ._adapter_http import make_evidence_envelope, make_response
+from ._adapter_http import make_evidence_envelope, make_generation_envelope, make_response
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import own_vlan
 from ._settlement_wire import generation_wire, job_wire
@@ -84,6 +85,116 @@ class CarrierIsolationHelpers:
 
 
 class TestCarrierIsolation(CarrierIsolationHelpers, CoalescedCarrierHelpers, BGPSettlementHelpers, BGPCaptureCase):
+    def serve_listing_only_generation(self, generation, *, pruned=False):
+        self.serve_terminal_evidence(generation, head=False, pruned=pruned)
+        original = self.adapter._handle
+        self.requested_attempts = []
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method != "POST" or not url.endswith("/deployment-evidence"):
+                return response
+            requested = kwargs["json"]["apply_attempt_ids"]
+            self.requested_attempts.append(requested)
+            document = response.json()
+            self.assertIsNone(document["head"])
+            self.assertEqual(document["attempts"], [])
+            if str(self.attempt.pk) in requested:
+                failed = make_generation_envelope(
+                    generation, device_id=self.management.adapter_device_id, error="projection_construction"
+                )
+                failed["projection"] = None
+                document["attempts"] = [
+                    make_evidence_envelope(
+                        {
+                            "apply_attempt_id": str(self.attempt.pk),
+                            "admission_state": "admitted",
+                            "http_status": 202,
+                            "response": self.attempt.response,
+                            "selected": self.attempt.selected,
+                            "generation_ids": [generation["generation_id"]],
+                        },
+                        identity={
+                            "device_id": self.management.adapter_device_id,
+                            "apply_attempt_id": str(self.attempt.pk),
+                        },
+                        generations=[failed],
+                    )
+                ]
+            return make_response(200, document)
+
+        self.adapter._handle = handle
+        evidence = adapter_client.get_deployment_evidence(self.management.adapter_device_id, [self.attempt.pk])
+        with self.assertRaises(adapter_client.InvalidJobEvidence):
+            adapter_client.raise_item_error(evidence["attempts"][0]["generations"][0])
+        self.requested_attempts.clear()
+        [listed] = adapter_client.list_device_generations(self.management.adapter_device_id)
+        adapter_client.raise_item_error(listed)
+        self.assertEqual(listed["generation_id"], generation["generation_id"])
+
+    def test_listing_only_generation_uses_independently_validated_feed_evidence(self):
+        self.prepare_automatic()
+        generation = self.terminal(refused=None)
+        self.serve_listing_only_generation(generation)
+
+        result = consume_static_route_settlements(self.management)
+
+        self.assertFalse(result.stalled)
+        self.assertTrue(result.drained)
+        self.assertEqual((result.consumed, result.cursor), (1, 1))
+        execution = NSOApplyExecution.objects.get(generation_id=generation["generation_id"])
+        self.assertEqual((execution.consumption_state, execution.settle_seq), ("consumed", 1))
+        self.assertIsNotNone(execution.consumed_at)
+        self.assertEqual(execution.terminal_projection["carrier_job_result"], generation["carrier_job_result"])
+        self.assertTrue(self.requested_attempts)
+        self.assertTrue(all(str(self.attempt.pk) not in requested for requested in self.requested_attempts))
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "in_sync")
+
+    def test_listing_only_generation_uses_an_ordered_consumed_certificate(self):
+        self.prepare_automatic()
+        generation = self.terminal(refused=None)
+        self.serve_terminal_evidence(generation, head=False)
+        self.assertFalse(consume_static_route_settlements(self.management).stalled)
+        execution = NSOApplyExecution.objects.get(generation_id=generation["generation_id"])
+        self.assertEqual((execution.consumption_state, execution.settle_seq), ("consumed", 1))
+        self.assertIsNotNone(execution.consumed_at)
+        before = self.owner_bookkeeping()
+        projection = copy.deepcopy(execution.terminal_projection)
+        self.serve_listing_only_generation(generation, pruned=True)
+
+        result = consume_static_route_settlements(self.management)
+
+        self.assertFalse(result.stalled)
+        self.assertTrue(result.drained)
+        self.assertEqual((result.consumed, result.cursor), (0, 1))
+        self.assertEqual(self.owner_bookkeeping(), before)
+        execution.refresh_from_db()
+        self.assertEqual(execution.terminal_projection, projection)
+        self.assertEqual(NSOApplyExecution.objects.count(), 1)
+        self.assertTrue(self.requested_attempts)
+        self.assertTrue(all(str(self.attempt.pk) not in requested for requested in self.requested_attempts))
+
+    def test_listing_only_generation_without_feed_or_certificate_fails_closed(self):
+        self.prepare_automatic()
+        generation = self.terminal(refused=None)
+        self.serve_listing_only_generation(generation, pruned=True)
+        before = self.owner_bookkeeping()
+
+        result = consume_static_route_settlements(self.management)
+
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertEqual((result.consumed, result.cursor), (0, None))
+        self.assertEqual(self.owner_bookkeeping(), before)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertEqual(settlement_stall_projection(self.management)["job_id"], generation["carrier_job_id"])
+        self.assertFalse(NSOApplyExecution.objects.filter(consumption_state="consumed").exists())
+        self.assertTrue(self.requested_attempts)
+        self.assertTrue(all(str(self.attempt.pk) not in requested for requested in self.requested_attempts))
+
     def test_locked_feed_without_result_rolls_back_retained_success(self):
         self.prepare()
         before = self.owner_bookkeeping()
