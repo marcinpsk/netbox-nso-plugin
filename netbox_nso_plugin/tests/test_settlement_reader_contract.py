@@ -14,7 +14,7 @@ from uuid import UUID
 import pytest
 
 from netbox_nso_plugin import adapter_client
-from netbox_nso_plugin.settlement_schemas import MAX_NESTING
+from netbox_nso_plugin.settlement_schemas import MAX_NESTING, canonical_uuid
 
 from ._adapter_http import make_evidence_envelope, make_generation_envelope, make_response, make_transport_session
 
@@ -932,3 +932,17 @@ def test_settlement_schema_publishes_observation_and_evidence_roots():
         "DeploymentAttemptEvidenceOut",
         "SettlementReceiptEvidenceOut",
     } <= schemas.keys()
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("abcdefab-1234-4567-89ab-abcdefabcdef", True),
+        ("ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF", False),
+        ("abcdefab1234456789ababcdefabcdef", False),
+        ("not-a-uuid", False),
+        (UUID(int=1), False),
+    ],
+)
+def test_canonical_uuid_accepts_only_the_canonical_string(value, expected):
+    assert canonical_uuid(value) is expected

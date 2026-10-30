@@ -21,7 +21,7 @@ from datetime import datetime
 import requests
 from django.conf import settings
 
-from .settlement_schemas import valid_store_incarnation, within_wire_bounds
+from .settlement_schemas import canonical_uuid, within_wire_bounds
 from .vault_refs import is_secret_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -1567,7 +1567,7 @@ def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
         },
     )
     incarnation = resp.headers.get(STORE_INCARNATION_HEADER)
-    if not valid_store_incarnation(incarnation):
+    if not canonical_uuid(incarnation):
         # An unknown store cannot validate the cursor epoch or identify a carrier.
         raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid settlement evidence")
     try:

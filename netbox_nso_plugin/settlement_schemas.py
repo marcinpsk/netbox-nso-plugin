@@ -30,8 +30,8 @@ _FORMAT_CHECKER = FormatChecker()
 
 
 @_FORMAT_CHECKER.checks("uuid")
-def valid_store_incarnation(value):
-    """Accept only canonical UUID strings at the settlement boundary."""
+def canonical_uuid(value):
+    """Accept only canonical UUID strings for every settlement `uuid` field."""
     if not isinstance(value, str):
         return False
     try:

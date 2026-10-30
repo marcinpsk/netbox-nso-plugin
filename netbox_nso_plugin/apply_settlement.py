@@ -12,7 +12,7 @@ from uuid import UUID
 from django.utils import timezone
 
 from .refusal_contract import GENERATION_FIELDS, ContractError
-from .settlement_schemas import APPLY_SKIP_REASONS, valid_store_incarnation
+from .settlement_schemas import APPLY_SKIP_REASONS, canonical_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -514,7 +514,7 @@ def settle_apply_attempts(
     if deployment_evidence["device_id"] != management.adapter_device_id:
         raise EvidenceInvariantError("deployment_mapping_changed")
     incarnation = store_incarnation or getattr(deployment_evidence, "store_incarnation", None)
-    if not valid_store_incarnation(incarnation):
+    if not canonical_uuid(incarnation):
         raise EvidenceInvariantError("missing_store_incarnation")
     sequences = getattr(deployment_evidence, "settlement_sequences", {})
     carrier_id = getattr(deployment_evidence, "carrier_id", None)
