@@ -457,3 +457,56 @@ class TestCommittedSettlementPrefix(CoalescedCarrierHelpers, BGPSettlementHelper
         for owner in self.owners:
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
+
+    def test_pending_admission_write_cannot_roll_back_an_identified_carrier(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        from .test_apply_settlement import _attempt, _payload
+
+        generations = self.prepare_carrier()
+        pending_id = uuid4()
+        pending = _attempt(pending_id, self.management.adapter_device_id, 83, {"vlan": 99}, "pending")
+        pending["response"]["job_id"] = None
+        pending["response"]["generations"][0]["job_id"] = None
+        pending["generations"][0].update(carrier_job_id=None, carrier_job_status=None)
+        local = NSOApplyAttempt.objects.create(
+            id=pending_id,
+            adapter_apply_attempt_id=pending_id,
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            selected=pending["response"]["selected"],
+            scope_revisions=pending["response"]["selected"],
+        )
+        evidence = _payload(
+            self.management.adapter_device_id,
+            [
+                {
+                    "apply_attempt_id": str(self.attempt.pk),
+                    "admission_state": "admitted",
+                    "http_status": 202,
+                    "response": self.attempt.response,
+                    "generations": generations,
+                },
+                pending,
+            ],
+        )
+        evidence.settlement_sequences = {501: 1}
+
+        def reject_pending_admission(execute, sql, params, many, context):
+            if sql.startswith("UPDATE") and NSOApplyAttempt._meta.db_table in sql and pending_id in params:
+                raise RuntimeError("Pending admission write crossed the carrier boundary")
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(reject_pending_admission):
+            settle_apply_attempts(self.management, evidence)
+
+        self.assertEqual(NSOApplyExecution.objects.filter(carrier_job_id=501, consumption_state="consumed").count(), 2)
+        self.assertFalse(NSOApplyExecution.objects.filter(generation_id=83).exists())
+        local.refresh_from_db()
+        self.assertIsNone(local.response)
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "in_sync")

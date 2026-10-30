@@ -528,6 +528,7 @@ def settle_apply_attempts(
         }
         | {generation["carrier_job_id"] for generation in getattr(deployment_evidence, "automatic_generations", ())}
     )
+    carriers.discard(None)
     passes = [(deployment_evidence, carrier) for carrier in sorted(carriers, key=lambda value: sequences.get(value, 0))]
     if carrier_id is None:
         # Carrier passes skip admissions that no carrier names, so an unscoped read ends with them.
