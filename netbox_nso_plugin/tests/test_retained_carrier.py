@@ -91,7 +91,7 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(adapter_client.list_device_generations(self.management.adapter_device_id), [row])
 
     def test_null_snapshot_blocks_until_the_terminal_carrier_is_retained(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
         self.prepare_automatic()
         generation = self.terminal(refused=None)
@@ -109,8 +109,9 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
                         )
                     ]
                 )
-                with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+                with self.assertRaises(adapter_client.InvalidJobEvidence) as raised:
                     settle_device_apply_attempts(self.management)
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
                 self.assertFalse(NSOApplyExecution.objects.filter(consumed_at__isnull=False).exists())
                 self.management.refresh_from_db()
                 self.assertIsNone(self.management.settle_cursor_seq)

@@ -427,6 +427,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             make_generation_listing(
                 generation_id=seq,
                 seq=seq,
+                status="settled" if seq == wanted else "pending",
                 job_id=wanted if seq == wanted else None,
                 carrier_job_id=wanted if seq == wanted else None,
                 carrier_job_status="succeeded" if seq == wanted else None,
@@ -495,6 +496,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             make_generation_listing(
                 generation_id=seq,
                 seq=seq,
+                status="settled" if seq == wanted else "pending",
                 job_id=wanted if seq == wanted else None,
                 carrier_job_id=wanted if seq == wanted else None,
                 carrier_job_status="succeeded" if seq == wanted else None,
