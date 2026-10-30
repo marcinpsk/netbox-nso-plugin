@@ -475,6 +475,50 @@ def _deployment_target(body, location):
     return body["attempts"][0]["generations"][1]
 
 
+@pytest.mark.parametrize("location", ["head", "attempt", "generation"])
+def test_deployment_invalid_identity_uuid_refuses_the_response(location):
+    body = _deployment_envelope_page()
+    target = _deployment_target(body, location)
+    target["identity"]["apply_attempt_id"] = "not-a-uuid"
+    target["projection"]["apply_attempt_id"] = "not-a-uuid"
+    with _serve_response(make_response(200, body)), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        _read_response("get_deployment_evidence")
+    assert raised.value.reason == "invalid settlement evidence"
+    assert raised.value.job_id is None
+    assert raised.value.settle_seq is None
+
+
+@pytest.mark.parametrize("location", ["head", "attempt"])
+def test_deployment_invalid_projection_uuid_keeps_the_item_identity(location):
+    body = _deployment_envelope_page()
+    target = _deployment_target(body, location)
+    target["projection"]["apply_attempt_id"] = "not-a-uuid"
+    with _serve_response(make_response(200, body)):
+        evidence = _read_response("get_deployment_evidence")
+    decoded = _deployment_target(evidence, location)
+    assert decoded.evidence_identity == target["identity"]
+    assert decoded.evidence_digest == target["digest"]
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(decoded)
+    assert raised.value.reason == "invalid settlement evidence"
+    children = (
+        evidence["attempts"][0].evidence_generations
+        if location == "attempt"
+        else evidence["attempts"][0]["generations"]
+    )
+    for child in children:
+        adapter_client.raise_item_error(child)
+
+
+def test_deployment_invalid_unknown_attempt_uuid_refuses_the_response():
+    body = _deployment_envelope_page()
+    body["unknown_apply_attempt_ids"] = ["not-a-uuid"]
+    with _serve_response(make_response(200, body)), pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        _read_response("get_deployment_evidence")
+    assert raised.value.reason == "invalid settlement evidence"
+    assert raised.value.job_id is None
+
+
 @pytest.mark.parametrize("location,projection_depth", [("head", 3), ("attempt", 4), ("generation", 6)])
 @pytest.mark.parametrize("failure", [None, "depth", "integer"])
 def test_deployment_item_wire_bounds_use_the_absolute_response_depth(location, projection_depth, failure):

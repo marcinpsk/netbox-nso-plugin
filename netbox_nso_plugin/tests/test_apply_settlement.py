@@ -687,7 +687,8 @@ class TestAttemptSettlement(TestCase):
         self.assertIsNone(extra.response)
 
     def test_a_malformed_attempt_record_is_rejected_before_any_replay(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
 
         attempt_id = uuid4()
         self._vlan_row(1652, attempt_id)
@@ -708,10 +709,12 @@ class TestAttemptSettlement(TestCase):
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(MalformedSession())),
-            self.assertRaisesRegex(EvidenceInvariantError, "invalid_apply_attempt_uuid"),
+            self.assertRaises(InvalidJobEvidence) as raised,
         ):
             load_deployment_evidence(self.management)
 
+        self.assertEqual(raised.exception.reason, "invalid settlement evidence")
+        self.assertIsNone(raised.exception.job_id)
         self.assertEqual(requests, ["deployment-evidence"])
         local.refresh_from_db()
         self.assertIsNone(local.http_status)
@@ -753,6 +756,7 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(raised.exception.code, "invalid_response")
 
     def test_invalid_unknown_attempt_in_replay_refetch_is_rejected(self):
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
 
         for unknown_id in ("not-a-uuid", str(uuid4())):
@@ -783,15 +787,17 @@ class TestAttemptSettlement(TestCase):
                     patch(
                         "netbox_nso_plugin.adapter_client._get_session", return_value=_epoch_session(ReplaySession())
                     ),
-                    self.assertRaisesRegex(
-                        EvidenceInvariantError,
-                        "invalid_unknown_attempt_uuid"
-                        if unknown_id == "not-a-uuid"
-                        else "unrequested_unknown_apply_attempt",
-                    ),
+                    self.assertRaises(
+                        InvalidJobEvidence if unknown_id == "not-a-uuid" else EvidenceInvariantError
+                    ) as raised,
                 ):
                     load_deployment_evidence(self.management, attempt_ids=[attempt_id])
 
+                if unknown_id == "not-a-uuid":
+                    self.assertEqual(raised.exception.reason, "invalid settlement evidence")
+                    self.assertIsNone(raised.exception.job_id)
+                else:
+                    self.assertEqual(str(raised.exception), "unrequested_unknown_apply_attempt")
                 self.assertEqual(requests, ["deployment-evidence", "apply", "deployment-evidence"])
                 local.refresh_from_db()
                 self.assertIsNone(local.http_status)

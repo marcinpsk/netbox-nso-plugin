@@ -35,15 +35,21 @@ VALIDATORS = {
                 if component in _ARRAY_COMPONENTS
                 else {"$ref": f"#/components/schemas/{component}"}
             ),
-        }
+        },
+        format_checker=Draft202012Validator.FORMAT_CHECKER,
     )
     for component in (*_ARRAY_COMPONENTS, "DeviceDeploymentEvidenceOut", "ActionApplyOut", "SettlementObservationOut")
 }
 _ITEM_VALIDATORS = {
-    name: Draft202012Validator({**_SCHEMA, "$ref": f"#/components/schemas/{name}"})
+    name: Draft202012Validator(
+        {**_SCHEMA, "$ref": f"#/components/schemas/{name}"}, format_checker=Draft202012Validator.FORMAT_CHECKER
+    )
     for name in (*_ITEM_IDENTITIES, *_ITEM_IDENTITIES.values())
 }
-_DIGEST_VALIDATOR = Draft202012Validator(_SCHEMA["components"]["schemas"]["EvidenceErrorOut"]["properties"]["digest"])
+_DIGEST_VALIDATOR = Draft202012Validator(
+    _SCHEMA["components"]["schemas"]["EvidenceErrorOut"]["properties"]["digest"],
+    format_checker=Draft202012Validator.FORMAT_CHECKER,
+)
 
 
 class _EvidenceProjection(dict):

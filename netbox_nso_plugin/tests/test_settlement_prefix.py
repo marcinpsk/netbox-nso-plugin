@@ -160,6 +160,41 @@ class TestCommittedSettlementPrefix(CoalescedCarrierHelpers, BGPSettlementHelper
 
         self.adapter._handle = handle
 
+    def test_invalid_attempt_identity_records_a_stall_without_advancing_the_cursor(self):
+        generations = self.prepare_carrier()
+        self.serve_carriers(generations)
+        self.management.refresh_from_db()
+        cursor = self.management.settle_cursor_seq
+        original = self.adapter._handle
+
+        def malformed_identity(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method != "POST" or not url.endswith("/deployment-evidence"):
+                return response
+            body = response.json()
+            attempt = body["attempts"][0]
+            attempt["identity"]["apply_attempt_id"] = "not-a-uuid"
+            attempt["projection"]["apply_attempt_id"] = "not-a-uuid"
+            attempt["generations"] = []
+            return make_response(response.status_code, body)
+
+        self.adapter._handle = malformed_identity
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertEqual(result.consumed, 0)
+        self.assertEqual(result.cursor, cursor)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_cursor_seq, cursor)
+        issue = settlement_stall_projection(self.management)
+        self.assertEqual(issue["reason"], "invalid settlement evidence")
+        self.assertNotIn("job_id", issue)
+        self.assertNotIn("identity", issue)
+        self.assertFalse(NSOApplyExecution.objects.filter(consumption_state="consumed").exists())
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "deploying")
+
     def test_identified_error_commits_the_complete_prefix_and_stops_before_the_suffix(self):
         generations = self.prepare_carrier()
         self.serve_carriers(generations)
