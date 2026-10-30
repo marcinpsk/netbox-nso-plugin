@@ -803,7 +803,18 @@ def test_receipt_nesting_bound_keeps_the_reader_exception_contract(depth):
         assert raised.value.code == "invalid_response"
 
 
-@pytest.mark.parametrize("failure", ["provenance", "timestamp", "carrier", "order"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "provenance",
+        "timestamp",
+        "carrier",
+        "order",
+        "unpaired_carrier_status",
+        "settled_failed_carrier",
+        "settled_missing_carrier",
+    ],
+)
 def test_generation_semantic_failures_keep_trusted_item_identity(failure):
     from ._adapter_http import make_generation_listing
 
@@ -814,6 +825,12 @@ def test_generation_semantic_failures_keep_trusted_item_identity(failure):
         row["updated_at"] = "2026-01-02T03:04:05"
     elif failure == "carrier":
         row["job_id"] += 1
+    elif failure == "settled_failed_carrier":
+        row["carrier_job_status"] = "failed"
+    elif failure == "settled_missing_carrier":
+        row.update(carrier_job_id=None, carrier_job_status=None)
+    elif failure == "unpaired_carrier_status":
+        row.update(status="failed", carrier_job_id=None)
     page = [row, {**row, "seq": row["seq"] + 1}] if failure == "order" else [row]
     response = make_response(200, [make_generation_envelope(item) for item in page])
     with _serve_response(response):
@@ -823,6 +840,78 @@ def test_generation_semantic_failures_keep_trusted_item_identity(failure):
     assert raised.value.device_id == 7
     assert raised.value.job_id == row["carrier_job_id"]
     assert raised.value.reason == "invalid settlement evidence"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generation_id", 0),
+        ("generation_id", True),
+        ("seq", -1),
+        ("seq", False),
+        ("status", "invalid"),
+        ("job_id", 0),
+        ("job_id", True),
+        ("carrier_job_id", -1),
+        ("carrier_job_id", True),
+        ("settlement_cohort", 0),
+        ("settlement_cohort", False),
+        ("stream_revisions", {"bgp": 0}),
+        ("stream_revisions", {"bgp": True}),
+        ("stream_revisions", {"bgp": None}),
+        ("stream_revisions", []),
+        ("source_push_seq", {"bgp": -1}),
+        ("source_push_seq", {"bgp": False}),
+        ("source_push_seq", []),
+        ("source_push_seq", {}),
+        ("created_at", "invalid"),
+        ("created_at", "2026-01-02T03:04:05"),
+        ("updated_at", "invalid"),
+        ("updated_at", "2026-01-02T03:04:05"),
+        ("carrier_job_status", "partial"),
+        ("carrier_job_status", None),
+        ("job_id", 502),
+    ],
+)
+def test_generation_listing_rejects_invalid_shared_and_admission_metadata(field, value):
+    from ._adapter_http import make_generation_listing
+
+    row = make_generation_listing(status="failed")
+    envelope = make_generation_envelope(row)
+    envelope["projection"] = {**row, field: value}
+    with _serve_response(make_response(200, [envelope])):
+        [item] = adapter_client.list_device_generations(7)
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(item)
+    assert raised.value.reason == "invalid settlement evidence"
+    assert raised.value.device_id == 7
+    assert raised.value.job_id == row["carrier_job_id"]
+    assert item.evidence_identity == envelope["identity"]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"status": "pending", "job_id": 502},
+        {"status": "running", "job_id": 502},
+        {"status": "failed", "carrier_job_id": None, "carrier_job_status": None},
+        {"status": "outcome_unknown", "carrier_job_status": "failed"},
+        {"status": "abandoned", "job_id": None},
+        {"source_push_seq": {"bgp": None}},
+        {"source_push_seq": {"bgp": 1, "vlan": None}},
+        {"settlement_cohort": None},
+        {"created_at": "2026-01-02T03:04:05Z", "updated_at": "2026-01-02T03:04:05.123456Z"},
+    ],
+)
+def test_generation_listing_accepts_valid_shared_and_admission_metadata(metadata):
+    from ._adapter_http import make_generation_listing
+
+    row = make_generation_listing(**metadata)
+    with _serve_response(make_response(200, [make_generation_envelope(row)])):
+        [item] = adapter_client.list_device_generations(7)
+    adapter_client.raise_item_error(item)
+    assert item == row
 
 
 JSONB_REJECTED = {

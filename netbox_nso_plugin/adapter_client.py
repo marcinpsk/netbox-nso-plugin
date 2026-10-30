@@ -1434,25 +1434,6 @@ def list_jobs(adapter_device_id):
     return jobs
 
 
-GENERATION_LISTING_FIELDS = frozenset(
-    {
-        "generation_id",
-        "seq",
-        "status",
-        "job_id",
-        "carrier_job_id",
-        "carrier_job_status",
-        "mode",
-        "settlement_cohort",
-        "digest",
-        "stream_revisions",
-        "source_push_seq",
-        "created_at",
-        "updated_at",
-    }
-)
-
-
 def _positive_generation_int(value):
     return type(value) is int and value > 0
 
@@ -1466,32 +1447,21 @@ def _aware_generation_timestamp(value):
         return False
 
 
-def _generation_provenance(mapping, *, nullable=False):
-    return isinstance(mapping, dict) and all(
-        isinstance(key, str) and (_positive_generation_int(value) or nullable and value is None)
-        for key, value in mapping.items()
-    )
-
-
 def _validated_generation_listing(row, device_id):
-    from .refusal_contract import GENERATION_STATUSES
+    from .execution_contract import ContractError, validate_generation_listing
+
+    try:
+        validate_generation_listing(row)
+    except ContractError as exc:
+        raise InvalidJobEvidence(
+            {"device_id": device_id, "id": row["carrier_job_id"]}, "invalid settlement evidence"
+        ) from exc
 
     valid = (
-        all(_positive_generation_int(row[key]) for key in ("generation_id", "seq"))
-        and all(
-            row[key] is None or _positive_generation_int(row[key])
-            for key in ("job_id", "carrier_job_id", "settlement_cohort")
-        )
-        and row["status"] in GENERATION_STATUSES
-        and _generation_provenance(row["stream_revisions"])
-        and _generation_provenance(row["source_push_seq"], nullable=True)
+        all(row[key] is None or _positive_generation_int(row[key]) for key in ("job_id", "settlement_cohort"))
         and row["stream_revisions"].keys() <= row["source_push_seq"].keys()
-        and all(_aware_generation_timestamp(row[key]) for key in ("created_at", "updated_at"))
+        and _aware_generation_timestamp(row["created_at"])
         and (row["carrier_job_id"] is None) == (row["carrier_job_status"] is None)
-        and (
-            row["carrier_job_status"] is None
-            or row["carrier_job_status"] in {"queued", "running", "succeeded", "failed"}
-        )
         and (
             row["status"] in {"pending", "running"}
             or row["carrier_job_id"] is None
