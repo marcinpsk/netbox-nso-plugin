@@ -3,7 +3,9 @@
 """Bound the adapter response boundaries in the direct settlement call graph."""
 
 import ast
+import json
 from contextlib import contextmanager
+from importlib.resources import files
 from importlib.util import resolve_name
 from pathlib import Path
 from unittest.mock import patch
@@ -914,3 +916,19 @@ def test_receipt_integer_bound_keeps_the_reader_exception_contract(field):
         adapter_client.get_intent_receipts(device_id=7)
     assert type(raised.value) is adapter_client.AdapterError
     assert raised.value.code == "invalid_response"
+
+
+def test_settlement_schema_publishes_observation_and_evidence_roots():
+    schemas = json.loads(files("netbox_nso_plugin").joinpath("schemas/settlements.json").read_text(encoding="utf-8"))[
+        "components"
+    ]["schemas"]
+    assert {
+        "SettlementObservationIn",
+        "SettlementObservationOut",
+        "JobEvidenceOut",
+        "DeviceGenerationEvidenceOut",
+        "DeploymentGenerationEvidenceOut",
+        "DeploymentHeadEvidenceOut",
+        "DeploymentAttemptEvidenceOut",
+        "SettlementReceiptEvidenceOut",
+    } <= schemas.keys()

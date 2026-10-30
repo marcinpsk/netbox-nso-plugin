@@ -2,7 +2,6 @@
 # Copyright (C) 2026 Marcin Zieba
 """Regenerate observation schemas from the live-adapter job's sibling checkout."""
 
-import json
 import os
 import subprocess
 import sys
@@ -36,20 +35,3 @@ def test_vendored_response_schemas_match_adapter_snapshot(tmp_path, name, option
     assert output.read_text(encoding="utf-8") == (root / f"netbox_nso_plugin/schemas/{name}.json").read_text(
         encoding="utf-8"
     )
-
-
-def test_settlement_schema_publishes_observation_and_evidence_roots():
-    root = Path(__file__).resolve().parents[1]
-    schemas = json.loads((root / "netbox_nso_plugin/schemas/settlements.json").read_text(encoding="utf-8"))[
-        "components"
-    ]["schemas"]
-    assert {
-        "SettlementObservationIn",
-        "SettlementObservationOut",
-        "JobEvidenceOut",
-        "DeviceGenerationEvidenceOut",
-        "DeploymentGenerationEvidenceOut",
-        "DeploymentHeadEvidenceOut",
-        "DeploymentAttemptEvidenceOut",
-        "SettlementReceiptEvidenceOut",
-    } <= schemas.keys()
