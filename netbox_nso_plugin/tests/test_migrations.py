@@ -96,7 +96,7 @@ class TestMigrationGraph(SimpleTestCase):
         loader = MigrationLoader(None, ignore_no_migrations=True)
         leaves = sorted(name for app, name in loader.graph.leaf_nodes() if app == APP)
 
-        assert leaves == ["0038_settlement_evidence_error"]
+        assert leaves == ["0039_settlement_issue"]
         assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
         state = loader.project_state([(APP, leaves[0])])
         for name in (
@@ -104,6 +104,8 @@ class TestMigrationGraph(SimpleTestCase):
             "nsoapplyexecution",
             "nsoapplyoverlaysnapshot",
             "nsooverlaysettlementfence",
+            "nsosettlementissue",
+            "nsosettlementissueowner",
             "nsobgprouterstate",
         ):
             assert (APP, name) in state.models, f"missing refusal ledger model: {name}"

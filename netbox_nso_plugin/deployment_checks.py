@@ -15,8 +15,7 @@ def check_contracts():
     executor = MigrationExecutor(connection)
     _require(not executor.migration_plan(executor.loader.graph.leaf_nodes()), "Database migration heads are pending")
     _require(
-        executor.loader.graph.leaf_nodes("netbox_nso_plugin")
-        == [("netbox_nso_plugin", "0038_settlement_evidence_error")],
+        executor.loader.graph.leaf_nodes("netbox_nso_plugin") == [("netbox_nso_plugin", "0039_settlement_issue")],
         "Unexpected plugin migration head",
     )
 
