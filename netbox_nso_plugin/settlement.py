@@ -53,7 +53,10 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
 
     pk = getattr(mgmt, "pk", mgmt)
     management = NSODeviceManagement.objects.get(pk=pk)
+    # Only a pass that saw the resume request before its reads may clear it.
+    resume = management.settle_resume_pending
     fence = request_fence(management)
+    acknowledged = _acknowledged_job_keys(pk)
     epoch = fence["mapping_epoch"]
     read = None
     consumed = 0
@@ -100,18 +103,47 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
         if read is not None and drained:
             management.refresh_from_db()
             fence = request_fence(management)
-            return _complete_evidence_result(result, read, management, fence, expected_fence, epoch)
+            result = _complete_evidence_result(result, read, management, fence, expected_fence, epoch)
+        # A pass without the evidence read did not walk the history that an acknowledgement released.
+        if drained and resume and read is not None:
+            _clear_resume_request(pk, expected_fence)
         return result
     except _SettlementReadChanged:
         management.refresh_from_db()
         return ConsumeResult(management.adapter_device_id, consumed, True, epoch_reset, management.settle_cursor_seq)
     except adapter_client.InvalidJobEvidence as exc:
-        stall = _invalid_evidence_stall(management, fence, exc, "invalid_evidence")
+        stall = _invalid_evidence_stall(management, fence, acknowledged, exc, "invalid_evidence")
     except EvidenceInvariantError as exc:
         logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
-        stall = _invariant_evidence_stall(management, fence, exc)
+        stall = _invariant_evidence_stall(management, fence, acknowledged, exc)
     _publish_stall_issue(pk)
     return replace(stall, consumed=consumed, epoch_reset=epoch_reset)
+
+
+def _clear_resume_request(pk, fence):
+    """Clear the resume request after a drained pass, unless the cursor moved after the walk."""
+    from .intent_state import mirror_refresh
+    from .models import NSODeviceManagement
+    from .settlement_evidence import matches_request_fence
+    from .signals import suppress_intent_push
+
+    with transaction.atomic():
+        row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
+        if not row.settle_resume_pending or not matches_request_fence(row, fence):
+            return
+        with suppress_intent_push(), mirror_refresh(row, ("settle_resume_pending",)) as locked:
+            locked.settle_resume_pending = False
+            locked.save(update_fields=("settle_resume_pending",))
+
+
+def request_settlement_pass(device_id):
+    """Enqueue the normal settlement pass; the durable resume request and the sweep cover a lost enqueue."""
+    from .reconcile import enqueue_device_reconcile
+
+    try:
+        enqueue_device_reconcile(device_id)
+    except Exception:  # noqa: BLE001 - the resume request is committed, and the sweep is the retry clock
+        logger.exception("Could not enqueue the settlement pass for device %s", device_id)
 
 
 def _publish_stall_issue(pk):
@@ -320,21 +352,38 @@ def _historical_carriers(read, management):
     )
 
 
-def _invariant_evidence_stall(management, fence, error):
+def _invariant_evidence_stall(management, fence, acknowledged, error):
     """Persist the invariant through its request fence."""
     from .settlement_evidence import invariant_code
 
     invalid_job = getattr(error, "invalid_job", adapter_client.InvalidJobEvidence({}, "invalid settlement evidence"))
-    return _invalid_evidence_stall(management, fence, invalid_job, "evidence_invariant", invariant_code(error))
+    return _invalid_evidence_stall(
+        management, fence, acknowledged, invalid_job, "evidence_invariant", invariant_code(error)
+    )
 
 
-def _invalid_evidence_stall(management, fence, error, stall_class, code=None):
-    """Retain invalid evidence without advancing its settlement cursor."""
+def _acknowledged_job_keys(pk):
+    from .models import NSOSettlementIssue
+
+    return frozenset(
+        NSOSettlementIssue.objects.filter(management_id=pk, state="acknowledged").values_list(
+            "store_incarnation", "job_id"
+        )
+    )
+
+
+def _invalid_evidence_stall(management, fence, acknowledged, error, stall_class, code=None):
+    """Retain invalid evidence without advancing its settlement cursor.
+
+    A pass does not write a stall of a job that an acknowledgement released after the pass began. A historical
+    acknowledgement keeps the request fence, and the resume request of the acknowledgement owes a fresh pass.
+    """
     from .models import NSODeviceManagement
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
-        write_diagnostic(row, fence, error, stall_class=stall_class, code=code)
+        if (error.store_incarnation, error.job_id) not in _acknowledged_job_keys(row.pk) - acknowledged:
+            write_diagnostic(row, fence, error, stall_class=stall_class, code=code)
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
 
 
@@ -349,6 +398,7 @@ def sweep_static_route_settlements() -> tuple[int, int]:
     This independent clock can recover when the adapter cannot deliver callbacks.
     Query candidates after link repair so each poll uses the current mapping.
     Include every registered delivery scope and every sent selection that cadence or retry can still execute.
+    Include every device with a resume request from an acknowledgement.
     Keep each device's failure separate so one outage does not stop the sweep.
     """
     from . import status_machine as sm
@@ -375,6 +425,11 @@ def sweep_static_route_settlements() -> tuple[int, int]:
             accepted_selections__publication_state="sent",
             accepted_selections__binding_state__in=("unbound", "bound"),
         ).values_list("pk", flat=True)
+    )
+    candidate_pks.update(
+        NSODeviceManagement.objects.filter(adapter_device_id__isnull=False, settle_resume_pending=True).values_list(
+            "pk", flat=True
+        )
     )
     candidates = sorted(candidate_pks)
     polled = 0

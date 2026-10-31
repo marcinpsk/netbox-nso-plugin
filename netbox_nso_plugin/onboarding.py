@@ -668,11 +668,11 @@ def advance_provisioning(mgmt) -> dict:
 
 def _fail_untracked_provisioning(mgmt) -> dict:
     """Terminate a provisioning row that no open provision attempt can ever complete."""
+    from .apply_state import lock_device_management
     from .management_lifecycle import save_management
-    from .models import NSODeviceManagement
 
     with transaction.atomic():
-        current = NSODeviceManagement.objects.select_for_update().filter(pk=mgmt.pk).first()
+        current = lock_device_management(mgmt.device_id, pk=mgmt.pk)
         if current is None:
             return {"status": "deleted", "error": None}
         if current.onboard_status != "provisioning":

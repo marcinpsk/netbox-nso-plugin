@@ -43,6 +43,7 @@ from netbox_nso_plugin.request_authorization import (
     Management,
     OverlayFamily,
     OverlayRow,
+    SettlementIssueAcknowledgement,
     missing_authz_targets,
     uncovered_routes,
     view_class_of,
@@ -468,6 +469,8 @@ class TestExcludedTargetCensus(IntentPushResetMixin, TestCase):
                 yield {"key": key, "pk": self.rows_b[model].pk}
         elif isinstance(target, IntegrationSync):
             yield {}
+        elif isinstance(target, SettlementIssueAcknowledgement):
+            yield {target.kwarg: self.device_b.pk}
         else:
             self.fail(f"the census has no case for target kind {type(target).__name__}")
 
@@ -496,7 +499,12 @@ class TestExcludedTargetCensus(IntentPushResetMixin, TestCase):
     def _operator(self):
         """Grant every model permission the routes need; management actions only on A."""
         user = User.objects.create_user(username=f"authz-operator-{uuid4().hex[:6]}")
-        _grant(user, ("view", "change", "add", "sync"), NSODeviceManagement, {"pk": self.management_a.pk})
+        _grant(
+            user,
+            ("view", "change", "add", "sync", "acknowledge_settlement_issue"),
+            NSODeviceManagement,
+            {"pk": self.management_a.pk},
+        )
         needed = set()
         for _pattern, _method, _kwargs, policy in self._cases():
             needed.update(policy.target.permissions())
@@ -534,6 +542,7 @@ class TestExcludedTargetCensus(IntentPushResetMixin, TestCase):
             "overlay_field_edit",
             "routing_bulk_accept_static_routes",
             "generation_retry",
+            "settlement_issue_acknowledge",
             "sync_complete",
         ):
             self.assertIn(expected, names)

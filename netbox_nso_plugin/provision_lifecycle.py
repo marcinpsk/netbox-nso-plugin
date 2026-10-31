@@ -238,6 +238,7 @@ def _complete_terminal_attempt(tombstone, inventory_cache) -> bool:
 
     from . import adapter_client
     from .adapter_client import AdapterError
+    from .apply_state import lock_device_intent_transaction
     from .models import NSODeviceManagement, NSOProvisionTombstone
 
     provision_attempt_id = tombstone.provision_attempt_id
@@ -249,6 +250,8 @@ def _complete_terminal_attempt(tombstone, inventory_cache) -> bool:
         )
         if tombstone.state != "terminal":
             return False
+        # The completion saves this device's management row, so its intent lock comes first (L4 before L5).
+        lock_device_intent_transaction(tombstone.netbox_device_id)
         # of=("self",): the joined NSOInstance row is shared by every device on the instance.
         relevant_management = (
             NSODeviceManagement.objects.select_for_update(of=("self",))
@@ -304,8 +307,8 @@ def _complete_terminal_attempt(tombstone, inventory_cache) -> bool:
             )
             return False
 
-        # An orphan matches no management row, so the adapter calls below hold the tombstone
-        # fence alone. No device, management, or instance row is locked across them.
+        # The adapter calls below hold the tombstone fence and the device intent lock, but no row lock.
+        # Quick Manage takes only the intent lock, so it cannot adopt the adapter device during the delete.
         adapter_device_id = tombstone.adapter_device_id
         ambiguous = False
         if adapter_device_id is None:

@@ -49,6 +49,13 @@ def _device_is_editable(device_pk) -> bool:
     return _in_second_connection(lambda: Device.objects.filter(pk=device_pk).update(description="foreign edit"))
 
 
+def _device_intent_is_free(device_pk) -> bool:
+    """Report whether a second connection can take the device intent lock right now."""
+    from netbox_nso_plugin.apply_state import lock_device_intent_transaction
+
+    return _in_second_connection(lambda: lock_device_intent_transaction(device_pk))
+
+
 def _row_is_lockable(model, **filters) -> bool:
     """Report whether a second connection can take the row lock right now."""
     return _in_second_connection(lambda: list(model.objects.select_for_update().filter(**filters)))
@@ -1170,6 +1177,32 @@ class TestProvisionSweepLockWindow(_CascadeFlushMixin, TransactionTestCase):
 
         self.assertEqual((checked, closed), (1, 1))
         self.assertEqual(observed, {"device": True, "instance": True})
+
+    def test_the_orphan_offboard_keeps_quick_manage_out_until_the_delete_commits(self):
+        """Quick Manage creates the management row under the device intent lock, not the tombstone fence."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import manage_existing
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        device, instance, _management, tombstone = self._terminal_attempt(
+            "provision-offboard-quick-manage",
+            with_management=False,
+        )
+        observed = {}
+
+        def quick_manage():
+            observed["managed"] = manage_existing(device, instance, tombstone.nso_device_name)["managed"]
+
+        def offboard(_adapter_device_id):
+            observed["intent"] = _device_intent_is_free(device.pk)
+            _in_second_connection(quick_manage)
+
+        with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device", side_effect=offboard):
+            checked, closed = sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        self.assertEqual((checked, closed), (1, 1))
+        self.assertEqual(observed, {"intent": False, "managed": False})
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
 
     def test_the_completion_save_does_not_pin_the_shared_instance_row(self):
         """Every device on the instance shares that row; the completion must not lock it.

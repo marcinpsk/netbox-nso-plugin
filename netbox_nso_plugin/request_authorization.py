@@ -301,6 +301,51 @@ class Management(TargetSpec):
         )
 
 
+def _acknowledging_managements(user):
+    """Return the managements inside both the change and the acknowledge restrictions of *user*."""
+    from .refusal_ledger import ACKNOWLEDGE_SETTLEMENT_ISSUE
+
+    return _managements(user, "change").filter(pk__in=_managements(user, ACKNOWLEDGE_SETTLEMENT_ISSUE).values("pk"))
+
+
+def _acknowledge_permissions():
+    from .refusal_ledger import ACKNOWLEDGE_SETTLEMENT_ISSUE
+
+    return (*_management_permissions("change"), *_management_permissions(ACKNOWLEDGE_SETTLEMENT_ISSUE))
+
+
+def may_acknowledge_settlement(user, management) -> bool:
+    """Return whether *user* may acknowledge a settlement issue of *management*."""
+    return (
+        management is not None
+        and all(user.has_perm(permission) for permission in _acknowledge_permissions())
+        and _acknowledging_managements(user).filter(pk=management.pk).exists()
+    )
+
+
+@dataclass(frozen=True)
+class SettlementIssueAcknowledgement(TargetSpec):
+    """One settlement issue of a device's management, posted as ``issue``: change and acknowledge, each restricted."""
+
+    kwarg: str = "pk"
+
+    def permissions(self):  # noqa: D102
+        return _acknowledge_permissions()
+
+    def resolve(self, request, user, kwargs):  # noqa: D102
+        from .models import NSOSettlementIssue
+
+        management = get_object_or_404(_acknowledging_managements(user), device_id=kwargs[self.kwarg])
+        issue_pk = parse_object_id(request.POST.get("issue", ""))
+        if issue_pk is None:
+            raise BadRequest("Invalid settlement issue identity")
+        issues = NSOSettlementIssue.objects.filter(management=management)
+        issue = get_object_or_404(issues, pk=issue_pk)
+        return AuthorizedTarget(
+            user=user, primary=issue, device=management.device, management=management, queryset=issues
+        )
+
+
 @dataclass(frozen=True)
 class OverlayRow(TargetSpec):
     """One overlay row, authorized through its management (AUTHZ_TARGETS path)."""

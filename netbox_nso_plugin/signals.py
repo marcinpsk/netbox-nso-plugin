@@ -394,11 +394,11 @@ def _allocate_push_attempt(device_id, scope):
     """
     from django.db import transaction
 
-    from .models import NSODeviceManagement
+    from .apply_state import lock_device_management
 
     try:
         with transaction.atomic():
-            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            mgmt = lock_device_management(device_id)
             if mgmt is None:
                 return None
             attempts = dict(mgmt.intent_push_attempts or {})
@@ -486,16 +486,14 @@ def _record_push_outcome(device_id, scope, attempt, exc, *, expected_management_
     """
     from django.db import transaction
 
-    from .models import NSODeviceManagement
+    from .apply_state import lock_device_management
 
     if attempt is None:
         return
     try:
         with transaction.atomic():
-            managements = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id)
-            if expected_management_id is not None:
-                managements = managements.filter(pk=expected_management_id)
-            mgmt = managements.first()
+            filters = {} if expected_management_id is None else {"pk": expected_management_id}
+            mgmt = lock_device_management(device_id, **filters)
             if mgmt is None:
                 return
             high_water = int((mgmt.intent_push_attempts or {}).get(scope) or 0)

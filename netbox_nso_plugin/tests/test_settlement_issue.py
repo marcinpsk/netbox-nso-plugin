@@ -23,7 +23,7 @@ from netbox_nso_plugin.settlement_issue import publish_stall_issue
 
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
-from ._settlement_observation import INCARNATION, failed_item, serve_observation
+from ._settlement_observation import INCARNATION, failed_item, published_job, serve_observation
 from ._settlement_wire import generation_wire, job_wire
 from .test_coalesced_settlement import CoalescedCarrierHelpers
 from .test_durable_bgp_capture import BGPCaptureCase, _CaptureHandler
@@ -461,7 +461,9 @@ class HistoricalStore:
         def handle(method, url, **kwargs):
             if method == "GET" and url.endswith("/jobs"):
                 after = int(kwargs["params"]["after_settle_seq"])
-                return make_response(200, [job_wire(job) for job in self.history_jobs if job["settle_seq"] > after])
+                return make_response(
+                    200, [published_job(job) for job in self.history_jobs if job["settle_seq"] > after]
+                )
             if method == "GET" and url.endswith("/generations"):
                 return make_response(200, [generation_wire(row, device_id) for row in self.history_listing])
             if method == "POST" and url.endswith("/deployment-evidence"):
@@ -488,6 +490,38 @@ class HistoricalStore:
             settle_cursor_seq=cursor,
             settle_cursor_incarnation=INCARNATION,
             settle_cursor_device_id=device_id,
+        )
+
+    def manual_reference(self, *, promoted=True, **response):
+        from uuid import uuid4
+
+        attempt_id = uuid4()
+        link = {
+            "generation_id": 60,
+            "seq": 2,
+            "job_id": 40,
+            "mode": "networked",
+            "source_push_seq": {"bgp": 999},
+            "stream_revisions": {"bgp": 3},
+            "digest": "a" * 64,
+        }
+        return NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            adapter_apply_attempt_id=attempt_id if promoted else None,
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            source_epoch=self.management.adapter_source_epoch,
+            selected={"bgp": 999},
+            scope_revisions={"bgp": 1},
+            http_status=202,
+            response={
+                "device_id": self.management.adapter_device_id,
+                "outcome": "promoted",
+                "selected": {"bgp": 999},
+                "skipped": {},
+                "generations": [link],
+                **response,
+            },
         )
 
 
@@ -579,38 +613,6 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         self.assertEqual(outcome, {"recorded": False})
         lost.refresh_from_db()
         self.assertIsNone(lost.response)
-
-    def manual_reference(self, *, promoted=True, **response):
-        from uuid import uuid4
-
-        attempt_id = uuid4()
-        link = {
-            "generation_id": 60,
-            "seq": 2,
-            "job_id": 40,
-            "mode": "networked",
-            "source_push_seq": {"bgp": 999},
-            "stream_revisions": {"bgp": 3},
-            "digest": "a" * 64,
-        }
-        return NSOApplyAttempt.objects.create(
-            id=attempt_id,
-            adapter_apply_attempt_id=attempt_id if promoted else None,
-            management=self.management,
-            adapter_device_id=self.management.adapter_device_id,
-            source_epoch=self.management.adapter_source_epoch,
-            selected={"bgp": 999},
-            scope_revisions={"bgp": 1},
-            http_status=202,
-            response={
-                "device_id": self.management.adapter_device_id,
-                "outcome": "promoted",
-                "selected": {"bgp": 999},
-                "skipped": {},
-                "generations": [link],
-                **response,
-            },
-        )
 
     def assert_no_exit(self, code):
         issue = self.stall_history()
