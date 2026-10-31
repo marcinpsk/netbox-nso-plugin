@@ -29,8 +29,7 @@ from ._adapter_http import make_evidence_envelope, make_response
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import mirror_update, without_commit_drain
 from ._ownership_case import acquire_overlay
-from ._settlement_observation import INCARNATION, serve_observation
-from ._settlement_wire import job_wire
+from ._settlement_observation import INCARNATION, published_job, serve_observation
 from .test_coalesced_settlement import CoalescedCarrierHelpers
 from .test_durable_bgp_capture import BGPCaptureCase, _CaptureHandler
 from .test_settlement_acknowledgement_view import BUTTON, AcknowledgementViewHelpers
@@ -126,7 +125,7 @@ class LegacyStore:
             if method == "GET" and url.endswith("/jobs"):
                 after = int(kwargs["params"]["after_settle_seq"])
                 jobs = [*self.legacy_jobs, *self.later_jobs]
-                return make_response(200, [job_wire(job) for job in jobs if job["settle_seq"] > after])
+                return make_response(200, [published_job(job) for job in jobs if job["settle_seq"] > after])
             if method == "GET" and url.endswith("/generations"):
                 return make_response(
                     200,
