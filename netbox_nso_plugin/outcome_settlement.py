@@ -273,6 +273,14 @@ def _earlier_execution(fence, generation, incarnation, settle_seq):
     raise EvidenceInvariantError("execution_order_unproven")
 
 
+def _batch_code(exc):
+    """Keep the closed code of an invariant; a contract error or free text has no specific cause."""
+    from .settlement_evidence import invariant_code
+
+    code = invariant_code(exc) if isinstance(exc, EvidenceInvariantError) else "unclassified"
+    return "invalid_terminal_batch" if code == "unclassified" else code
+
+
 def _record_invariant(management, generation, incarnation, attempt, code):
     """Persist safe diagnostics after the rejected batch transaction rolled back."""
     if not isinstance(generation, dict) or not canonical_uuid(incarnation):
@@ -321,7 +329,7 @@ def validate_terminal_generation(
         try:
             return _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
         except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
-            code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
+            code = _batch_code(exc)
             _record_invariant(management, generation, store_incarnation, attempt, code)
             error = EvidenceInvariantError(code)
             if hasattr(exc, "invalid_job"):
@@ -468,7 +476,7 @@ def settle_terminal_generations(
                 after_settle()
             return executions
     except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
-        code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
+        code = _batch_code(exc)
         for generation in generations:
             _record_invariant(
                 management,

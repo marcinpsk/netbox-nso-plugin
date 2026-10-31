@@ -40,6 +40,7 @@ from .test_settlement_prefix import CarrierPageHelpers
 READ_ROUTES = ("/jobs", "/generations", "/deployment-evidence", "/settlement-observation")
 UNBOUNDED = "The rows that this job can affect cannot be bounded."
 NO_EXIT = "No acknowledgement is available for this stall."
+MISSING_OWNER = "owner_missing_without_deletion_evidence"
 
 
 def assert_acknowledged_position(case, cursor):
@@ -357,12 +358,19 @@ class TestCascadedOwnerDeletionReplay(AcknowledgementViewHelpers, BGPSettlementH
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_evidence_error["class"], "evidence_invariant")
         self.assertEqual(self.management.settle_evidence_error["exit"], "acknowledgeable")
+        self.assertEqual(self.management.settle_evidence_error["code"], MISSING_OWNER)
+        self.assertEqual(
+            set(NSOApplyExecution.objects.filter(carrier_job_id=501).values_list("invariant_code", flat=True)),
+            {MISSING_OWNER},
+        )
         issue = NSOSettlementIssue.objects.get(state="open")
-        self.assertEqual((issue.job_id, issue.position), (501, "next_feed"))
+        self.assertEqual((issue.job_id, issue.position, issue.stall_reason), (501, "next_feed", MISSING_OWNER))
         effects = {(owner.model_label, owner.overlay_pk): owner.proposed_effect for owner in issue.owners.all()}
         self.assertEqual(effects, {**dict.fromkeys(snapshots, "missing_owner"), self.key(survivor): "unavailable"})
         client = self.client_for(self.acknowledger())
         tab = client.get(self.tab_url())
+        self.assertContains(tab, f"Closed reason: <code>{MISSING_OWNER}</code>", html=True)
+        self.assertContains(tab, "Stall class: evidence invariant.")
         self.assertContains(tab, "Affected rows: 1 outcome unknown, 0 kept with a newer state, 3 missing.")
         self.assertContains(tab, BUTTON, count=1)
 

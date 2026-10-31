@@ -410,7 +410,7 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
         self.assertEqual(snapshot.settlement_disposition, "unavailable")
         execution = NSOApplyExecution.objects.get(generation_id=81, carrier_job_id=501)
         self.assertEqual(execution.consumption_state, "acknowledged")
-        self.assertEqual(execution.invariant_code, "invalid_terminal_batch")
+        self.assertEqual(execution.invariant_code, "owner_missing_without_deletion_evidence")
         for row in (self.owners[0], self.owners[2]):
             row.refresh_from_db()
             self.assertEqual(row.status, "apply_failed")
