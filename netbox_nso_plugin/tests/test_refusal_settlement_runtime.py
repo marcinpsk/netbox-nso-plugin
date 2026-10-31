@@ -800,6 +800,31 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             self.assertEqual((row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id), expected)
         self.assertEqual(NSOApplyExecution.objects.get().consumption_state, "unconsumed")
 
+    def test_foreign_owner_delete_settles_after_the_planner_pass_proves_it(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        from ._outbox_case import without_commit_drain
+
+        self.prepare()
+        generation = self.terminal(refused=2)
+        owner = self.owners[1]
+        owner_key = owner._meta.label_lower, owner.pk
+        type(owner).objects.filter(pk=owner.pk).delete()
+        with self.assertRaises(EvidenceInvariantError):
+            self.settle(generation)
+
+        with without_commit_drain():
+            reconcile_scope_ownership(self.management.device_id, ["bgp"])
+        self.settle(generation)
+
+        execution = NSOApplyExecution.objects.get()
+        self.assertEqual(execution.consumption_state, "consumed")
+        self.assertEqual(
+            execution.overlay_snapshots.get(model_label=owner_key[0], overlay_pk=owner_key[1]).settlement_disposition,
+            "superseded",
+        )
+
     def _delete_owner(self, owner):
         from netbox_nso_plugin.ownership_grants import OwnershipGrant
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
