@@ -263,6 +263,114 @@ class TestCarrierIsolation(CarrierIsolationHelpers, CoalescedCarrierHelpers, BGP
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
 
+    def test_each_later_carrier_reads_only_its_own_listing_and_feed_rows(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import settlement
+
+        self.prepare_automatic()
+        first = self.terminal()
+        first["carrier_job_status"] = "failed"
+        first["carrier_job_error"] = {"code": "refused", "message": "The carrier was refused.", "detail": {}}
+        retry = self.terminal(refused=None)
+        retry["carrier_job_id"] = 502
+        self.serve_retry(first, retry)
+        self.assertEqual(consume_static_route_settlements(self.management).cursor, 2)
+        device_id = self.management.adapter_device_id
+        syncs = [
+            {
+                **self.job(retry, 3 + index),
+                "id": 601 + index,
+                "type": "sync",
+                "result": None,
+                "row_outcomes": None,
+                "refusals": None,
+            }
+            for index in range(12)
+        ]
+        pending = [
+            {
+                "generation_id": 1000 + index,
+                "seq": 5 + index,
+                "status": "pending",
+                "job_id": None,
+                "carrier_job_id": None,
+                "carrier_job_status": None,
+                "mode": "networked",
+                "settlement_cohort": 9,
+                "digest": "a" * 64,
+                "stream_revisions": {"bgp": 8 + index},
+                "source_push_seq": retry["source_push_seq"],
+                "created_at": self.stamp.isoformat(),
+                "updated_at": self.stamp.isoformat(),
+            }
+            for index in range(150)
+        ]
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/jobs"):
+                after = int(kwargs["params"]["after_settle_seq"])
+                rows = response.json() + [job_wire(job) for job in syncs if job["settle_seq"] > after]
+                return make_response(200, rows[: int(kwargs["params"]["limit"])])
+            if method == "GET" and url.endswith("/generations"):
+                return make_response(200, response.json() + [generation_wire(row, device_id) for row in pending])
+            return response
+
+        self.adapter._handle = handle
+        current, foreign, classes = [None], [], {}
+
+        def counted(row):
+            base = type(row)
+            if base not in classes:
+
+                def getitem(item, key, base=base):
+                    identity = item.evidence_identity
+                    if current[0] is not None and identity.get("id", identity.get("carrier_job_id")) != current[0]:
+                        foreign[-1] += 1
+                    return base.__getitem__(item, key)
+
+                classes[base] = type(f"Counted{base.__name__}", (base,), {"__getitem__": getitem})
+            row.__class__ = classes[base]
+            return row
+
+        feed, listing, commit = (
+            adapter_client.get_settlement_feed,
+            adapter_client.list_device_generations,
+            settlement._commit_carrier,
+        )
+
+        def counted_feed(*args, **kwargs):
+            jobs, incarnation = feed(*args, **kwargs)
+            return [counted(job) for job in jobs], incarnation
+
+        def counted_commit(management, read, carrier_id, *args, **kwargs):
+            current[0] = carrier_id
+            foreign.append(0)
+            try:
+                return commit(management, read, carrier_id, *args, **kwargs)
+            finally:
+                current[0] = None
+
+        with (
+            patch.object(adapter_client, "get_settlement_feed", counted_feed),
+            patch.object(
+                adapter_client,
+                "list_device_generations",
+                lambda *args, **kwargs: [counted(row) for row in listing(*args, **kwargs)],
+            ),
+            patch.object(settlement, "_commit_carrier", counted_commit),
+        ):
+            result = consume_static_route_settlements(self.management)
+        self.assertFalse(result.stalled)
+        self.assertTrue(result.drained)
+        self.assertEqual((result.consumed, result.cursor), (12, 14))
+        # The historical retry carrier commits first, then every sync carrier in feed order.
+        self.assertEqual(len(foreign), 13)
+        self.assertGreater(foreign[0], 0)
+        self.assertEqual(foreign[1:], [0] * 12)
+
     def test_manual_carrier_before_retry_uses_its_independent_admission(self):
         self.prepare()
         first = self.terminal(refused=None)
