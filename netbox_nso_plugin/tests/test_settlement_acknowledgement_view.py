@@ -60,7 +60,9 @@ class ResumeQueueMixin:
         self.queue.delete(delete_jobs=True)
 
     def queued_devices(self):
-        return [job.args[0] for job in self.queue.get_jobs()]
+        # NetBox also queues its search cache job here while a worker serves the default queue.
+        reconcile = "netbox_nso_plugin.reconcile.run_device_reconcile"
+        return [job.args[0] for job in self.queue.get_jobs() if job.func_name == reconcile]
 
     def drain_queue(self):
         from rq import SimpleWorker
@@ -576,6 +578,32 @@ class TestSettlementResume(AcknowledgementViewHelpers, BGPSettlementHelpers, BGP
         self.adapter._handle = handle
         self.assertTrue(consume_static_route_settlements(self.management).drained)
         self.assertEqual(armed, [True])
+        self.management.refresh_from_db()
+        self.assertTrue(self.management.settle_resume_pending)
+        self.assertTrue(consume_static_route_settlements(self.management).drained)
+        self.management.refresh_from_db()
+        self.assertFalse(self.management.settle_resume_pending)
+
+    def test_a_pass_with_a_degraded_evidence_read_keeps_the_flag(self):
+        self.acknowledged()
+        original = self.adapter._handle
+        incarnation = self.server.evidence_incarnation
+        flipped = []
+
+        def handle(method, url, **kwargs):
+            self.server.evidence_incarnation = incarnation
+            response = original(method, url, **kwargs)
+            params = kwargs.get("params") or {}
+            # Only the closing read of the evidence bracket asks for one job after a positive sequence.
+            closing = int(params.get("limit", 0)) == 1 and int(params.get("after_settle_seq", 0)) > 0
+            if method == "GET" and url.endswith("/jobs") and closing and not flipped:
+                flipped.append(True)
+                self.server.evidence_incarnation = "00000000-0000-4000-8000-000000000003"
+            return response
+
+        self.adapter._handle = handle
+        self.assertTrue(consume_static_route_settlements(self.management).drained)
+        self.assertEqual(flipped, [True])
         self.management.refresh_from_db()
         self.assertTrue(self.management.settle_resume_pending)
         self.assertTrue(consume_static_route_settlements(self.management).drained)

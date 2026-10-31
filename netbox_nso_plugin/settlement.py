@@ -104,7 +104,8 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
             management.refresh_from_db()
             fence = request_fence(management)
             result = _complete_evidence_result(result, read, management, fence, expected_fence, epoch)
-        if drained and resume:
+        # A pass without the evidence read did not walk the history that an acknowledgement released.
+        if drained and resume and read is not None:
             _clear_resume_request(pk, expected_fence)
         return result
     except _SettlementReadChanged:
