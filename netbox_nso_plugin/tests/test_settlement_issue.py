@@ -23,7 +23,7 @@ from netbox_nso_plugin.settlement_issue import publish_stall_issue
 
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
-from ._settlement_observation import INCARNATION, failed_item, serve_observation
+from ._settlement_observation import INCARNATION, failed_item, published_job, serve_observation
 from ._settlement_wire import generation_wire, job_wire
 from .test_coalesced_settlement import CoalescedCarrierHelpers
 from .test_durable_bgp_capture import BGPCaptureCase, _CaptureHandler
@@ -432,7 +432,9 @@ class HistoricalStore:
         def handle(method, url, **kwargs):
             if method == "GET" and url.endswith("/jobs"):
                 after = int(kwargs["params"]["after_settle_seq"])
-                return make_response(200, [job_wire(job) for job in self.history_jobs if job["settle_seq"] > after])
+                return make_response(
+                    200, [published_job(job) for job in self.history_jobs if job["settle_seq"] > after]
+                )
             if method == "GET" and url.endswith("/generations"):
                 return make_response(200, [generation_wire(row, device_id) for row in self.history_listing])
             if method == "POST" and url.endswith("/deployment-evidence"):
