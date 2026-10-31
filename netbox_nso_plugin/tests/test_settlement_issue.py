@@ -540,6 +540,37 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         acknowledge(following, following.revision_digest, self.operator("placeholder-other"), "second carrier")
         self.assertTrue(consume_static_route_settlements(self.management).drained)
 
+    def test_one_read_reuses_its_acknowledged_view_until_the_acknowledgements_change(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence, without_acknowledged
+
+        self.serve_history()
+        second = copy.deepcopy(self.history_jobs[0])
+        second.update(id=41, settle_seq=4)
+        self.history_jobs.append(second)
+        self.history_listing.append(
+            make_generation_listing(
+                generation_id=61,
+                seq=3,
+                job_id=41,
+                carrier_job_id=41,
+                stream_revisions={"bgp": 4},
+                source_push_seq={"bgp": 1000},
+            )
+        )
+        first = self.stall_history()
+        acknowledge(first, first.revision_digest, self.operator(), "first pre-ledger carrier")
+        self.management.refresh_from_db()
+        read = load_deployment_evidence(self.management, defer_carriers=True)
+        view = without_acknowledged(read, self.management)
+        self.assertEqual([row["carrier_job_id"] for row in view.generation_listing], [41])
+        self.assertIs(without_acknowledged(read, self.management), view)
+        following = self.stall_history()
+        acknowledge(following, following.revision_digest, self.operator("placeholder-other"), "second carrier")
+        self.management.refresh_from_db()
+        changed = without_acknowledged(read, self.management)
+        self.assertIsNot(changed, view)
+        self.assertEqual(list(changed.generation_listing), [])
+
     def test_attempt_answers_the_decision_reads_stay_locked_until_the_commit(self):
         from uuid import uuid4
 
