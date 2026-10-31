@@ -375,7 +375,7 @@ def _retarget(generation, generation_id, seq, carrier_job_id):
 class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, BGPCaptureCase):
     """Apply B freezes the owners, then carrier A is acknowledged, then B's certificate arrives."""
 
-    def second_apply(self):
+    def second_apply(self, generation_id=83, seq=6, job_id=502):
         from uuid import UUID
 
         from django.urls import reverse
@@ -386,8 +386,8 @@ class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, B
 
         def admission(selected):
             response = promoted_streams(selected, {"bgp"})
-            response["job_id"] = 502
-            response["generations"][0].update(generation_id=83, seq=6, job_id=502, digest="c" * 64)
+            response["job_id"] = job_id
+            response["generations"][0].update(generation_id=generation_id, seq=seq, job_id=job_id, digest="c" * 64)
             return 202, response
 
         self.adapter.apply_response = admission
@@ -398,7 +398,7 @@ class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, B
         self.assertEqual(answer.status_code, 200, answer.content)
         return NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
 
-    def serve_two_carriers(self, first, second, carriers):
+    def serve_feed(self, carriers, failed):
         from ._adapter_http import make_generation_listing
         from ._settlement_wire import deployment_wire, generation_wire, job_wire
         from .test_durable_bgp_capture import _CaptureHandler
@@ -454,7 +454,9 @@ class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, B
             if method == "GET" and url.endswith("/jobs"):
                 after = int(kwargs["params"]["after_settle_seq"])
                 rows = [job_wire(job) for job in jobs if job["settle_seq"] > after]
-                return make_response(200, [failed_item(row) if row["identity"]["id"] == 501 else row for row in rows])
+                return make_response(
+                    200, [failed_item(row) if row["identity"]["id"] in failed else row for row in rows]
+                )
             if method == "GET" and url.endswith("/generations"):
                 return make_response(200, [generation_wire(row, device_id) for row in listing])
             if method == "POST" and url.endswith("/deployment-evidence"):
@@ -498,7 +500,7 @@ class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, B
         second = self.second_apply()
         self.attempt = second
         certified = _retarget(self.evidence(dispositions=dispositions), 83, 6, 502)
-        self.serve_two_carriers(first, second, [(first, stalled), (second, certified)])
+        self.serve_feed([(first, stalled), (second, certified)], failed={501})
         result = consume_static_route_settlements(self.management)
         self.assertTrue(result.stalled)
         issue = NSOSettlementIssue.objects.get(state="open")
@@ -524,3 +526,26 @@ class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, B
             self.assertEqual((peer.status, peer.last_apply_error), ("apply_failed", ADVISORY.format(501)))
             snapshot = second.overlay_snapshots.get(model_label=peer._meta.label_lower, overlay_pk=peer.pk)
             self.assertEqual(snapshot.settlement_disposition, "not_applied")
+
+    def test_a_later_manual_certificate_clears_unknowns_after_two_acknowledgements(self):
+        in_sync = {"bgp.router": "in_sync", "bgp.router.scope.peer": "in_sync"}
+        self.prepare()
+        first = self.attempt
+        stalled = _retarget(self.evidence(dispositions=in_sync), 81, 4, 501)
+        second = self.second_apply()
+        self.attempt = second
+        also_stalled = _retarget(self.evidence(dispositions=in_sync), 83, 6, 502)
+        third = self.second_apply(generation_id=84, seq=7, job_id=503)
+        self.attempt = third
+        certified = _retarget(self.evidence(dispositions=in_sync), 84, 7, 503)
+        self.serve_feed([(first, stalled), (second, also_stalled), (third, certified)], failed={501, 502})
+        for job_id in (501, 502):
+            self.assertTrue(consume_static_route_settlements(self.management).stalled)
+            issue = NSOSettlementIssue.objects.get(state="open")
+            self.assertEqual(issue.job_id, job_id)
+            acknowledge(issue, issue.revision_digest, self.operator(), "carrier result unreadable")
+        result = consume_static_route_settlements(self.management)
+        self.assertEqual((result.cursor, result.stalled), (3, False))
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual((owner.status, owner.apply_attempt_id), ("in_sync", third.pk))

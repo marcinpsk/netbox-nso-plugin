@@ -158,13 +158,29 @@ def cover_unknown_contributions(row, fence, execution, outcomes):
     return rest
 
 
-def acknowledged_since(snapshot, row, fence, management):
-    """Return the acknowledgement that is the only change since this snapshot froze its expectation."""
+def acknowledged_since(snapshot, row, fence, management) -> bool:
+    """Return whether a contiguous acknowledgement chain is the only change since the snapshot froze."""
     from . import durable_capture as capture
     from .models import NSOSettlementIssueOwner
 
-    if fence is None or row.status != "apply_failed":
-        return None
+    if fence is None or row.status != "apply_failed" or fence.bookkeeping_revision <= snapshot.expected_fence_revision:
+        return False
+    chain = {}
+    for owner in NSOSettlementIssueOwner.objects.filter(
+        issue__management_id=fence.management_id,
+        issue__mapping_epoch=snapshot.mapping_epoch,
+        issue__state=ACKNOWLEDGED,
+        model_label=row._meta.label_lower,
+        overlay_pk=row.pk,
+        committed_effect=UNKNOWN_EFFECT,
+    ):
+        revision = owner.authority["fence"]["bookkeeping_revision"]
+        if revision in chain:
+            return False
+        chain[revision] = owner
+    if set(range(snapshot.expected_fence_revision, fence.bookkeeping_revision)) - set(chain):
+        return False
+    first = chain[snapshot.expected_fence_revision].authority
     expected = {
         "status": snapshot.expected_status,
         "last_apply_at": instant(snapshot.expected_last_apply_at),
@@ -173,33 +189,16 @@ def acknowledged_since(snapshot, row, fence, management):
         if snapshot.expected_apply_attempt_id is None
         else str(snapshot.expected_apply_attempt_id),
     }
-    owners = NSOSettlementIssueOwner.objects.filter(
-        issue__management_id=fence.management_id,
-        issue__mapping_epoch=snapshot.mapping_epoch,
-        issue__state=ACKNOWLEDGED,
-        model_label=row._meta.label_lower,
-        overlay_pk=row.pk,
-        committed_effect=UNKNOWN_EFFECT,
-    ).select_related("issue")
-    for owner in owners:
-        revision = owner.authority["fence"]["bookkeeping_revision"]
-        if (
-            revision == snapshot.expected_fence_revision
-            and fence.bookkeeping_revision == revision + 1
-            and all(owner.authority.get(name) == value for name, value in expected.items())
-            and capture._matches(
-                snapshot,
-                row,
-                management,
-                {},
-                "expected",
-                check_revisions=False,
-                check_bookkeeping_revision=False,
-                check_bookkeeping=False,
-            )
-        ):
-            return owner
-    return None
+    return all(first.get(name) == value for name, value in expected.items()) and capture._matches(
+        snapshot,
+        row,
+        management,
+        {},
+        "expected",
+        check_revisions=False,
+        check_bookkeeping_revision=False,
+        check_bookkeeping=False,
+    )
 
 
 def unknown_advisory(job_ids) -> str:
