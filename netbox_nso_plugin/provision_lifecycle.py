@@ -307,8 +307,8 @@ def _complete_terminal_attempt(tombstone, inventory_cache) -> bool:
             )
             return False
 
-        # An orphan matches no management row, so the adapter calls below hold the tombstone
-        # fence alone. No device, management, or instance row is locked across them.
+        # The adapter calls below hold the tombstone fence and the device intent lock, but no row lock.
+        # Quick Manage takes only the intent lock, so it cannot adopt the adapter device during the delete.
         adapter_device_id = tombstone.adapter_device_id
         ambiguous = False
         if adapter_device_id is None:
