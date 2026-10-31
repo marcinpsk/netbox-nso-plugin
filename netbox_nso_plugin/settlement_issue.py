@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from uuid import UUID
 
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Q
 from django.utils import timezone
 
 from . import adapter_client
@@ -279,23 +279,14 @@ def _selector(provenance, stream):
     return {"selection_revision": provenance["stream_revisions"][stream]}
 
 
-def _manual_attempts(management):
+def _attempts_naming(management, job_id, generation_ids):
+    """Return every attempt whose stored admission names the job or a generation, with or without its identity."""
     from .models import NSOApplyAttempt
 
-    return NSOApplyAttempt.objects.filter(
-        management=management,
-        adapter_device_id=management.adapter_device_id,
-        trigger_kind="manual",
-        adapter_apply_attempt_id=F("pk"),
-    )
-
-
-def _attempts_naming(management, job_id, generation_ids):
-    """Return promoted manual attempts whose stored admission names the job or a generation."""
     query = Q(response__generations__contains=[{"job_id": job_id}])
     for generation_id in generation_ids:
         query |= Q(response__generations__contains=[{"generation_id": generation_id}])
-    return set(_manual_attempts(management).filter(query).values_list("pk", flat=True))
+    return set(NSOApplyAttempt.objects.filter(management=management).filter(query).values_list("pk", flat=True))
 
 
 def _candidate_attempts(management, stall, observation, members, provenance):
@@ -305,7 +296,10 @@ def _candidate_attempts(management, stall, observation, members, provenance):
         identity = row.evidence_identity
         if identity["generation_id"] in members and identity["apply_attempt_id"] is not None:
             attempts.add(UUID(identity["apply_attempt_id"]))
-    for attempt in _manual_attempts(management).filter(response__isnull=True):
+    from .models import NSOApplyAttempt
+
+    # A lost answer is ambiguous linkage, also for an attempt from before the adapter identity existed.
+    for attempt in NSOApplyAttempt.objects.filter(management=management, trigger_kind="manual", response__isnull=True):
         if any(
             attempt.selected.get(stream) == next(iter(_selector(provenance[generation_id], stream).values()))
             for generation_id in members

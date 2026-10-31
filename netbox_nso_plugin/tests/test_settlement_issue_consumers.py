@@ -181,6 +181,12 @@ class TestAcknowledgedObligationConsumers(SettlementIssueHelpers, BGPSettlementH
         self.assertFalse(JournalEntry.objects.exists())
 
     def test_an_attempt_keeps_outstanding_sibling_generations_discoverable(self):
+        self.assert_outstanding_sibling_keeps_the_attempt_open(other_store_certificate=False)
+
+    def test_a_sibling_certificate_from_another_store_does_not_complete_the_attempt(self):
+        self.assert_outstanding_sibling_keeps_the_attempt_open(other_store_certificate=True)
+
+    def assert_outstanding_sibling_keeps_the_attempt_open(self, *, other_store_certificate):
         from uuid import UUID
 
         from django.urls import reverse
@@ -254,6 +260,8 @@ class TestAcknowledgedObligationConsumers(SettlementIssueHelpers, BGPSettlementH
         self.adapter._handle = with_pending
         self.invalid_feed_job()
         serve_observation(self)
+        if other_store_certificate:
+            _other_store_certificate(self.management, 82)
         consume_static_route_settlements(self.management)
         issue = NSOSettlementIssue.objects.get(state="open")
         acknowledge(issue, issue.revision_digest, self.operator(), "carrier result unreadable")
@@ -265,6 +273,34 @@ class TestAcknowledgedObligationConsumers(SettlementIssueHelpers, BGPSettlementH
         self.assertFalse(result.stalled)
         self.attempt.refresh_from_db()
         self.assertEqual(self.attempt.lifecycle, "open")
+
+
+def _other_store_certificate(management, generation_id):
+    """Record a consumed certificate whose generation id belongs to an earlier store."""
+    from netbox_nso_plugin.models import NSOApplyAttempt
+
+    attempt = NSOApplyAttempt.objects.create(
+        management=management,
+        adapter_device_id=management.adapter_device_id,
+        trigger_kind="cadence",
+        lifecycle="terminal",
+        completed_at=timezone.now(),
+    )
+    return NSOApplyExecution.objects.create(
+        attempt=attempt,
+        management=management,
+        mapping_epoch=capture.mapping_epoch(management),
+        adapter_device_id=management.adapter_device_id,
+        store_incarnation="00000000-0000-4000-8000-000000000009",
+        generation_id=generation_id,
+        generation_seq=1,
+        carrier_job_id=900,
+        settle_seq=1,
+        terminal_projection={"generation_id": generation_id},
+        terminal_at=timezone.now(),
+        consumption_state="consumed",
+        consumed_at=timezone.now(),
+    )
 
 
 def fence_for_row(row):

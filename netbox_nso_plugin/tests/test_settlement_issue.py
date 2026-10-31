@@ -511,7 +511,7 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         acknowledge(following, following.revision_digest, self.operator("placeholder-other"), "second carrier")
         self.assertTrue(consume_static_route_settlements(self.management).drained)
 
-    def manual_reference(self, **response):
+    def manual_reference(self, *, promoted=True, **response):
         from uuid import uuid4
 
         attempt_id = uuid4()
@@ -526,7 +526,7 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         }
         return NSOApplyAttempt.objects.create(
             id=attempt_id,
-            adapter_apply_attempt_id=attempt_id,
+            adapter_apply_attempt_id=attempt_id if promoted else None,
             management=self.management,
             adapter_device_id=self.management.adapter_device_id,
             source_epoch=self.management.adapter_source_epoch,
@@ -555,6 +555,15 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         owner = self.router_owner()
         from ._outbox_case import mirror_update
 
+        mirror_update(owner, status="deploying", apply_attempt_id=attempt.pk)
+        self.assert_no_exit("ownership_unbounded")
+
+    def test_a_pre_ledger_admission_and_a_deploying_owner_have_no_exit(self):
+        from ._outbox_case import mirror_update
+
+        self.serve_history()
+        attempt = self.manual_reference(promoted=False)
+        owner = self.router_owner()
         mirror_update(owner, status="deploying", apply_attempt_id=attempt.pk)
         self.assert_no_exit("ownership_unbounded")
 

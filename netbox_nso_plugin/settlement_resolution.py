@@ -183,6 +183,10 @@ def close_completed_attempt(attempt, now):
     if attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists():
         return False
     if attempt.trigger_kind == "manual" and attempt.executions.filter(consumption_state=ACKNOWLEDGED).exists():
+        # Generation ids belong to one store, so siblings resolve only inside the attempt's own store.
+        stores = set(attempt.executions.values_list("store_incarnation", flat=True))
+        if len(stores) != 1:
+            return False
         admitted = {
             link.get("generation_id")
             for link in (attempt.response or {}).get("generations") or ()
@@ -190,7 +194,11 @@ def close_completed_attempt(attempt, now):
         }
         resolved = set(
             NSOApplyExecution.objects.filter(
-                management_id=attempt.management_id, generation_id__in=admitted, consumption_state__in=RESOLVED_STATES
+                management_id=attempt.management_id,
+                adapter_device_id=attempt.adapter_device_id,
+                store_incarnation=stores.pop(),
+                generation_id__in=admitted,
+                consumption_state__in=RESOLVED_STATES,
             ).values_list("generation_id", flat=True)
         )
         if admitted - resolved:
