@@ -101,7 +101,8 @@ needs two actions on **NSO Device Management**: `change` and the custom action
 `acknowledge_settlement_issue`. The device must be inside the constraints of both. A user
 without one of the actions receives HTTP 403. A device outside the constraints answers
 HTTP 404. The acknowledgement records the actor, the reason and the time. It does not
-certify deployment and does not change the device.
+certify deployment and does not change the device. A successful acknowledgement resumes
+settlement: the next settlement sweep processes the device feed again.
 
 Programmatic writers must wrap each create, save, or delete of a managed intent model in
 `intent_transaction()`. The renderer write, revision bump, and intent outbox entry must
