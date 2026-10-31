@@ -4,7 +4,8 @@
 
 The operation takes the existing mutation locks, revalidates the complete decision against one
 fresh adapter observation, and commits the audit record, the exact obligations, the owner
-effects and the cursor rule in one transaction. Any change refuses it with no writes.
+effects, the cursor rule and the resume request in one transaction. Any change refuses it with
+no writes.
 """
 
 from __future__ import annotations
@@ -283,11 +284,14 @@ def _apply_owner_effect(owner, management, execution, attempt, issue):
 
 
 def _apply_cursor(issue, management):
-    """Advance only past the actual next feed job; a historical carrier keeps the cursor."""
+    """Advance only past the actual next feed job, clear the matching diagnostic and request a pass.
+
+    A historical carrier keeps the cursor. The resume request commits with the acknowledgement.
+    """
     from .intent_state import mirror_refresh
 
     diagnostic = management.settle_evidence_error or {}
-    values = {}
+    values = {"settle_resume_pending": True}
     if (
         diagnostic.get("job_id") == issue.job_id
         and diagnostic.get("store_incarnation") == issue.store_incarnation
@@ -303,8 +307,6 @@ def _apply_cursor(issue, management):
             settle_stall_attempts=0,
             settle_stall_first_seen_at=None,
         )
-    if not values:
-        return
     with mirror_refresh(management, values) as locked:
         for name, value in values.items():
             setattr(locked, name, value)
