@@ -92,7 +92,7 @@ class TestTheCarrier(_CarrierCase):
         assert state.status == "deploying"
         assert self._cursor(mgmt).settle_cursor_seq == 0
         assert self._cursor(mgmt).settle_evidence_error == {}
-        assert self._cursor(mgmt).settle_stall_attempts > 0
+        assert self._cursor(mgmt).settle_stall_attempts == 1
 
 
 class TestOrderingAndIsolation(_CarrierCase):
@@ -333,4 +333,4 @@ class TestRawRouteResultsRemainUnconsumed(_CarrierCase):
         assert state.last_apply_error == ""
         assert self._cursor(mgmt).settle_cursor_seq == 0
         assert self._cursor(mgmt).settle_evidence_error == {}
-        assert self._cursor(mgmt).settle_stall_attempts > 0
+        assert self._cursor(mgmt).settle_stall_attempts == 1
