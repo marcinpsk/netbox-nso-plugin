@@ -351,6 +351,19 @@
     <div class="alert alert-warning" role="alert">{{ projection.summary }}</div>
   {% endfor %}
 
+  {% if settlement_stall %}
+    <div class="alert alert-warning" role="alert">
+      {% if settlement_stall.job_id %}
+        <strong>Settlement is paused.</strong>
+        Adapter job {{ settlement_stall.job_id }}{% if settlement_stall.settle_seq %}, settle_seq {{ settlement_stall.settle_seq }}{% endif %}:
+        {{ settlement_stall.reason }}.
+      {% else %}
+        <strong>Settlement is paused: {{ settlement_stall.reason }}.</strong>
+      {% endif %}
+      Later executions remain unsettled until this evidence validates.
+    </div>
+  {% endif %}
+
   <div id="nso-apply-state-error" class="alert alert-warning mb-3 d-none" role="alert">
     <span class="mdi mdi-alert-outline me-1"></span>
     Apply state is unavailable: <span data-slot="message"></span>

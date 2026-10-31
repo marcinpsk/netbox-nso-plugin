@@ -15,15 +15,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_vendored_observation_schemas_match_adapter_snapshot(tmp_path):
+@pytest.mark.parametrize("name,options", [("observations", []), ("settlements", ["--settlement"])])
+def test_vendored_response_schemas_match_adapter_snapshot(tmp_path, name, options):
     root = Path(__file__).resolve().parents[1]
     sibling = Path(__file__).resolve().parents[2] / "nso-adapter/tests/api/openapi_snapshot.json"
     snapshot = Path(os.environ.get("NSO_ADAPTER_OPENAPI_SNAPSHOT", sibling))
-    output = tmp_path / "observations.json"
+    output = tmp_path / f"{name}.json"
     subprocess.run(
-        [sys.executable, str(root / "scripts/generate_observation_schemas.py"), str(snapshot), "--output", str(output)],
+        [
+            sys.executable,
+            str(root / "scripts/generate_observation_schemas.py"),
+            str(snapshot),
+            "--output",
+            str(output),
+            *options,
+        ],
         check=True,
     )
-    assert output.read_text(encoding="utf-8") == (root / "netbox_nso_plugin/schemas/observations.json").read_text(
+    assert output.read_text(encoding="utf-8") == (root / f"netbox_nso_plugin/schemas/{name}.json").read_text(
         encoding="utf-8"
     )

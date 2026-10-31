@@ -7,6 +7,7 @@ from netbox_nso_plugin.models import NSOApplyExecution
 
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
@@ -18,13 +19,19 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/generations"):
                 limit = int(kwargs["params"]["limit"])
                 offset = limit if "since_seq" in kwargs["params"] else 0
-                return make_response(200, rows[offset : offset + limit])
+                return make_response(
+                    200,
+                    [generation_wire(row, self.management.adapter_device_id) for row in rows[offset : offset + limit]],
+                )
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
 
     def test_listing_rejects_every_missing_field_and_invalid_value_before_writes(self):
-        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+        from netbox_nso_plugin.refusal_display import settlement_stall_projection
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._outbox_case import mirror_update
 
         self.prepare_automatic()
         self.serve_terminal_evidence(self.terminal())
@@ -49,12 +56,16 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         for row in malformed:
             with self.subTest(row=row):
                 self.serve_listing([row])
-                with self.assertRaises(adapter_client.AdapterError) as raised:
-                    load_deployment_evidence(self.management)
-                self.assertEqual(raised.exception.code, "invalid_response")
+                mirror_update(self.management, settle_evidence_error={})
+                result = consume_static_route_settlements(self.management)
+                self.assertTrue(result.stalled)
+                self.assertFalse(result.drained)
                 self.assertFalse(NSOApplyExecution.objects.exists())
                 self.management.refresh_from_db()
                 self.assertIsNone(self.management.settle_cursor_seq)
+                issue = settlement_stall_projection(self.management)
+                self.assertIsNotNone(issue)
+                self.assertEqual(issue["reason"], "invalid settlement evidence")
 
     def test_malformed_later_page_is_rejected_before_writes(self):
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence
@@ -80,7 +91,7 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(adapter_client.list_device_generations(self.management.adapter_device_id), [row])
 
     def test_null_snapshot_blocks_until_the_terminal_carrier_is_retained(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
         self.prepare_automatic()
         generation = self.terminal(refused=None)
@@ -98,8 +109,9 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
                         )
                     ]
                 )
-                with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+                with self.assertRaises(adapter_client.InvalidJobEvidence) as raised:
                     settle_device_apply_attempts(self.management)
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
                 self.assertFalse(NSOApplyExecution.objects.filter(consumed_at__isnull=False).exists())
                 self.management.refresh_from_db()
                 self.assertIsNone(self.management.settle_cursor_seq)
@@ -131,7 +143,8 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = response.json()
                 row = document["attempts"][0]["generations"][0] if manual else document["head"]
-                row.update(change)
+                row["projection"].update(change)
+                row["identity"].update({key: value for key, value in change.items() if key in row["identity"]})
                 return make_response(200, document)
             return response
 
@@ -159,7 +172,7 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         generation = self.terminal()
-        execution = settle_terminal_generation(self.management, generation, "placeholder-store")
+        execution = settle_terminal_generation(self.management, generation, "00000000-0000-4000-8000-000000000004")
         self.assertIsNone(execution.settle_seq)
         self.serve_terminal_evidence(generation, head=False, pruned=True)
         with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):

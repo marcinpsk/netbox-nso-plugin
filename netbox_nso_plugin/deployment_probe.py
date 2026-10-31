@@ -181,6 +181,7 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         management.adapter_device_id, after_settle_seq=(settle_seq or 1) - 1, limit=100
     )
     evidence = adapter_client.get_deployment_evidence(management.adapter_device_id, [attempt.pk])
+    adapter_client.raise_evidence_errors(evidence)
     _require(evidence["device_id"] == management.adapter_device_id, "Probe evidence device changed")
     rows = evidence["attempts"]
     _require(len(rows) == 1 and rows[0]["apply_attempt_id"] == str(attempt.pk), "Probe admission is missing")
@@ -194,6 +195,7 @@ def _terminal_evidence(attempt, *, settle_seq=None):
     from .apply_settlement import reconcile_admission_links
 
     listing = adapter_client.list_device_generations(management.adapter_device_id)
+    adapter_client.raise_evidence_errors(listing)
     reconcile_admission_links((row["response"], attempt.response), listing)
     generations = row["generations"]
     _require(len(generations) == 1, "Probe requires one generation")
@@ -248,6 +250,7 @@ def _terminal_evidence(attempt, *, settle_seq=None):
     _require(incarnation == final_incarnation, "Probe store changed during evidence fetch")
     _require(len(jobs) == 1 and type(jobs[0]["settle_seq"]) is int, "Probe carrier sequence is unavailable")
     job = jobs[0]
+    adapter_client.raise_item_error(job)
     _require(
         job["device_id"] == management.adapter_device_id
         and job["type"] == "apply"

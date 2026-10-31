@@ -10,7 +10,7 @@ from django.db import transaction
 
 from . import delivery, drain
 from . import durable_capture as capture
-from .apply_settlement import EvidenceInvariantError
+from .apply_settlement import EvidenceInvariantError, identify_generation_stall
 from .models import NSOAcceptedSelection, NSOIntentOutboxState
 from .refusal_contract import GENERATION_STATUSES
 from .refusal_registry import RegistryError
@@ -35,10 +35,7 @@ def pending_selections(management, evidence, generations):
     """Find only unacknowledged protocol sources named by terminal evidence."""
     authorities = list(generations)
     for attempt in evidence["attempts"]:
-        rows = attempt.get("generations")
-        if not isinstance(rows, list):
-            raise EvidenceInvariantError("invalid_terminal_batch")
-        authorities.extend(rows)
+        authorities.extend(attempt["generations"])
     pairs = {pair for generation in authorities for pair in _source_pairs(generation)}
     return [
         selection
@@ -53,28 +50,33 @@ def pending_selections(management, evidence, generations):
 
 
 def _source_pairs(generation):
-    if not isinstance(generation, dict) or generation.get("status") not in GENERATION_STATUSES:
-        raise EvidenceInvariantError("invalid_terminal_batch")
-    if generation["status"] in {"pending", "running"}:
-        return set()
-    sources, revisions = generation.get("source_push_seq"), generation.get("stream_revisions")
-    if (
-        not isinstance(sources, dict)
-        or not isinstance(revisions, dict)
-        or not revisions.keys() <= sources.keys()
-        or any(
-            not isinstance(stream, str) or source is not None and (type(source) is not int or source <= 0)
-            for stream, source in sources.items()
-        )
-    ):
-        raise EvidenceInvariantError("invalid_terminal_batch")
-    streams = {entry.section for entry in delivery.delivery_keys().values()}
-    if any(
-        not isinstance(stream, str) or stream not in streams or type(revision) is not int or revision <= 0
-        for stream, revision in revisions.items()
-    ):
-        raise EvidenceInvariantError("invalid_terminal_batch")
-    return {(stream, sources[stream]) for stream in revisions if sources[stream] is not None}
+    with identify_generation_stall(generation):
+        if (
+            not isinstance(generation, dict)
+            or not isinstance(generation.get("status"), str)
+            or generation["status"] not in GENERATION_STATUSES
+        ):
+            raise EvidenceInvariantError("invalid_terminal_batch")
+        if generation["status"] in {"pending", "running"}:
+            return set()
+        sources, revisions = generation.get("source_push_seq"), generation.get("stream_revisions")
+        if (
+            not isinstance(sources, dict)
+            or not isinstance(revisions, dict)
+            or not revisions.keys() <= sources.keys()
+            or any(
+                not isinstance(stream, str) or source is not None and (type(source) is not int or source <= 0)
+                for stream, source in sources.items()
+            )
+        ):
+            raise EvidenceInvariantError("invalid_terminal_batch")
+        streams = {entry.section for entry in delivery.delivery_keys().values()}
+        if any(
+            not isinstance(stream, str) or stream not in streams or type(revision) is not int or revision <= 0
+            for stream, revision in revisions.items()
+        ):
+            raise EvidenceInvariantError("invalid_terminal_batch")
+        return {(stream, sources[stream]) for stream in revisions if sources[stream] is not None}
 
 
 def _captured_claim(selection, management):

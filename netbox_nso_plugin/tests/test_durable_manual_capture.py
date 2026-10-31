@@ -31,7 +31,7 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.refusal_registry import OVERLAYS
 
-from ._adapter_http import make_response
+from ._adapter_http import make_evidence_envelope, make_response
 from ._outbox_case import (
     ReceiptAdapter,
     content_update,
@@ -58,7 +58,7 @@ class ManualAdmissionAdapter(ReceiptAdapter):
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith(("/jobs", "/generations")):
             response = make_response(200, [])
-            response.headers["X-Store-Incarnation"] = "manual-read-store"
+            response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000010"
             return response
         if method == "POST" and url.endswith("/actions/apply"):
             body = copy.deepcopy(kwargs["json"])
@@ -74,21 +74,27 @@ class ManualAdmissionAdapter(ReceiptAdapter):
         if method == "POST" and url.endswith("/deployment-evidence"):
             body = self.apply_requests[0]
             attempt_id = body["apply_attempt_id"]
+            device_id = int(url.split("/devices/")[1].split("/")[0])
             attempts = []
             if self.rejected:
                 attempts.append(
-                    {
-                        "apply_attempt_id": attempt_id,
-                        "admission_state": "rejected",
-                        "http_status": 409,
-                        "response": self.rejection(),
-                        "generations": [],
-                    }
+                    make_evidence_envelope(
+                        {
+                            "apply_attempt_id": attempt_id,
+                            "admission_state": "rejected",
+                            "http_status": 409,
+                            "response": self.rejection(),
+                            "selected": body["selected"],
+                            "generation_ids": [],
+                        },
+                        identity={"device_id": device_id, "apply_attempt_id": attempt_id},
+                        generations=[],
+                    )
                 )
             return make_response(
                 200,
                 {
-                    "device_id": int(url.split("/devices/")[1].split("/")[0]),
+                    "device_id": device_id,
                     "head": None,
                     "blocked": False,
                     "write_work_pending": False,
@@ -176,7 +182,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 management=self.management,
                 family=family,
                 applied_attempt_id=index,
-                applied_incarnation="manual-read-store",
+                applied_incarnation="00000000-0000-4000-8000-000000000010",
                 applied_source_epoch=3,
                 applied_payload_revision=index + 10,
                 applied_publication_sequence=index + 20,
@@ -186,7 +192,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 observed_payload_revision=index + 110,
             )
             self.read_watermarks[family] = {
-                "incarnation": "manual-read-store",
+                "incarnation": "00000000-0000-4000-8000-000000000010",
                 "source_epoch": 3,
                 "payload_revision": index + 10,
                 "digest": None,
@@ -376,7 +382,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
             families = OVERLAYS[self.mtu._meta.label_lower].read_families
             NSOFamilyReadState.objects.filter(management=self.management, family__in=families).update(
                 applied_attempt_id=1000,
-                applied_incarnation="manual-read-store",
+                applied_incarnation="00000000-0000-4000-8000-000000000010",
                 applied_source_epoch=3,
                 applied_payload_revision=1010,
                 applied_publication_sequence=1020,
@@ -440,7 +446,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
             footprint = footprint_for_instance(self.mtu)
             family = sorted(OVERLAYS[self.mtu._meta.label_lower].read_families)[0]
             identity = {
-                "incarnation": "manual-read-store",
+                "incarnation": "00000000-0000-4000-8000-000000000010",
                 "source_epoch": 3,
                 "payload_revision": 1010,
                 "digest": "c" * 64,

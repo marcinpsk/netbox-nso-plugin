@@ -927,3 +927,73 @@ rules:
               ...
     paths:
       include: ["netbox_nso_plugin/views.py"]
+
+  - id: nso-test-subtest-stale-diagnostic
+    languages: [python]
+    severity: ERROR
+    message: A subtest loop reads the stored settlement diagnostic without clearing it first. A value from an earlier subtest can satisfy the assertion. Call mirror_update(<management>, settle_evidence_error={}) in the loop body before the read. This checks direct reads of settle_evidence_error and settlement_stall_projection(...) in a subTest block inside a for loop, not reads through helper methods.
+    pattern-either:
+      # No reset precedes the read in its block or in an enclosing block.
+      - patterns:
+          - pattern-either:
+              - pattern: $ROW.settle_evidence_error
+              - pattern: settlement_stall_projection(...)
+              - pattern: $MODULE.settlement_stall_projection(...)
+          - pattern-inside: |
+              with $CASE.subTest(...):
+                  ...
+          - pattern-inside: |
+              for $ITEM in $ITEMS:
+                  ...
+          - pattern-not-inside: |
+              mirror_update(..., settle_evidence_error={}, ...)
+              ...
+          - pattern-not-inside: |
+              $HELPERS.mirror_update(..., settle_evidence_error={}, ...)
+              ...
+      # A reset before the loop runs once, so the loop body must reset again.
+      - patterns:
+          - pattern-either:
+              - pattern: $ROW.settle_evidence_error
+              - pattern: settlement_stall_projection(...)
+              - pattern: $MODULE.settlement_stall_projection(...)
+          - pattern-inside: |
+              with $CASE.subTest(...):
+                  ...
+          - pattern-inside: |
+              for $ITEM in $ITEMS:
+                  ...
+          - pattern-inside: |
+              $PRE(..., settle_evidence_error={}, ...)
+              ...
+              for $ITEM in $ITEMS:
+                  ...
+          - metavariable-regex:
+              metavariable: $PRE
+              regex: '^(\w+\.)*mirror_update$'
+          - pattern-not-inside: |
+              for $ITEM in $ITEMS:
+                  ...
+                  mirror_update(..., settle_evidence_error={}, ...)
+                  ...
+                  with $CASE.subTest(...):
+                      ...
+          - pattern-not-inside: |
+              for $ITEM in $ITEMS:
+                  ...
+                  $HELPERS.mirror_update(..., settle_evidence_error={}, ...)
+                  ...
+                  with $CASE.subTest(...):
+                      ...
+          - pattern-not-inside: |
+              with $CASE.subTest(...):
+                  ...
+                  mirror_update(..., settle_evidence_error={}, ...)
+                  ...
+          - pattern-not-inside: |
+              with $CASE.subTest(...):
+                  ...
+                  $HELPERS.mirror_update(..., settle_evidence_error={}, ...)
+                  ...
+    paths:
+      include: ["netbox_nso_plugin/tests/**"]
