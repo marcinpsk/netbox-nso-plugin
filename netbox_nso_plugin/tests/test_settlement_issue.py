@@ -167,6 +167,35 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
         )
         self.assertEqual([request["job_id"] for request in self.observation_requests], [501])
 
+    def test_a_publication_fault_still_returns_the_stall_and_the_next_pass_publishes(self):
+        from netbox_nso_plugin.models import NSOAcceptedSelection
+
+        self.prepare()
+        self.generation = self.terminal(refused=None)
+        self.serve_terminal_evidence(self.generation, manual=True)
+        self.invalid_feed_job()
+        serve_observation(self)
+        selections = NSOAcceptedSelection.objects.filter(management=self.management)
+        manifests = {row.pk: copy.deepcopy(row.contributor_manifest) for row in selections}
+        self.assertTrue(manifests)
+        for pk, manifest in manifests.items():
+            broken = [{key: value for key, value in owner.items() if key != "contributors"} for owner in manifest]
+            NSOAcceptedSelection.objects.filter(pk=pk).update(contributor_manifest=broken)
+        with self.assertLogs("netbox_nso_plugin.settlement", "ERROR") as logs:
+            result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertIn("KeyError", "\n".join(logs.output))
+        self.assertFalse(NSOSettlementIssue.objects.exists())
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error["class"], "invalid_evidence")
+        self.assertNotIn("exit", self.management.settle_evidence_error)
+
+        for pk, manifest in manifests.items():
+            NSOAcceptedSelection.objects.filter(pk=pk).update(contributor_manifest=manifest)
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        issue = NSOSettlementIssue.objects.get(management=self.management, state="open")
+        self.assertEqual(issue.job_id, 501)
+
     def test_republishing_unchanged_evidence_keeps_the_revision_and_changed_evidence_supersedes_it(self):
         issue = self.stall_invalid_manual_carrier()
         self.assertEqual(publish_stall_issue(self.management).pk, issue.pk)

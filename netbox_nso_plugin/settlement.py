@@ -118,7 +118,10 @@ def _publish_stall_issue(pk):
     """Publish the identified stall from pure reads; the diagnostic stays when this fails."""
     from .settlement_issue import publish_stall_issue
 
-    publish_stall_issue(pk)
+    try:
+        publish_stall_issue(pk)
+    except Exception:  # noqa: BLE001 - advisory; the next pass publishes from the kept diagnostic
+        logger.exception("Settlement issue publication failed for management %s", pk)
 
 
 def _align_carrier_read(read, row, jobs, incarnation):
