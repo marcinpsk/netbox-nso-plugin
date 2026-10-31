@@ -161,7 +161,7 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
 
 
 def _sweep_one(provision_attempt_id, inventory_cache) -> bool:
-    """Advance one attempt. Every adapter call runs outside the device and management locks."""
+    """Advance one attempt. Only the orphan offboard calls the adapter under the tombstone and intent locks."""
     from .models import NSOProvisionTombstone
 
     tombstone = NSOProvisionTombstone.objects.get(provision_attempt_id=provision_attempt_id)
