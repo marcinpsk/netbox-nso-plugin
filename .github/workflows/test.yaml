@@ -276,7 +276,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: a7732a585c53ab261d3f8e77d5545aab0109f5ea
+          ref: 14cc8489ed2edf9a23598bfe8d4b498e8b7a9864
           path: refusal-adapter
           persist-credentials: false
 
