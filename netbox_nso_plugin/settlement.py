@@ -56,7 +56,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     # Only a pass that saw the resume request before its reads may clear it.
     resume = management.settle_resume_pending
     fence = request_fence(management)
-    acknowledged = _acknowledgement_count(pk)
+    acknowledged = _acknowledged_job_keys(pk)
     epoch = fence["mapping_epoch"]
     read = None
     consumed = 0
@@ -121,24 +121,18 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
 
 def _clear_resume_request(pk, fence):
     """Clear the resume request after a drained pass, unless the cursor moved after the walk."""
+    from .intent_state import mirror_refresh
     from .models import NSODeviceManagement
     from .settlement_evidence import matches_request_fence
+    from .signals import suppress_intent_push
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
         if not row.settle_resume_pending or not matches_request_fence(row, fence):
             return
-        _write_resume_request(row, False)
-
-
-def _write_resume_request(row, pending):
-    """Write the durable resume request while the caller holds the management row lock."""
-    from .intent_state import mirror_refresh
-    from .signals import suppress_intent_push
-
-    with suppress_intent_push(), mirror_refresh(row, ("settle_resume_pending",)) as locked:
-        locked.settle_resume_pending = pending
-        locked.save(update_fields=("settle_resume_pending",))
+        with suppress_intent_push(), mirror_refresh(row, ("settle_resume_pending",)) as locked:
+            locked.settle_resume_pending = False
+            locked.save(update_fields=("settle_resume_pending",))
 
 
 def request_settlement_pass(device_id):
@@ -364,26 +358,28 @@ def _invariant_evidence_stall(management, fence, acknowledged, error):
     )
 
 
-def _acknowledgement_count(pk):
+def _acknowledged_job_keys(pk):
     from .models import NSOSettlementIssue
 
-    return NSOSettlementIssue.objects.filter(management_id=pk, state="acknowledged").count()
+    return frozenset(
+        NSOSettlementIssue.objects.filter(management_id=pk, state="acknowledged").values_list(
+            "store_incarnation", "job_id"
+        )
+    )
 
 
 def _invalid_evidence_stall(management, fence, acknowledged, error, stall_class, code=None):
     """Retain invalid evidence without advancing its settlement cursor.
 
-    A pass that read its evidence before an acknowledgement committed does not write its stall, because a
-    historical acknowledgement keeps the request fence. It requests a fresh pass, so a stall only it saw stays owed.
+    A pass does not write a stall of a job that an acknowledgement released after the pass began. A historical
+    acknowledgement keeps the request fence, and the resume request of the acknowledgement owes a fresh pass.
     """
     from .models import NSODeviceManagement
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
-        if _acknowledgement_count(row.pk) == acknowledged:
+        if (error.store_incarnation, error.job_id) not in _acknowledged_job_keys(row.pk) - acknowledged:
             write_diagnostic(row, fence, error, stall_class=stall_class, code=code)
-        elif not row.settle_resume_pending:
-            _write_resume_request(row, True)
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
 
 

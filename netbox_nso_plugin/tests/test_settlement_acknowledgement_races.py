@@ -11,12 +11,13 @@ detected from pg_stat_activity, never from a sleep.
 import copy
 import threading
 import time
+from unittest.mock import patch
 
 from django.db import OperationalError, connection, connections
 from django.db.models.signals import post_init
 
 from netbox_nso_plugin.models import NSOApplyExecution, NSODeviceManagement, NSOSettlementIssue
-from netbox_nso_plugin.settlement import consume_static_route_settlements, sweep_static_route_settlements
+from netbox_nso_plugin.settlement import consume_static_route_settlements
 
 from ._adapter_http import make_generation_listing
 from ._bgp_settlement import BGPSettlementHelpers
@@ -369,34 +370,62 @@ class TestHistoricalAcknowledgementAgainstSettlement(
         self.assertFalse(self.management.settle_resume_pending)
         self.assertEqual(self.management.settle_evidence_error, {})
 
-    def test_a_stall_that_only_a_stale_pass_saw_stays_owed(self):
+    def stale_pass_reads_a_new_job(self, *, before_new_job):
+        """Hold a pass in its listing read across an acknowledgement, then publish an invalid job only it reads."""
         self.serve_history()
         client = self.client_for(self.acknowledger())
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         issue = NSOSettlementIssue.objects.get(state="open")
-        # The pass counts acknowledgements and reads the feed, then waits inside its listing read.
         entered, release = self.hold_next("GET", "/generations")
         pass_thread, passed = self.run_pass({"thread": None})
         self.assertTrue(entered.wait(WAIT))
         client.post(self.action_url(), self.form(issue, reason="placeholder pre-ledger carrier"))
-        self.drain_queue()
-        self.management.refresh_from_db()
-        self.assertFalse(self.management.settle_resume_pending)
-        # The adapter then publishes an invalid job that only the held pass will read.
+        before_new_job()
         later = copy.deepcopy(self.history_jobs[0])
         later.update(id=52, type="sync", result=None, settle_seq=6)
         self.history_jobs.append(later)
         self.invalid_feed_job(52)
+        serve_observation(self)
         release.set()
         self.join(pass_thread)
         self.assertNotIn("error", passed)
         self.assertTrue(passed["result"].stalled)
-        self.management.refresh_from_db()
-        self.assertEqual(self.management.settle_evidence_error, {})
-        self.assertTrue(self.management.settle_resume_pending)
-        serve_observation(self)
-        self.assertEqual(sweep_static_route_settlements(), (1, 0))
+
+    def assert_new_job_recorded(self):
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_evidence_error["job_id"], 52)
-        self.assertTrue(self.management.settle_resume_pending)
         self.assertEqual(NSOSettlementIssue.objects.get(state="open").job_id, 52)
+        page = self.client_for(self.acknowledger()).get(self.tab_url())
+        self.assertContains(page, "Settlement is paused", count=1)
+
+    def test_a_stall_of_a_job_that_no_acknowledgement_released_is_recorded_after_a_drained_pass(self):
+        self.stale_pass_reads_a_new_job(before_new_job=self.drain_queue)
+        self.assert_new_job_recorded()
+
+    def test_a_stall_of_a_job_that_no_acknowledgement_released_survives_a_racing_clear(self):
+        from netbox_nso_plugin import settlement
+
+        ready, go = threading.Event(), threading.Event()
+        real = settlement._complete_evidence_result
+        state = {}
+
+        def held(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if threading.get_ident() == state.get("thread"):
+                ready.set()
+                go.wait(WAIT)
+            return result
+
+        patcher = patch.object(settlement, "_complete_evidence_result", new=held)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def drained_pass_waits_before_its_clear():
+            self.clearing, self.cleared = self.run_pass(state)
+            self.assertTrue(ready.wait(WAIT))
+
+        self.stale_pass_reads_a_new_job(before_new_job=drained_pass_waits_before_its_clear)
+        go.set()
+        self.join(self.clearing)
+        self.assertTrue(self.cleared["result"].drained)
+        self.assert_new_job_recorded()
