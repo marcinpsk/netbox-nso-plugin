@@ -18,6 +18,8 @@ from django.db import IntegrityError, connection, transaction
 from django.db.migrations.loader import MigrationLoader
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
+from netbox_nso_plugin.deployment_checks import PLUGIN_MIGRATION_HEAD
+
 from ._ownership_case import acquire_overlay
 from .mixins import _CascadeFlushMixin
 
@@ -96,7 +98,7 @@ class TestMigrationGraph(SimpleTestCase):
         loader = MigrationLoader(None, ignore_no_migrations=True)
         leaves = sorted(name for app, name in loader.graph.leaf_nodes() if app == APP)
 
-        assert leaves == ["0040_snapshot_owner_epoch_index"]
+        assert leaves == [PLUGIN_MIGRATION_HEAD]
         assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
         state = loader.project_state([(APP, leaves[0])])
         for name in (
