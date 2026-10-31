@@ -31,6 +31,15 @@ WAIT = 30
 
 
 class RaceHelpers:
+    def setUp(self):
+        super().setUp()
+        self.barrier_timeouts = []
+
+    def wait_released(self, event, label):
+        """Wait on a barrier in a racer thread; a timeout fails the test when the racers are joined."""
+        if not event.wait(WAIT):
+            self.barrier_timeouts.append(label)
+
     def hold_observation(self):
         """Hold the next settlement observation until released; the caller then owns its locks."""
         return self.hold_next("POST", "/settlement-observation")
@@ -45,7 +54,7 @@ class RaceHelpers:
             if method == verb and url.endswith(route) and not armed:
                 armed.append(True)
                 entered.set()
-                release.wait(WAIT)
+                self.wait_released(release, f"{verb} {route}")
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
@@ -64,7 +73,7 @@ class RaceHelpers:
             elif state["locked"]:
                 state["done"] = True
                 paused.set()
-                resume.wait(WAIT)
+                self.wait_released(resume, "paused pass")
 
         post_init.connect(receiver, sender=NSODeviceManagement, weak=False)
         self.addCleanup(post_init.disconnect, receiver, sender=NSODeviceManagement)
@@ -119,6 +128,7 @@ class RaceHelpers:
         for thread in threads:
             thread.join(WAIT)
             self.assertFalse(thread.is_alive(), "a racer did not finish")
+        self.assertEqual(self.barrier_timeouts, [], "a racer passed a barrier on its timeout")
 
     def race_pass_against_acknowledgement(self, issue, reason):
         """Let a pass read before the acknowledgement commits and write after it, then return both outcomes."""
@@ -413,7 +423,7 @@ class TestHistoricalAcknowledgementAgainstSettlement(
             result = real(*args, **kwargs)
             if threading.get_ident() == state.get("thread"):
                 ready.set()
-                go.wait(WAIT)
+                self.wait_released(go, "clearing pass")
             return result
 
         patcher = patch.object(settlement, "_complete_evidence_result", new=held)
