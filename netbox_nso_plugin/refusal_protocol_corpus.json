@@ -673,6 +673,24 @@
       ]
     },
     {
+      "name": "catalog-bgp.peer-family-undeclared",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp\",\"key\":\"7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"bgp.peer-family-undeclared\",\"message\":\"On this NED a peer address family is written only inside an address family that its scope declares. The scope declares no address family for this row.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bgp",
+          "row": {
+            "subject": "bgp",
+            "key": "7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a"
+          },
+          "field": null,
+          "reason": "target-not-found",
+          "message_id": "bgp.peer-family-undeclared",
+          "message": "On this NED a peer address family is written only inside an address family that its scope declares. The scope declares no address family for this row.",
+          "related": null
+        }
+      ]
+    },
+    {
       "name": "catalog-bgp.vrf-peer-family-undeclared",
       "message": "device-intent: refused {\"refusals\":[{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp\",\"key\":\"7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"bgp.vrf-peer-family-undeclared\",\"message\":\"On this NED a VRF peer exists only inside an address family that its scope declares. The scope declares no address family for this row.\",\"related\":null}]}",
       "refusals": [
