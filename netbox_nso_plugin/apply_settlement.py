@@ -168,6 +168,7 @@ def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequence
         ):
             raise EvidenceInvariantError("deployment evidence has an invalid admitted response")
     identities = [generation["generation_id"] for generation in raw["generations"]]
+    identities.extend(raw.get("acknowledged_generation_ids", ()))
     if len(set(identities)) != len(identities):
         raise EvidenceInvariantError("deployment evidence repeats a generation identity")
     if _response_generation_ids(response) != set(identities):
@@ -355,7 +356,7 @@ def promoted_stream_coverage(generations, expected_selected, skipped):
 _ADMISSION_GENERATION_METADATA = ("generation_id", "seq", "digest", "mode", "stream_revisions", "source_push_seq")
 
 
-def reconcile_admission_links(responses, generations, *, generation_ids=None):
+def reconcile_admission_links(responses, generations, *, generation_ids=None, released=frozenset()):
     """Match immutable admission links with the complete generation listing."""
     by_id = {row["generation_id"]: row for row in generations}
     for response in responses:
@@ -364,6 +365,8 @@ def reconcile_admission_links(responses, generations, *, generation_ids=None):
         _response_generation_ids(response)
         for link in response.get("generations") or ():
             if generation_ids is not None and link["generation_id"] not in generation_ids:
+                continue
+            if link["generation_id"] in released:
                 continue
             generation = by_id.get(link["generation_id"])
             with identify_generation_stall(generation):
@@ -388,6 +391,7 @@ def _reconcile_admissions(
     *,
     carrier_id=None,
     carrier_attempt_ids=(),
+    released=frozenset(),
 ):
     from django.db.models import F
 
@@ -466,7 +470,7 @@ def _reconcile_admissions(
             if link.get("job_id") == carrier_id
         }
     )
-    reconcile_admission_links(responses, generations, generation_ids=selected)
+    reconcile_admission_links(responses, generations, generation_ids=selected, released=released)
 
 
 def _admission_keep_streams(attempt, response, *, rejected=False):
@@ -673,10 +677,21 @@ def deploying_attempt_ids(management) -> tuple[UUID, ...]:
 
 
 def deployment_evidence_attempt_ids(management) -> tuple[UUID, ...]:
-    """Return referenced attempts plus local attempts whose response was lost."""
+    """Return referenced attempts, lost responses and attempts with outstanding sibling generations."""
     from .models import NSOApplyAttempt
 
     attempt_ids = set(deploying_attempt_ids(management))
+    # An acknowledged generation keeps its attempt open until every admitted sibling resolves.
+    attempt_ids.update(
+        NSOApplyAttempt.objects.filter(
+            management=management,
+            adapter_device_id=management.adapter_device_id,
+            trigger_kind="manual",
+            adapter_apply_attempt_id__isnull=False,
+            lifecycle="open",
+            executions__consumption_state="acknowledged",
+        ).values_list("pk", flat=True)
+    )
     attempt_ids.update(
         NSOApplyAttempt.objects.filter(
             management=management,
@@ -916,6 +931,7 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
 
     if mapping_epoch(management) != read.mapping_epoch:
         raise EvidenceInvariantError("evidence_epoch_changed")
+    read = without_acknowledged(read, management)
     jobs = [job for job in read.feed_jobs if carrier_id is None or job["id"] == carrier_id]
     relevant = [row for row in read.generation_listing if carrier_id is None or row["carrier_job_id"] == carrier_id]
     raise_evidence_errors(jobs)
@@ -961,6 +977,7 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
         sequences,
         carrier_id=carrier_id,
         carrier_attempt_ids={UUID(raw["apply_attempt_id"]) for raw in evidence["attempts"]},
+        released=getattr(read, "released_generation_ids", frozenset()),
     )
     bound = _bound_evidence(
         evidence,
@@ -987,6 +1004,55 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
             if keep is not None:
                 bound.replay_restorations.append((attempt.pk, keep))
     return bound
+
+
+def without_acknowledged(read, management):
+    """Remove only acknowledged obligations; siblings and retry carriers keep ordinary evidence."""
+    from .settlement_resolution import acknowledged_jobs, acknowledged_obligations
+
+    acknowledged = acknowledged_obligations(management, read.store_incarnation)
+    jobs = acknowledged_jobs(management, read.store_incarnation)
+    if not acknowledged and not jobs:
+        return read
+
+    def kept(row):
+        return row is None or (row["generation_id"], row["carrier_job_id"]) not in acknowledged
+
+    view = _BoundEvidence(read)
+    view.__dict__.update(vars(read))
+    view["head"] = read["head"] if kept(read["head"]) else None
+    view["attempts"] = [_attempt_without(raw, kept) for raw in read["attempts"]]
+    view.feed_jobs = [job for job in read.feed_jobs if job["id"] not in jobs]
+    view.generation_listing = [row for row in read.generation_listing if kept(row)]
+    # An admission link names its generation; only the listing identity says which carrier was released.
+    view.released_generation_ids = frozenset(row["generation_id"] for row in read.generation_listing if not kept(row))
+    view.read_snapshots = [
+        {
+            **snapshot,
+            "head": snapshot["head"] if kept(snapshot["head"]) else None,
+            "attempts": [_attempt_without(raw, kept) for raw in snapshot["attempts"]],
+        }
+        for snapshot in read.read_snapshots
+    ]
+    return view
+
+
+def _attempt_without(raw, kept):
+    """Keep an attempt's acknowledged generation identities for its completeness check."""
+    import copy
+
+    from .adapter_client import EvidenceItem
+
+    rows = _attempt_generations(raw)
+    dropped = [row["generation_id"] for row in rows if not kept(row)]
+    if not dropped:
+        return raw
+    retained = [row for row in rows if kept(row)]
+    if isinstance(raw, EvidenceItem):
+        copied = copy.copy(raw)
+        copied.evidence_generations = retained
+        return copied
+    return {**raw, "generations": retained, "acknowledged_generation_ids": dropped}
 
 
 def _carrier_attempts(management, read, carrier_id):

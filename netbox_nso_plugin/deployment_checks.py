@@ -15,8 +15,7 @@ def check_contracts():
     executor = MigrationExecutor(connection)
     _require(not executor.migration_plan(executor.loader.graph.leaf_nodes()), "Database migration heads are pending")
     _require(
-        executor.loader.graph.leaf_nodes("netbox_nso_plugin")
-        == [("netbox_nso_plugin", "0038_settlement_evidence_error")],
+        executor.loader.graph.leaf_nodes("netbox_nso_plugin") == [("netbox_nso_plugin", "0039_settlement_issue")],
         "Unexpected plugin migration head",
     )
 
@@ -88,6 +87,7 @@ def check_active_streams():
     from .intent_drift import _delivery_key, _scopes
     from .models import NSOIntentRevision
     from .selection_manifest import frozen_manifest
+    from .settlement_resolution import acknowledged_obligations
 
     _require(
         not NSOApplyAttempt.objects.filter(lifecycle="open", trigger_kind="manual").exists()
@@ -183,7 +183,11 @@ def check_active_streams():
         adapter_client.raise_evidence_errors(generations)
         terminal = [generation for generation in generations if terminal_carrier_requires_certificate(generation)]
         certificates = generation_certificate_candidates(management, incarnation, terminal)
+        acknowledged = acknowledged_obligations(management, incarnation)
         for generation in generations:
+            if (generation["generation_id"], generation["carrier_job_id"]) in acknowledged:
+                # Resolved without a certificate: no success or provenance claim exists for it.
+                continue
             if terminal_carrier_requires_certificate(generation):
                 identity = generation["generation_id"], generation["carrier_job_id"]
                 _require(

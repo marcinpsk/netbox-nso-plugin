@@ -113,6 +113,8 @@ def validate_settlement_response(component, body, device_id):
         return [validate_settlement_item(component, item, device_id, depth=2) for item in body]
     if component == "DeviceDeploymentEvidenceOut":
         return _deployment_evidence(body, device_id)
+    if component == "SettlementObservationOut":
+        return _settlement_observation(body, device_id)
     # Bound frames before validators recurse; identified items have separate bounds.
     if not within_wire_bounds(body):
         raise InvalidJobEvidence({"device_id": device_id}, reason)
@@ -202,19 +204,24 @@ def validate_settlement_item(component, item, device_id, *, depth=1):
     return decoded
 
 
-def _deployment_evidence(body, device_id):
-    """Validate the response frame and decode each independent evidence item."""
-    from .adapter_client import InvalidJobEvidence
-
-    if not isinstance(body, dict):
-        raise InvalidJobEvidence({"device_id": device_id}, "invalid settlement evidence")
+def _deployment_frame(body):
     frame = {**body}
     if isinstance(frame.get("attempts"), list):
         frame["attempts"] = []
     if isinstance(frame.get("head"), dict):
         frame["head"] = None
+    return frame
+
+
+def _deployment_evidence(body, device_id, *, depth=1):
+    """Validate the response frame and decode each independent evidence item."""
+    from .adapter_client import InvalidJobEvidence
+
+    if not isinstance(body, dict):
+        raise InvalidJobEvidence({"device_id": device_id}, "invalid settlement evidence")
+    frame = _deployment_frame(body)
     if (
-        not within_wire_bounds(frame)
+        not within_wire_bounds(frame, start_depth=depth)
         or not VALIDATORS["DeviceDeploymentEvidenceOut"].is_valid(frame)
         or body["device_id"] != device_id
     ):
@@ -223,9 +230,44 @@ def _deployment_evidence(body, device_id):
         **body,
         "head": None
         if body["head"] is None
-        else validate_settlement_item("DeploymentHeadEvidenceOut", body["head"], device_id, depth=2),
+        else validate_settlement_item("DeploymentHeadEvidenceOut", body["head"], device_id, depth=depth + 1),
         "attempts": [
-            validate_settlement_item("DeploymentAttemptEvidenceOut", row, device_id, depth=3)
+            validate_settlement_item("DeploymentAttemptEvidenceOut", row, device_id, depth=depth + 2)
             for row in body["attempts"]
+        ],
+    }
+
+
+def _settlement_observation(body, device_id):
+    """Validate one observation frame and decode each identified item separately."""
+    from .adapter_client import InvalidJobEvidence
+
+    if not isinstance(body, dict):
+        raise InvalidJobEvidence({"device_id": device_id}, "invalid settlement evidence")
+    frame = {**body}
+    if isinstance(frame.get("job"), dict):
+        frame["job"] = None
+    for key in ("generations", "receipts"):
+        if isinstance(frame.get(key), list):
+            frame[key] = []
+    if isinstance(frame.get("deployment"), dict):
+        frame["deployment"] = _deployment_frame(frame["deployment"])
+    if not within_wire_bounds(frame) or not VALIDATORS["SettlementObservationOut"].is_valid(frame):
+        raise InvalidJobEvidence({"device_id": device_id}, "invalid settlement evidence")
+    if body["device"]["device_id"] != device_id:
+        raise InvalidJobEvidence({"device_id": device_id}, "invalid settlement evidence")
+    return {
+        **body,
+        "job": None
+        if body["job"] is None
+        else validate_settlement_item("JobEvidenceOut", body["job"], device_id, depth=2),
+        "generations": [
+            validate_settlement_item("DeviceGenerationEvidenceOut", row, device_id, depth=3)
+            for row in body["generations"]
+        ],
+        "deployment": _deployment_evidence(body["deployment"], device_id, depth=2),
+        "receipts": [
+            validate_settlement_item("SettlementReceiptEvidenceOut", row, device_id, depth=3)
+            for row in body["receipts"]
         ],
     }

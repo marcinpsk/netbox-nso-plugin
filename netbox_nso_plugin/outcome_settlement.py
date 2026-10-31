@@ -20,6 +20,13 @@ from .apply_settlement import (
 )
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
 from .refusal_registry import OVERLAYS
+from .settlement_resolution import (
+    RESOLVED_STATES,
+    acknowledged_since,
+    close_completed_attempt,
+    cover_unknown_contributions,
+    unknown_bookkeeping,
+)
 from .settlement_schemas import canonical_uuid
 
 
@@ -533,7 +540,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
                 store_incarnation=incarnation,
                 generation_id=generation["generation_id"],
                 attempt=attempt,
-                consumption_state="consumed",
+                consumption_state__in=RESOLVED_STATES,
             )
             .exclude(carrier_job_id=generation["carrier_job_id"])
             .exists()
@@ -557,7 +564,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
                     management=management,
                     store_incarnation=incarnation,
                     generation_id=generation["generation_id"],
-                    consumption_state="consumed",
+                    consumption_state__in=RESOLVED_STATES,
                 ).exists()
                 else "cadence",
                 selected={row.stream: row.source_push_seq or row.selection_revision for row in selections.values()},
@@ -629,10 +636,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
         )
         execution.consumed_at = timezone.now()
         execution.save(update_fields=("consumption_state", "consumed_at"))
-        if not attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists():
-            attempt.lifecycle = "terminal"
-            attempt.completed_at = timezone.now()
-            attempt.save(update_fields=("lifecycle", "completed_at"))
+        close_completed_attempt(attempt, timezone.now())
         return execution
 
 
@@ -644,7 +648,8 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
     generation = execution.terminal_projection
     fence = fence_for(row) if row is not None else None
     matches = capture._matches(snapshot, row, management, {}, "expected", check_revisions=False)
-    if not matches or _earlier_execution(fence, generation, execution.store_incarnation, settle_seq):
+    acknowledged = None if matches else acknowledged_since(snapshot, row, fence, management)
+    if not (matches or acknowledged) or _earlier_execution(fence, generation, execution.store_incarnation, settle_seq):
         disposition = "superseded"
     else:
         disposition = OwnerOutcome(snapshot, tuple(outcomes)).disposition
@@ -653,7 +658,10 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
 
             if not static_route_success_proven(snapshot, generation):
                 disposition = "unavailable"
-        values = {name: copy.deepcopy(getattr(snapshot, "prior_" + name)) for name in capture._BOOKKEEPING}
+        # After an acknowledgement, the state before this execution is the acknowledged one.
+        source = row if acknowledged else snapshot
+        prefix = "" if acknowledged else "prior_"
+        values = {name: copy.deepcopy(getattr(source, prefix + name)) for name in capture._BOOKKEEPING}
         if disposition == "refused":
             causes = [cause for outcome in outcomes for cause in outcome["refusals"]]
             error = refusal_error(causes, json_error=OVERLAYS[snapshot.model_label].error_type == "JSONField")
@@ -665,6 +673,11 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
                 last_apply_error={} if OVERLAYS[snapshot.model_label].error_type == "JSONField" else "",
                 apply_attempt_id=attempt.pk,
             )
+        unknown = cover_unknown_contributions(row, fence, execution, outcomes)
+        if unknown and disposition != "refused":
+            # Every final write keeps acknowledged unknown contributions from success or prior state.
+            disposition = "unavailable"
+            values = unknown_bookkeeping(row, [owner.issue.job_id for owner, _keys in unknown], attempt)
         with suppress_intent_push(), mirror_refresh(row, values) as locked:
             _require(locked is not None, "owner_disappeared_under_lock")
             for name, value in values.items():

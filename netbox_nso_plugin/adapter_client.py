@@ -1962,6 +1962,35 @@ def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
     return _settlement_response(resp, "DeviceDeploymentEvidenceOut", adapter_device_id)
 
 
+def get_settlement_observation(adapter_device_id, *, job_id, after_settle_seq, apply_attempt_ids):
+    """Read one target job and its next-feed proof from one adapter snapshot."""
+    request = {
+        "job_id": job_id,
+        "after_settle_seq": after_settle_seq,
+        "apply_attempt_ids": sorted({str(attempt_id) for attempt_id in apply_attempt_ids}),
+    }
+    resp = _request_response("POST", f"/api/v1/devices/{adapter_device_id}/settlement-observation", json=request)
+    observation = _settlement_response(resp, "SettlementObservationOut", adapter_device_id)
+    job = observation["job"]
+    absent = observation["absent"]["job_id"]
+    next_feed = observation["next_feed"]
+    if (
+        observation["request"] != request
+        or (job is None) != (absent == job_id)
+        or absent not in (None, job_id)
+        or job is not None
+        and job["id"] != job_id
+        or next_feed is not None
+        and (
+            next_feed["device_id"] != adapter_device_id
+            or type(next_feed["settle_seq"]) is not int
+            or next_feed["settle_seq"] <= after_settle_seq
+        )
+    ):
+        raise InvalidJobEvidence({"device_id": adapter_device_id}, "invalid settlement evidence")
+    return observation
+
+
 def list_nso_devices(nso_instance_id: str) -> list[dict]:
     """GET /api/v1/nso-instances/{id}/devices — enriched device list.
 

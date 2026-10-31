@@ -768,6 +768,32 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         assert parsed.path == f"/api/v1/devices/{management.adapter_device_id}/generations"
         assert parse_qs(parsed.query) == {"limit": ["500"]}
 
+    def test_pinned_adapter_serves_the_settlement_observation_reader(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSOInstance
+
+        instance = NSOInstance.objects.create(name="o3c-pin", adapter_instance_id="o3c-pin")
+        management = self._link(make_device("observation-pin"), instance, "observation-pin")
+        unknown = uuid4()
+        _AdapterWireSession.reset(self.environment.adapter_port)
+
+        observation = adapter_client.get_settlement_observation(
+            management.adapter_device_id, job_id=2**31 - 1, after_settle_seq=0, apply_attempt_ids=[unknown, unknown]
+        )
+
+        assert observation["job"] is None
+        assert observation["absent"]["job_id"] == 2**31 - 1
+        assert observation["absent"]["apply_attempt_ids"] == [str(unknown)]
+        assert observation["device"]["device_id"] == management.adapter_device_id
+        assert observation["deployment"]["unknown_apply_attempt_ids"] == [str(unknown)]
+        [request] = _AdapterWireSession.snapshot()
+        assert urlparse(request["url"]).path == (
+            f"/api/v1/devices/{management.adapter_device_id}/settlement-observation"
+        )
+        assert request["body"] == {"job_id": 2**31 - 1, "after_settle_seq": 0, "apply_attempt_ids": [str(unknown)]}
+
     def test_a_plugin_onboard_completes_through_the_pinned_provision_attempt_contract(self):
         from uuid import uuid4
 

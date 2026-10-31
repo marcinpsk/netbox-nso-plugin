@@ -19,6 +19,8 @@ from .refusal_ledger import NSOAcceptedSelection as NSOAcceptedSelection
 from .refusal_ledger import NSOApplyExecution as NSOApplyExecution
 from .refusal_ledger import NSOApplyOverlaySnapshot as NSOApplyOverlaySnapshot
 from .refusal_ledger import NSOOverlaySettlementFence as NSOOverlaySettlementFence
+from .refusal_ledger import NSOSettlementIssue as NSOSettlementIssue
+from .refusal_ledger import NSOSettlementIssueOwner as NSOSettlementIssueOwner
 
 
 class _OwnedOverlayModel(NetBoxModel):
