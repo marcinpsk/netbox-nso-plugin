@@ -234,7 +234,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         self.assertEqual((result.consumed, self.management.settle_cursor_seq), (1, 41))
         execution = NSOApplyExecution.objects.get(management=self.management, carrier_job_id=501)
-        self.assertEqual(execution.invariant_code, "invalid_terminal_batch")
+        self.assertEqual(execution.invariant_code, "cause_not_in_frozen_contribution")
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, "Settlement is paused", count=1)
         self.assertContains(response, "Adapter job 501")
