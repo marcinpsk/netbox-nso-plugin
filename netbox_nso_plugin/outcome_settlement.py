@@ -321,22 +321,6 @@ def _record_invariant(management, generation, incarnation, attempt, code):
         )
 
 
-def validate_terminal_generation(
-    management, generation, store_incarnation, *, attempt=None, authorities=None, receipt_recoveries=None
-):
-    """Prove complete ownership without binding selections or writing overlays."""
-    with identify_generation_stall(generation):
-        try:
-            return _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
-        except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
-            code = _batch_code(exc)
-            _record_invariant(management, generation, store_incarnation, attempt, code)
-            error = EvidenceInvariantError(code)
-            if hasattr(exc, "invalid_job"):
-                error.invalid_job = exc.invalid_job
-            raise error from exc
-
-
 def _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries):
     _validate_generation(generation)
     _require(canonical_uuid(store_incarnation), "missing_store_incarnation")
