@@ -234,7 +234,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         self.assertEqual((result.consumed, self.management.settle_cursor_seq), (1, 41))
         execution = NSOApplyExecution.objects.get(management=self.management, carrier_job_id=501)
-        self.assertEqual(execution.invariant_code, "invalid_terminal_batch")
+        self.assertEqual(execution.invariant_code, "cause_not_in_frozen_contribution")
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, "Settlement is paused", count=1)
         self.assertContains(response, "Adapter job 501")
@@ -465,7 +465,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         from django.db import transaction
 
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
-        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation, validate_terminal_generation
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         self.prepare()
         generation = self.terminal()
@@ -476,12 +476,12 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             "{00000000-0000-4000-8000-000000000001}",
             "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
         ):
-            for consume in (validate_terminal_generation, settle_terminal_generation):
-                with self.subTest(incarnation=incarnation, consume=consume.__name__), transaction.atomic():
-                    kwargs = {"settle_seq": 1} if consume is settle_terminal_generation else {}
-                    with self.assertRaises(EvidenceInvariantError):
-                        consume(self.management, generation, incarnation, attempt=self.attempt, **kwargs)
-                    self.assertFalse(NSOApplyExecution.objects.exists())
+            with self.subTest(incarnation=incarnation, consume="settle_terminal_generation"), transaction.atomic():
+                with self.assertRaises(EvidenceInvariantError):
+                    settle_terminal_generation(
+                        self.management, generation, incarnation, attempt=self.attempt, settle_seq=1
+                    )
+                self.assertFalse(NSOApplyExecution.objects.exists())
             with self.subTest(incarnation=incarnation, consume="settle_apply_attempts"), transaction.atomic():
                 with self.assertRaisesRegex(EvidenceInvariantError, "missing_store_incarnation"):
                     settle_apply_attempts(
@@ -498,7 +498,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             _validate_generation,
             identify_evidence_stall,
         )
-        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation, validate_terminal_generation
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
         from netbox_nso_plugin.selection_receipts import _source_pairs
 
         self.prepare()
@@ -507,7 +507,6 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         validators = (
             _validate_generation,
             _source_pairs,
-            lambda row: validate_terminal_generation(self.management, row, "00000000-0000-4000-8000-000000000004"),
             lambda row: settle_terminal_generation(self.management, row, "00000000-0000-4000-8000-000000000004"),
         )
         for validate in validators:
