@@ -15,6 +15,7 @@ from netbox.models import NetBoxModel
 from .outbox import CONTRIBUTION_KIND_CHOICES, CONTRIBUTION_KIND_ORDINARY
 from .ownership_grants import GRANTS
 from .ownership_querysets import OwnershipQuerySet
+from .refusal_ledger import ACKNOWLEDGE_SETTLEMENT_ISSUE
 from .refusal_ledger import NSOAcceptedSelection as NSOAcceptedSelection
 from .refusal_ledger import NSOApplyExecution as NSOApplyExecution
 from .refusal_ledger import NSOApplyOverlaySnapshot as NSOApplyOverlaySnapshot
@@ -587,6 +588,8 @@ class NSODeviceManagement(NetBoxModel):
     settle_stall_attempts = models.PositiveIntegerField(default=0)
     settle_stall_first_seen_at = models.DateTimeField(null=True, blank=True)
     settle_evidence_error = models.JSONField(default=dict, blank=True)
+    # An acknowledgement sets this in its transaction; a pass that saw it and drained the feed clears it.
+    settle_resume_pending = models.BooleanField(default=False)
     # Per-scope record of what an intent push was rejected with. ``intent_push_attempts``
     # is the never-cleared per-scope high-water mark: clearing the error entry on success
     # would take the attempt token with it, and a delayed failure from an earlier attempt
@@ -664,6 +667,7 @@ class NSODeviceManagement(NetBoxModel):
         ordering = ["device"]
         verbose_name = "NSO Device Management"
         verbose_name_plural = "NSO Device Management"
+        permissions = [(ACKNOWLEDGE_SETTLEMENT_ISSUE, "Acknowledge a settlement issue as outcome unknown")]
 
     # Columns a save that does not name them must never carry — see save().
     _PUSH_RECORD_FIELDS = ("intent_push_errors", "intent_push_attempts")
@@ -680,6 +684,7 @@ class NSODeviceManagement(NetBoxModel):
         "settle_stall_attempts",
         "settle_stall_first_seen_at",
         "settle_evidence_error",
+        "settle_resume_pending",
         "adapter_link_attempted_at",
     )
     # One authority for the refresh, so a column protected in one group cannot be missed.

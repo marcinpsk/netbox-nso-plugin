@@ -157,7 +157,23 @@ def project_rows(rows):
                 if current is not None:
                     row._refusal_current = current
     _load_previous_refusals(owners)
+    from .settlement_resolution import acknowledged_unknown_jobs
+
+    for key, jobs in acknowledged_unknown_jobs(owners.values()).items():
+        owners[key]._acknowledged_jobs = jobs
     return rows
+
+
+def _acknowledged_jobs(row):
+    """Return the acknowledged jobs whose unknown contributions still bind this owner."""
+    from .refusal_registry import OVERLAYS
+    from .settlement_resolution import acknowledged_unknown_jobs
+
+    if not hasattr(row, "_meta") or row._meta.label_lower not in OVERLAYS or row.pk is None:
+        return ()
+    if not hasattr(row, "_acknowledged_jobs"):
+        row._acknowledged_jobs = acknowledged_unknown_jobs([row])[(row._meta.label_lower, row.pk)]
+    return row._acknowledged_jobs
 
 
 def settled_interface_owners(queryset):
@@ -266,8 +282,10 @@ def _previous_refusal(row):
 def row_projection(row, interface=None):
     """Decide owner state, pending membership and safe execution evidence together."""
     from .refusal_registry import OVERLAYS
+    from .settlement_resolution import unknown_advisory
 
     error = getattr(row, "last_apply_error", None)
+    acknowledged = _acknowledged_jobs(row)
     historical_refusal = None
     projection = {"refusal": None, "refusal_text": "", "advisory": "", "error": None, "error_history": False}
     if isinstance(error, dict) and "refusals" in error:
@@ -286,11 +304,18 @@ def row_projection(row, interface=None):
                 historical_refusal = projection["refusal"]
                 projection["error"] = projection["refusal"]["text"]
             projection["refusal"] = None
+    # The acknowledgement stores its advisory as the error text; it shows as the advisory only.
+    advisories = (
+        {unknown_advisory(acknowledged), *(unknown_advisory([job]) for job in acknowledged)} if acknowledged else set()
+    )
     if projection["refusal"] is not None:
         projection["refusal_text"] = projection["refusal"]["text"]
         projection["error"] = projection["refusal_text"]
     elif error and projection["error"] is None:
-        projection["error"] = (error.get("message") or str(error)) if isinstance(error, dict) else error
+        message = (error.get("message") or str(error)) if isinstance(error, dict) else error
+        projection["error"] = None if message in advisories else message
+    if not projection["advisory"] and acknowledged:
+        projection["advisory"] = unknown_advisory(acknowledged)
     if not projection["advisory"]:
         projection["advisory"] = getattr(row, "last_result_advisory", "") or ""
     spec = OVERLAYS.get(row._meta.label_lower) if hasattr(row, "_meta") else None
@@ -303,7 +328,7 @@ def row_projection(row, interface=None):
         )
     else:
         projection["error_value"] = projection["error"] if projection["error"] is not None else error
-    kind, label, owned = _row_classification(row, projection, interface)
+    kind, label, owned = _row_classification(row, projection, interface, acknowledged)
     if kind == "in_sync":
         # A current not_applied restoration keeps its prior error as history; older failure text is not shown.
         restored = projection["execution_disposition"] == "not_applied" and projection["error"] is not None
@@ -335,7 +360,7 @@ def _stored_state(status, owned):
     return "unknown", status or "unknown"
 
 
-def _row_classification(row, projected, interface):
+def _row_classification(row, projected, interface, acknowledged=()):
     """Give current execution evidence precedence over stored status and value equality."""
     from .status_machine import OWNED_STATES
     from .summary import _COMPARABLE_IFACE_ATTRS, _netbox_value_for, matches_device_value
@@ -347,6 +372,9 @@ def _row_classification(row, projected, interface):
         return "apply_failed", "apply failed", owned
     if projected["advisory"] == UNAVAILABLE:
         return "unavailable", "previous " + _stored_state(row.status, owned)[1], owned
+    if acknowledged and row.status == "apply_failed":
+        # An acknowledged unknown outcome never reads as success, also when the values match.
+        return "apply_failed", "outcome unknown", owned
     if interface is None and hasattr(row, "attribute"):
         interface = getattr(row, "interface", None)
     # A current restoration or an ordinary error outranks value equality; an uncorrelated refusal does not.

@@ -461,6 +461,38 @@ class HistoricalStore:
             settle_cursor_device_id=device_id,
         )
 
+    def manual_reference(self, *, promoted=True, **response):
+        from uuid import uuid4
+
+        attempt_id = uuid4()
+        link = {
+            "generation_id": 60,
+            "seq": 2,
+            "job_id": 40,
+            "mode": "networked",
+            "source_push_seq": {"bgp": 999},
+            "stream_revisions": {"bgp": 3},
+            "digest": "a" * 64,
+        }
+        return NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            adapter_apply_attempt_id=attempt_id if promoted else None,
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            source_epoch=self.management.adapter_source_epoch,
+            selected={"bgp": 999},
+            scope_revisions={"bgp": 1},
+            http_status=202,
+            response={
+                "device_id": self.management.adapter_device_id,
+                "outcome": "promoted",
+                "selected": {"bgp": 999},
+                "skipped": {},
+                "generations": [link],
+                **response,
+            },
+        )
+
 
 class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGPCaptureCase):
     def stall_history(self):
@@ -550,38 +582,6 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         self.assertEqual(outcome, {"recorded": False})
         lost.refresh_from_db()
         self.assertIsNone(lost.response)
-
-    def manual_reference(self, *, promoted=True, **response):
-        from uuid import uuid4
-
-        attempt_id = uuid4()
-        link = {
-            "generation_id": 60,
-            "seq": 2,
-            "job_id": 40,
-            "mode": "networked",
-            "source_push_seq": {"bgp": 999},
-            "stream_revisions": {"bgp": 3},
-            "digest": "a" * 64,
-        }
-        return NSOApplyAttempt.objects.create(
-            id=attempt_id,
-            adapter_apply_attempt_id=attempt_id if promoted else None,
-            management=self.management,
-            adapter_device_id=self.management.adapter_device_id,
-            source_epoch=self.management.adapter_source_epoch,
-            selected={"bgp": 999},
-            scope_revisions={"bgp": 1},
-            http_status=202,
-            response={
-                "device_id": self.management.adapter_device_id,
-                "outcome": "promoted",
-                "selected": {"bgp": 999},
-                "skipped": {},
-                "generations": [link],
-                **response,
-            },
-        )
 
     def assert_no_exit(self, code):
         issue = self.stall_history()
