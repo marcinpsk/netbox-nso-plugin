@@ -121,18 +121,24 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
 
 def _clear_resume_request(pk, fence):
     """Clear the resume request after a drained pass, unless the cursor moved after the walk."""
-    from .intent_state import mirror_refresh
     from .models import NSODeviceManagement
     from .settlement_evidence import matches_request_fence
-    from .signals import suppress_intent_push
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
         if not row.settle_resume_pending or not matches_request_fence(row, fence):
             return
-        with suppress_intent_push(), mirror_refresh(row, ("settle_resume_pending",)) as locked:
-            locked.settle_resume_pending = False
-            locked.save(update_fields=("settle_resume_pending",))
+        _write_resume_request(row, False)
+
+
+def _write_resume_request(row, pending):
+    """Write the durable resume request while the caller holds the management row lock."""
+    from .intent_state import mirror_refresh
+    from .signals import suppress_intent_push
+
+    with suppress_intent_push(), mirror_refresh(row, ("settle_resume_pending",)) as locked:
+        locked.settle_resume_pending = pending
+        locked.save(update_fields=("settle_resume_pending",))
 
 
 def request_settlement_pass(device_id):
@@ -371,8 +377,8 @@ def _acknowledgement_count(pk):
 def _invalid_evidence_stall(management, fence, acknowledged, error, stall_class, code=None):
     """Retain invalid evidence without advancing its settlement cursor.
 
-    A pass that read its evidence before an acknowledgement committed writes nothing: a historical
-    acknowledgement keeps the request fence, and the acknowledgement already requested a new pass.
+    A pass that read its evidence before an acknowledgement committed does not write its stall, because a
+    historical acknowledgement keeps the request fence. It requests a fresh pass, so a stall only it saw stays owed.
     """
     from .models import NSODeviceManagement
 
@@ -380,6 +386,8 @@ def _invalid_evidence_stall(management, fence, acknowledged, error, stall_class,
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
         if _acknowledgement_count(row.pk) == acknowledged:
             write_diagnostic(row, fence, error, stall_class=stall_class, code=code)
+        elif not row.settle_resume_pending:
+            _write_resume_request(row, True)
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
 
 

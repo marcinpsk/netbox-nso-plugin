@@ -16,7 +16,7 @@ from django.db import OperationalError, connection, connections
 from django.db.models.signals import post_init
 
 from netbox_nso_plugin.models import NSOApplyExecution, NSODeviceManagement, NSOSettlementIssue
-from netbox_nso_plugin.settlement import consume_static_route_settlements
+from netbox_nso_plugin.settlement import consume_static_route_settlements, sweep_static_route_settlements
 
 from ._adapter_http import make_generation_listing
 from ._bgp_settlement import BGPSettlementHelpers
@@ -32,12 +32,16 @@ WAIT = 30
 class RaceHelpers:
     def hold_observation(self):
         """Hold the next settlement observation until released; the caller then owns its locks."""
+        return self.hold_next("POST", "/settlement-observation")
+
+    def hold_next(self, verb, route):
+        """Hold the next adapter request for *route* until released."""
         entered, release = threading.Event(), threading.Event()
         original = self.adapter._handle
         armed = []
 
         def handle(method, url, **kwargs):
-            if url.endswith("/settlement-observation") and not armed:
+            if method == verb and url.endswith(route) and not armed:
                 armed.append(True)
                 entered.set()
                 release.wait(WAIT)
@@ -364,3 +368,35 @@ class TestHistoricalAcknowledgementAgainstSettlement(
         self.management.refresh_from_db()
         self.assertFalse(self.management.settle_resume_pending)
         self.assertEqual(self.management.settle_evidence_error, {})
+
+    def test_a_stall_that_only_a_stale_pass_saw_stays_owed(self):
+        self.serve_history()
+        client = self.client_for(self.acknowledger())
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        issue = NSOSettlementIssue.objects.get(state="open")
+        # The pass counts acknowledgements and reads the feed, then waits inside its listing read.
+        entered, release = self.hold_next("GET", "/generations")
+        pass_thread, passed = self.run_pass({"thread": None})
+        self.assertTrue(entered.wait(WAIT))
+        client.post(self.action_url(), self.form(issue, reason="placeholder pre-ledger carrier"))
+        self.drain_queue()
+        self.management.refresh_from_db()
+        self.assertFalse(self.management.settle_resume_pending)
+        # The adapter then publishes an invalid job that only the held pass will read.
+        later = copy.deepcopy(self.history_jobs[0])
+        later.update(id=52, type="sync", result=None, settle_seq=6)
+        self.history_jobs.append(later)
+        self.invalid_feed_job(52)
+        release.set()
+        self.join(pass_thread)
+        self.assertNotIn("error", passed)
+        self.assertTrue(passed["result"].stalled)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error, {})
+        self.assertTrue(self.management.settle_resume_pending)
+        serve_observation(self)
+        self.assertEqual(sweep_static_route_settlements(), (1, 0))
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error["job_id"], 52)
+        self.assertTrue(self.management.settle_resume_pending)
+        self.assertEqual(NSOSettlementIssue.objects.get(state="open").job_id, 52)
