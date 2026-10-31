@@ -321,7 +321,8 @@ class TestIncarnationSpelling(_L2Base):
             for born in (_INC[1], newer_born):
                 with self.subTest(spelling=spelling, born=born):
                     read_state = {**_rs(attempt_id=9), "incarnation": spelling, "incarnation_born": born}
-                    self._http_observe({"l2_service": read_state})
+                    with self.assertNoLogs("netbox_nso_plugin.views", level="ERROR"):
+                        self._http_observe({"l2_service": read_state})
                     self.assertEqual(self._markers(), ("", None, None))
                     self.assertEqual(self.mgmt.adapter_incarnation, _INC[0])
 
