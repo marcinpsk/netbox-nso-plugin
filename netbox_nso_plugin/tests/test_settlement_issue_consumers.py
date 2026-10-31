@@ -22,12 +22,15 @@ from netbox_nso_plugin.settlement_resolution import instant
 from ._adapter_http import make_response
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import content_update, mirror_update
+from ._refusal_display import RefusalDisplayHelpers
 from ._settlement_observation import INCARNATION, failed_item, serve_observation
 from .test_durable_bgp_capture import BGPCaptureCase
 from .test_settlement_issue import ADVISORY, HistoricalStore, SettlementIssueHelpers
 
 
-class TestAcknowledgedObligationConsumers(SettlementIssueHelpers, BGPSettlementHelpers, BGPCaptureCase):
+class TestAcknowledgedObligationConsumers(
+    SettlementIssueHelpers, RefusalDisplayHelpers, BGPSettlementHelpers, BGPCaptureCase
+):
     def acknowledged_carrier(self):
         issue = self.stall_invalid_manual_carrier()
         acknowledge(issue, issue.revision_digest, self.operator(), "carrier result unreadable")
@@ -127,6 +130,35 @@ class TestAcknowledgedObligationConsumers(SettlementIssueHelpers, BGPSettlementH
         for owner in self.owners[1:]:
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
+
+    def test_a_later_unavailable_settlement_keeps_the_acknowledged_advisory_on_the_row(self):
+        from django.urls import reverse
+
+        from netbox_nso_plugin.refusal_display import UNAVAILABLE
+
+        from .test_refusal_display_parity import OwnerHTML, owner_projections
+
+        self.acknowledged_carrier()
+        router = self.owners[0]
+        router.refresh_from_db()
+        self.unknown_owner(router, ["bgp", "bgp.router", "f" * 64], 499)
+        self.serve_retry()
+        self.assertFalse(consume_static_route_settlements(self.management).stalled)
+        expected = {
+            "state": "apply_failed",
+            "label": "outcome unknown",
+            "pending": True,
+            "advisory": ADVISORY.format(499),
+            "error": None,
+        }
+        parsed = OwnerHTML()
+        parsed.feed(self.category("bgp").content.decode())
+        payload = dict(owner_projections(self.category("bgp", format="json").json()))
+        key = (router._meta.model_name, router.pk)
+        for surface in (parsed.owners[key], payload[key]):
+            self.assertEqual({name: surface[name] for name in expected}, expected)
+        tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(tab, UNAVAILABLE)
 
     def test_the_not_applied_restore_cannot_restore_success_over_an_unknown_contribution(self):
         self.prepare()

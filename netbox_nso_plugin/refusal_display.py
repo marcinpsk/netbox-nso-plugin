@@ -292,7 +292,11 @@ def row_projection(row, interface=None):
         projection["refusal"] = safe_projection(error["refusals"])
     current = _current_snapshot(row)
     projection["execution_disposition"] = current[0].settlement_disposition if current else None
-    projection["advisory"] = UNAVAILABLE if projection["execution_disposition"] == "unavailable" else ""
+    # An acknowledged unknown outcome outranks a later unavailable settlement of the same acceptance.
+    if acknowledged:
+        projection["advisory"] = unknown_advisory(acknowledged)
+    elif projection["execution_disposition"] == "unavailable":
+        projection["advisory"] = UNAVAILABLE
     if isinstance(error, str) and error and projection["execution_disposition"] != "refused":
         projection["refusal"] = _previous_refusal(row)
     if current is not None and (projection["refusal"] is None or projection["refusal"]["valid"]):
@@ -314,8 +318,6 @@ def row_projection(row, interface=None):
     elif error and projection["error"] is None:
         message = (error.get("message") or str(error)) if isinstance(error, dict) else error
         projection["error"] = None if message in advisories else message
-    if not projection["advisory"] and acknowledged:
-        projection["advisory"] = unknown_advisory(acknowledged)
     if not projection["advisory"]:
         projection["advisory"] = getattr(row, "last_result_advisory", "") or ""
     spec = OVERLAYS.get(row._meta.label_lower) if hasattr(row, "_meta") else None
@@ -503,7 +505,7 @@ def device_execution_summaries(management):
         current = _current_snapshot(row)
         if current is not None:
             execution = current[1]
-            unavailable = row_projection(row)["advisory"] == UNAVAILABLE
+            unavailable = row_projection(row)["execution_disposition"] == "unavailable"
             previous = executions.get(execution.pk)
             executions[execution.pk] = (execution, unavailable or bool(previous and previous[1]))
     summaries = []

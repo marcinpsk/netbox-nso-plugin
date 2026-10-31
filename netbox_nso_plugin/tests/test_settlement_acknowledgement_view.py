@@ -25,7 +25,7 @@ from ._outbox_case import make_managed, mirror_update
 from ._refusal_display import RefusalDisplayHelpers
 from ._settlement_observation import serve_observation
 from .test_durable_bgp_capture import BGPCaptureCase
-from .test_refusal_display_parity import OwnerHTML
+from .test_refusal_display_parity import OwnerHTML, owner_projections
 from .test_request_authorization import _grant
 from .test_settlement_issue import ADVISORY, HistoricalStore, SettlementIssueHelpers
 
@@ -360,7 +360,7 @@ class TestAcknowledgementAction(AcknowledgementViewHelpers, BGPSettlementHelpers
         }
         parsed = OwnerHTML()
         parsed.feed(self.category("bgp").content.decode())
-        payload = dict(_owner_rows(self.category("bgp", format="json").json()))
+        payload = dict(owner_projections(self.category("bgp", format="json").json()))
         for row in self.owners:
             key = (row._meta.model_name, row.pk)
             with self.subTest(owner=key):
@@ -383,17 +383,6 @@ class TestAcknowledgementAction(AcknowledgementViewHelpers, BGPSettlementHelpers
         owner_reads = [query for query in batched if "nsosettlementissueowner" in query["sql"]]
         self.assertEqual(len(owner_reads), 1)
         self.assertFalse([query for query in projected if "nsosettlementissueowner" in query["sql"]])
-
-
-def _owner_rows(value):
-    if isinstance(value, dict):
-        if "model" in value and "pk" in value:
-            yield (value["model"], value["pk"]), value
-        for child in value.values():
-            yield from _owner_rows(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _owner_rows(child)
 
 
 class TestAcknowledgementAuthorization(AcknowledgementViewHelpers, BGPSettlementHelpers, BGPCaptureCase):
