@@ -96,7 +96,7 @@ class TestMigrationGraph(SimpleTestCase):
         loader = MigrationLoader(None, ignore_no_migrations=True)
         leaves = sorted(name for app, name in loader.graph.leaf_nodes() if app == APP)
 
-        assert leaves == ["0039_settlement_issue"]
+        assert leaves == ["0040_snapshot_owner_epoch_index"]
         assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
         state = loader.project_state([(APP, leaves[0])])
         for name in (
@@ -112,6 +112,8 @@ class TestMigrationGraph(SimpleTestCase):
         assert "verification_attempt" in state.models[APP, "nsointentdeploymentcontrol"].fields
         assert "paired_activation" in state.models[APP, "nsointentdeploymentcontrol"].fields
         assert "nso_attempt_prune" in {index.name for index in state.models[APP, "nsoapplyattempt"].options["indexes"]}
+        snapshot_indexes = state.models[APP, "nsoapplyoverlaysnapshot"].options["indexes"]
+        assert "nso_snapshot_owner_epoch" in {index.name for index in snapshot_indexes}
 
 
 class TestMigrationsMatchTheModels(TestCase):

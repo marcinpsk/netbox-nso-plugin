@@ -227,6 +227,13 @@ class NSOApplyOverlaySnapshot(models.Model):
             models.UniqueConstraint(fields=["attempt", "model_label", "overlay_pk"], name="nso_snapshot_owner"),
             models.CheckConstraint(condition=models.Q(model_label__in=_LABELS), name="nso_snapshot_closed_model"),
         ]
+        # The absent-owner proof reads an owner's snapshots across attempts.
+        indexes = [
+            models.Index(
+                fields=["model_label", "overlay_pk", "mapping_epoch", "expected_fence_revision"],
+                name="nso_snapshot_owner_epoch",
+            )
+        ]
 
 
 class NSOOverlaySettlementFence(models.Model):
