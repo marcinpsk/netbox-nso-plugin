@@ -231,13 +231,13 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
         self.assertEqual(issue.acknowledgement_reason, "the carrier result cannot be read")
         self.assertIsNotNone(issue.acknowledged_at.utcoffset())
         self.assertEqual(
-            sorted(issue.committed_effects, key=lambda row: row["overlay_pk"]),
+            sorted(issue.committed_effects, key=lambda row: (row["model_label"], row["overlay_pk"])),
             sorted(
                 (
                     {"model_label": row._meta.label_lower, "overlay_pk": row.pk, "effect": "unavailable"}
                     for row in self.owners
                 ),
-                key=lambda row: row["overlay_pk"],
+                key=lambda row: (row["model_label"], row["overlay_pk"]),
             ),
         )
         execution = NSOApplyExecution.objects.get()
