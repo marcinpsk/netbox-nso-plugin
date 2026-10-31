@@ -56,6 +56,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     # Only a pass that saw the resume request before its reads may clear it.
     resume = management.settle_resume_pending
     fence = request_fence(management)
+    acknowledged = _acknowledgement_count(pk)
     epoch = fence["mapping_epoch"]
     read = None
     consumed = 0
@@ -110,10 +111,10 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
         management.refresh_from_db()
         return ConsumeResult(management.adapter_device_id, consumed, True, epoch_reset, management.settle_cursor_seq)
     except adapter_client.InvalidJobEvidence as exc:
-        stall = _invalid_evidence_stall(management, fence, exc, "invalid_evidence")
+        stall = _invalid_evidence_stall(management, fence, acknowledged, exc, "invalid_evidence")
     except EvidenceInvariantError as exc:
         logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
-        stall = _invariant_evidence_stall(management, fence, exc)
+        stall = _invariant_evidence_stall(management, fence, acknowledged, exc)
     _publish_stall_issue(pk)
     return replace(stall, consumed=consumed, epoch_reset=epoch_reset)
 
@@ -347,21 +348,34 @@ def _historical_carriers(read, management):
     )
 
 
-def _invariant_evidence_stall(management, fence, error):
+def _invariant_evidence_stall(management, fence, acknowledged, error):
     """Persist the invariant through its request fence."""
     from .settlement_evidence import invariant_code
 
     invalid_job = getattr(error, "invalid_job", adapter_client.InvalidJobEvidence({}, "invalid settlement evidence"))
-    return _invalid_evidence_stall(management, fence, invalid_job, "evidence_invariant", invariant_code(error))
+    return _invalid_evidence_stall(
+        management, fence, acknowledged, invalid_job, "evidence_invariant", invariant_code(error)
+    )
 
 
-def _invalid_evidence_stall(management, fence, error, stall_class, code=None):
-    """Retain invalid evidence without advancing its settlement cursor."""
+def _acknowledgement_count(pk):
+    from .models import NSOSettlementIssue
+
+    return NSOSettlementIssue.objects.filter(management_id=pk, state="acknowledged").count()
+
+
+def _invalid_evidence_stall(management, fence, acknowledged, error, stall_class, code=None):
+    """Retain invalid evidence without advancing its settlement cursor.
+
+    A pass that read its evidence before an acknowledgement committed writes nothing: a historical
+    acknowledgement keeps the request fence, and the acknowledgement already requested a new pass.
+    """
     from .models import NSODeviceManagement
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
-        write_diagnostic(row, fence, error, stall_class=stall_class, code=code)
+        if _acknowledgement_count(row.pk) == acknowledged:
+            write_diagnostic(row, fence, error, stall_class=stall_class, code=code)
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
 
 
