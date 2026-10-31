@@ -126,12 +126,13 @@ def _publish_stall_issue(pk):
 
 def _align_carrier_read(read, row, jobs, incarnation):
     """Bind jobs that became terminal during the evidence read before writing owners."""
+    from .apply_settlement import _Rows
     from .durable_capture import mapping_epoch
 
     if read is None or mapping_epoch(row) != read.mapping_epoch or incarnation != read.store_incarnation:
         return None
     known = {job["id"] for job in read.feed_jobs}
-    read.feed_jobs.extend(job for job in jobs if job["id"] not in known)
+    read.feed_jobs = _Rows([*read.feed_jobs, *(job for job in jobs if job["id"] not in known)])
     return read
 
 
@@ -196,7 +197,7 @@ class _SettlementReadChanged(Exception):
 def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fence, *, persist_cursor, seen):
     """Commit one complete carrier after its receipt claims and owner footprint are locked."""
     from .apply_settlement import (
-        _settlement_sequences,
+        _rows,
         _validate_feed_page,
         identify_evidence_stall,
         prepare_carrier_evidence,
@@ -209,7 +210,7 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
 
     identity = job or {"id": carrier_id, "device_id": management.adapter_device_id}
     stalled = False
-    sequences = _settlement_sequences(read.feed_jobs) if read is not None else {}
+    sequences = _rows(read.feed_jobs).sequences if read is not None else {}
     released = job is not None and job["id"] in acknowledged_jobs(management, incarnation)
     with identify_evidence_stall(identity, incarnation, sequences=sequences):
         if released:
@@ -275,11 +276,11 @@ def _validate_released_job(management, job, cursor, seen, incarnation):
 
 def _validate_locked_carrier(read, job):
     """Require the locked feed to retain the carrier facts used for owner settlement."""
-    from .apply_settlement import EvidenceInvariantError
+    from .apply_settlement import EvidenceInvariantError, _rows
 
     if read is None or job is None:
         return
-    retained = next((item for item in read.feed_jobs if item["id"] == job["id"]), None)
+    retained = next(iter(_rows(read.feed_jobs).matching(id=[job["id"]])), None)
     adapter_client.raise_item_error(retained)
     adapter_client.raise_item_error(job)
     if retained is not None and any(

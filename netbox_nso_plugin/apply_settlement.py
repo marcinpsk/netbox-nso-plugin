@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import logging
+from collections import ChainMap
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from functools import cached_property
 from uuid import UUID
 
 from django.utils import timezone
@@ -358,7 +360,7 @@ _ADMISSION_GENERATION_METADATA = ("generation_id", "seq", "digest", "mode", "str
 
 def reconcile_admission_links(responses, generations, *, generation_ids=None, released=frozenset()):
     """Match immutable admission links with the complete generation listing."""
-    by_id = {row["generation_id"]: row for row in generations}
+    by_id = _rows(generations).last_by("generation_id")
     for response in responses:
         if not isinstance(response, dict):
             raise EvidenceInvariantError("admission_generation_mismatch")
@@ -455,7 +457,7 @@ def _reconcile_admissions(
     selected = (
         None
         if carrier_id is None
-        else {row["generation_id"] for row in generations if row["carrier_job_id"] == carrier_id}
+        else {row["generation_id"] for row in _rows(generations).matching(carrier_job_id=[carrier_id])}
         | {
             row["generation_id"]
             for snapshot in snapshots
@@ -907,8 +909,8 @@ def load_deployment_evidence(management, *, attempt_ids=None, defer_carriers=Fal
             raise EvidenceInvariantError("evidence_epoch_changed")
         read = _BoundEvidence(evidence)
         read.store_incarnation = incarnation
-        read.feed_jobs = feed
-        read.generation_listing = generations
+        read.feed_jobs = _Rows(feed)
+        read.generation_listing = _Rows(generations)
         read.read_attempt_ids = attempt_ids
         read.read_snapshots = snapshots
         read.replay_answers = replay_answers
@@ -932,8 +934,9 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
     if mapping_epoch(management) != read.mapping_epoch:
         raise EvidenceInvariantError("evidence_epoch_changed")
     read = without_acknowledged(read, management)
-    jobs = [job for job in read.feed_jobs if carrier_id is None or job["id"] == carrier_id]
-    relevant = [row for row in read.generation_listing if carrier_id is None or row["carrier_job_id"] == carrier_id]
+    feed, listing = _rows(read.feed_jobs), _rows(read.generation_listing)
+    jobs = list(feed) if carrier_id is None else feed.matching(id=[carrier_id])
+    relevant = list(listing) if carrier_id is None else listing.matching(carrier_job_id=[carrier_id])
     raise_evidence_errors(jobs)
     raise_evidence_errors(relevant)
     evidence = dict(read)
@@ -966,7 +969,8 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
     }
     raise_evidence_errors(scoped)
     _reject_unrequested_attempts(evidence, read.read_attempt_ids)
-    sequences = _settlement_sequences(read.feed_jobs)
+    # Each carrier binds its own restored sequences over the shared feed order.
+    sequences = ChainMap({}, feed.sequences)
     _reconcile_admissions(
         management,
         read.read_attempt_ids,
@@ -988,7 +992,6 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
         carrier_id=carrier_id,
         settlement_sequences=sequences,
     )
-    bound.settlement_sequences.update(sequences)
     _restore_consumed_sequences(bound, management, read.store_incarnation)
     _require_ordered_terminal_evidence(bound, management, read.store_incarnation)
     pending, document = _load_pending_receipts(management, scoped, relevant)
@@ -1014,6 +1017,10 @@ def without_acknowledged(read, management):
     jobs = acknowledged_jobs(management, read.store_incarnation)
     if not acknowledged and not jobs:
         return read
+    # The acknowledgement state is read again for every carrier; only the view of an unchanged state is reused.
+    cached = getattr(read, "acknowledged_view", None)
+    if cached is not None and cached[0] is read and cached[1] == (acknowledged, jobs):
+        return cached[2]
 
     def kept(row):
         return row is None or (row["generation_id"], row["carrier_job_id"]) not in acknowledged
@@ -1022,8 +1029,8 @@ def without_acknowledged(read, management):
     view.__dict__.update(vars(read))
     view["head"] = read["head"] if kept(read["head"]) else None
     view["attempts"] = [_attempt_without(raw, kept) for raw in read["attempts"]]
-    view.feed_jobs = [job for job in read.feed_jobs if job["id"] not in jobs]
-    view.generation_listing = [row for row in read.generation_listing if kept(row)]
+    view.feed_jobs = _Rows(job for job in read.feed_jobs if job["id"] not in jobs)
+    view.generation_listing = _Rows(row for row in read.generation_listing if kept(row))
     # An admission link names its generation; only the listing identity says which carrier was released.
     view.released_generation_ids = frozenset(row["generation_id"] for row in read.generation_listing if not kept(row))
     view.read_snapshots = [
@@ -1034,6 +1041,7 @@ def without_acknowledged(read, management):
         }
         for snapshot in read.read_snapshots
     ]
+    read.acknowledged_view = (read, (acknowledged, jobs), view)
     return view
 
 
@@ -1091,14 +1099,13 @@ def _attempt_names_carrier(local_attempts, raw, read, carrier_id):
         return True
     if any(
         row["generation_id"] in generation_ids
-        for job in read.feed_jobs
-        if job["id"] == carrier_id
+        for job in _rows(read.feed_jobs).matching(id=[carrier_id])
         for row in job.get("row_outcomes") or ()
     ):
         return True
     return any(
-        row["generation_id"] in generation_ids and row["carrier_job_id"] == carrier_id
-        for row in read.generation_listing
+        row["generation_id"] in generation_ids
+        for row in _rows(read.generation_listing).matching(carrier_job_id=[carrier_id])
     )
 
 
@@ -1110,8 +1117,8 @@ def _generation_names_carrier(row, read, carrier_id):
         row["carrier_job_id"] == carrier_id
         or isinstance(row, EvidenceItem)
         and any(
-            generation["generation_id"] == row["generation_id"] and generation["carrier_job_id"] == carrier_id
-            for generation in read.generation_listing
+            generation["carrier_job_id"] == carrier_id
+            for generation in _rows(read.generation_listing).matching(generation_id=[row["generation_id"]])
         )
     )
 
@@ -1297,7 +1304,8 @@ def _bound_evidence(
     bound.feed_carrier_ids = {job["id"] for job in jobs}
     bound.automatic_generations = []
     bound.manual_attempt_by_generation = {}
-    by_id = {row["generation_id"]: row for row in generations}
+    generations = _rows(generations)
+    by_id = generations.last_by("generation_id")
     head = evidence["head"]
     if head is not None and head["row_outcomes"] is not None:
         job = _carrier_job(management.adapter_device_id, head["carrier_job_id"], bound.settlement_sequences)
@@ -1318,7 +1326,7 @@ def _bound_evidence(
                 "updated_at": job["updated_at"],
             }
             identifiers = _carrier_generation_ids(outcomes) | {
-                generation["generation_id"] for generation in generations if generation["carrier_job_id"] == job["id"]
+                generation["generation_id"] for generation in generations.matching(carrier_job_id=[job["id"]])
             }
             for generation_id in identifiers:
                 bound.automatic_generations.append(
@@ -1338,11 +1346,12 @@ def _bind_generation_modes(bound, generations):
 
     identifiers = {row["generation_id"] for row in bound.automatic_generations}
     bound.generation_modes = {}
+    if bound.carrier_id is not None:
+        generations = _rows(generations).matching(carrier_job_id=[bound.carrier_id], generation_id=identifiers)
     for row in generations:
-        if bound.carrier_id is None or row["carrier_job_id"] == bound.carrier_id or row["generation_id"] in identifiers:
-            raise_item_error(row)
-            if "mode" in row:
-                bound.generation_modes[row["generation_id"]] = row["mode"]
+        raise_item_error(row)
+        if "mode" in row:
+            bound.generation_modes[row["generation_id"]] = row["mode"]
 
 
 def _carrier_generation_ids(outcomes):
@@ -1500,7 +1509,8 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
     """Certify current carriers separately from exact historical certificates."""
     from .outcome_settlement import immutable_execution_projection
 
-    by_id = {generation["generation_id"]: generation for generation in generations}
+    generations = _rows(generations)
+    by_id = generations.last_by("generation_id")
     present = set()
     evidence = list(bound.automatic_generations)
     evidence.extend(
@@ -1527,11 +1537,11 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
                 elif immutable_execution_projection(cached) != immutable_execution_projection(row):
                     raise EvidenceInvariantError("consumed_execution_changed")
     _require_matching_carrier_projections(evidence, bound, management, incarnation)
+    carrier_id = getattr(bound, "carrier_id", None)
     pending = [
         generation
-        for generation in generations
-        if (getattr(bound, "carrier_id", None) is None or generation["carrier_job_id"] == bound.carrier_id)
-        and terminal_carrier_requires_certificate(generation)
+        for generation in (generations if carrier_id is None else generations.matching(carrier_job_id=[carrier_id]))
+        if terminal_carrier_requires_certificate(generation)
         and (generation["generation_id"], generation["carrier_job_id"]) not in present
     ]
     certificates = generation_certificate_candidates(management, incarnation, pending)
@@ -1684,6 +1694,47 @@ def _settlement_sequences(jobs):
     for job in jobs:
         sequences.setdefault(job["id"], job["settle_seq"])
     return sequences
+
+
+class _Rows(list):
+    """Rows of one immutable evidence read; each lookup index is built once per read."""
+
+    def __init__(self, rows=()):
+        super().__init__(rows)
+        self._positions = {}
+        self._last = {}
+
+    def _group(self, key):
+        if key not in self._positions:
+            positions = {}
+            for position, row in enumerate(self):
+                positions.setdefault(row[key], []).append(position)
+            self._positions[key] = positions
+        return self._positions[key]
+
+    def matching(self, **values):
+        """Return the rows whose key holds one of the given values, in read order."""
+        positions = set()
+        for key, wanted in values.items():
+            group = self._group(key)
+            for value in wanted:
+                positions.update(group.get(value, ()))
+        return [self[position] for position in sorted(positions)]
+
+    def last_by(self, key):
+        """Map each value of *key* to its last row, like a dict built over the rows."""
+        if key not in self._last:
+            self._last[key] = {value: self[positions[-1]] for value, positions in self._group(key).items()}
+        return self._last[key]
+
+    @cached_property
+    def sequences(self):
+        """Return the feed order of these jobs; callers overlay their own bindings."""
+        return _settlement_sequences(self)
+
+
+def _rows(rows):
+    return rows if isinstance(rows, _Rows) else _Rows(rows)
 
 
 def carrierless_evidence_read(read):
