@@ -483,6 +483,19 @@ def _write_bookkeeping(row, snapshot, prefix):
         target.save(update_fields=_BOOKKEEPING)
 
 
+def _write_values(row, values):
+    from .intent_state import mirror_refresh
+    from .lifecycle_fence import authoritative_bookkeeping
+    from .signals import suppress_intent_push
+
+    with authoritative_bookkeeping(), suppress_intent_push(), mirror_refresh(row, values) as target:
+        if target is None:
+            raise RegistryError("captured overlay disappeared before bookkeeping")
+        for name, value in values.items():
+            setattr(target, name, value)
+        target.save(update_fields=values)
+
+
 def promote_snapshots(attempt):
     from .apply_state import IntentChangedDuringPreparation
     from .lifecycle_fence import advance_fence
@@ -532,7 +545,8 @@ def promote_snapshots(attempt):
 
 
 def restore_attempt(attempt_id, keep_streams=()):
-    from .lifecycle_fence import advance_fence
+    from .lifecycle_fence import advance_fence, fence_for
+    from .settlement_resolution import unknown_bookkeeping, unknown_contributions
 
     with _snapshot_transaction(attempt_id) as (attempt, management, snapshots, rows, revisions):
         if attempt.trigger_kind != "manual" or attempt.adapter_apply_attempt_id != attempt.pk:
@@ -556,6 +570,16 @@ def restore_attempt(attempt_id, keep_streams=()):
                 check_revisions=False,
                 check_bookkeeping_revision=False,
             ):
+                unknown = unknown_contributions(row, fence_for(row))
+                if unknown:
+                    # A restored prior state must not hide an acknowledged unknown contribution.
+                    _write_values(
+                        row, unknown_bookkeeping(row, [owner.issue.job_id for owner, _keys in unknown], attempt)
+                    )
+                    advance_fence(row, current_attempt=attempt)
+                    item.settlement_disposition = "unavailable"
+                    item.save(update_fields=("settlement_disposition",))
+                    continue
                 if any(getattr(item, f"prior_{field}") != getattr(item, f"expected_{field}") for field in _BOOKKEEPING):
                     _write_bookkeeping(row, item, "prior")
                     advance_fence(row, current_attempt=attempt)

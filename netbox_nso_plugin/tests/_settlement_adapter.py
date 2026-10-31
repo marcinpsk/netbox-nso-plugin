@@ -315,6 +315,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"job_id": "notify-1"})
             return
 
+        # Drain the body so an unexpected POST cannot corrupt the next request on this connection.
+        self._body()
         self._send(404, {"error": {"code": "not_found", "message": f"unexpected request {self.path}"}})
 
     def do_PUT(self):  # noqa: N802 — BaseHTTPRequestHandler's dispatch name

@@ -23,6 +23,7 @@ SETTLEMENT_EVIDENCE_READERS = frozenset(
         "get_settlement_feed",
         "list_device_generations",
         "get_deployment_evidence",
+        "get_settlement_observation",
         "get_intent_receipts",
         "trigger_apply",
     }
@@ -56,8 +57,36 @@ def _read_response(reader):
         return adapter_client.trigger_apply(7, UUID(int=1), {"bgp": 1})
     if reader == "get_deployment_evidence":
         return adapter_client.get_deployment_evidence(7, [])
+    if reader == "get_settlement_observation":
+        return adapter_client.get_settlement_observation(7, job_id=1, after_settle_seq=0, apply_attempt_ids=[])
     assert reader == "list_device_generations"
     return adapter_client.list_device_generations(7)
+
+
+def _observation(**values):
+    """Return an empty SettlementObservationOut for job 1 after cursor 0 on device 7."""
+    return {
+        "request": {"job_id": 1, "after_settle_seq": 0, "apply_attempt_ids": []},
+        "store_incarnation": "00000000-0000-4000-8000-000000000001",
+        "device": {"device_id": 7, "netbox_device_id": None, "nso_instance": "placeholder", "nso_device_name": "dev"},
+        "job": None,
+        "next_feed": None,
+        "generations": [],
+        "deployment": {
+            "device_id": 7,
+            "head": None,
+            "blocked": False,
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "attempts": [],
+            "unknown_apply_attempt_ids": [],
+        },
+        "receipts": [],
+        "absent": {"job_id": 1, "apply_attempt_ids": [], "receipt_sections": []},
+        "digest": "a" * 64,
+        **values,
+    }
 
 
 @contextmanager
@@ -653,6 +682,7 @@ def test_readers_decode_valid_json_without_a_content_type_precondition(reader, c
             "attempts": [],
             "unknown_apply_attempt_ids": [],
         },
+        "get_settlement_observation": _observation(),
         "get_intent_receipts": {"receipts": [], "global_max_push_seq": None, "global_max_route_id": None},
         "trigger_apply": {
             "device_id": 7,
@@ -1035,3 +1065,95 @@ def test_settlement_schema_publishes_observation_and_evidence_roots():
 )
 def test_canonical_uuid_accepts_only_the_canonical_string(value, expected):
     assert canonical_uuid(value) is expected
+
+
+def _observe(body):
+    response = make_response(200, body)
+    with _serve_response(response):
+        return _read_response("get_settlement_observation")
+
+
+def test_observation_keeps_identified_item_failures_beside_valid_siblings():
+    from ._adapter_http import make_generation_listing
+
+    job = make_evidence_envelope(None, identity={"id": 1, "device_id": 7, "settle_seq": 2}, error="execution_contract")
+    listing = make_generation_listing(generation_id=81, seq=4, job_id=1, carrier_job_id=1)
+    failed = make_evidence_envelope(
+        None,
+        identity={"device_id": 7, "generation_id": 82, "seq": 5, "carrier_job_id": 1, "apply_attempt_id": None},
+        error="projection_construction",
+        digest="b" * 64,
+    )
+    valid = make_generation_envelope(listing)
+    observation = _observe(
+        _observation(
+            job=job,
+            next_feed={"id": 1, "device_id": 7, "settle_seq": 2},
+            generations=[valid, failed],
+            absent={"job_id": None, "apply_attempt_ids": [], "receipt_sections": []},
+        )
+    )
+    assert observation["job"].evidence_identity == {"id": 1, "device_id": 7, "settle_seq": 2}
+    assert observation["generations"][0] == listing
+    assert observation["generations"][0].evidence_digest == "a" * 64
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        adapter_client.raise_item_error(observation["generations"][1])
+    assert raised.value.job_id == 1
+    assert observation["generations"][1].evidence_digest == "b" * 64
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"request": {"job_id": 2, "after_settle_seq": 0, "apply_attempt_ids": []}},
+        {"request": {"job_id": 1, "after_settle_seq": 3, "apply_attempt_ids": []}},
+        {"absent": {"job_id": None, "apply_attempt_ids": [], "receipt_sections": []}},
+        {"absent": {"job_id": 2, "apply_attempt_ids": [], "receipt_sections": []}},
+        {"next_feed": {"id": 3, "device_id": 7, "settle_seq": 0}},
+        {"next_feed": {"id": 3, "device_id": 8, "settle_seq": 4}},
+        {"device": {"device_id": 8, "netbox_device_id": None, "nso_instance": "placeholder", "nso_device_name": "d"}},
+        {"store_incarnation": "placeholder-store"},
+        {"digest": "not-a-digest"},
+    ],
+    ids=[
+        "other-job",
+        "other-cursor",
+        "missing-absence",
+        "foreign-absence",
+        "next-feed-behind-cursor",
+        "next-feed-other-device",
+        "other-device",
+        "non-uuid-store",
+        "malformed-digest",
+    ],
+)
+def test_observation_frame_failures_refuse_the_whole_response(values):
+    with pytest.raises(adapter_client.InvalidJobEvidence) as raised:
+        _observe(_observation(**values))
+    assert raised.value.device_id == 7
+    assert raised.value.job_id is None
+
+
+def test_observation_request_names_each_attempt_once_in_order():
+    from uuid import UUID
+
+    attempts = [UUID(int=2), UUID(int=1), UUID(int=2)]
+    body = _observation(
+        request={"job_id": 1, "after_settle_seq": 0, "apply_attempt_ids": [str(UUID(int=1)), str(UUID(int=2))]}
+    )
+    response = make_response(200, body)
+    session = make_transport_session(response)
+    config = {"url": "http://adapter.invalid", "token": "placeholder", "verify_tls": True, "timeout": 5}
+    config["ca_cert_path"] = None
+    adapter_client.reset_session()
+    try:
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", autospec=True, return_value=config),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", autospec=True, return_value=session),
+        ):
+            adapter_client.get_settlement_observation(7, job_id=1, after_settle_seq=0, apply_attempt_ids=attempts)
+    finally:
+        adapter_client.reset_session()
+    sent = session.send.call_args.args[0]
+    assert sent.url == "http://adapter.invalid/api/v1/devices/7/settlement-observation"
+    assert json.loads(sent.body) == body["request"]

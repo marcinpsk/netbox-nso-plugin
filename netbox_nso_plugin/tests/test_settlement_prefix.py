@@ -15,7 +15,7 @@ from .test_coalesced_settlement import CoalescedCarrierHelpers
 from .test_durable_bgp_capture import BGPCaptureCase, _CaptureHandler
 
 
-class TestCommittedSettlementPrefix(CoalescedCarrierHelpers, BGPSettlementHelpers, BGPCaptureCase):
+class CarrierPageHelpers:
     def serve_carriers(self, generations, *, invariant=False, duplicate=False):
         case = self
 
@@ -160,6 +160,8 @@ class TestCommittedSettlementPrefix(CoalescedCarrierHelpers, BGPSettlementHelper
 
         self.adapter._handle = handle
 
+
+class TestCommittedSettlementPrefix(CarrierPageHelpers, CoalescedCarrierHelpers, BGPSettlementHelpers, BGPCaptureCase):
     def test_invalid_attempt_identity_records_a_stall_without_advancing_the_cursor(self):
         generations = self.prepare_carrier()
         self.serve_carriers(generations)

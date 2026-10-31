@@ -61,6 +61,19 @@ def _valid_execution_evidence(execution, attempt):
         return False
 
 
+def _acknowledged_history(execution, management):
+    """Accept an acknowledged obligation only as audited history behind the current cursor."""
+    return (
+        execution.settlement_issue.state == "acknowledged"
+        and execution.mapping_epoch == mapping_epoch(management)
+        and execution.adapter_device_id == management.adapter_device_id
+        and management.settle_cursor_device_id == execution.adapter_device_id
+        and management.settle_cursor_incarnation == execution.store_incarnation
+        and (management.settle_cursor_seq or 0) >= execution.settle_seq
+        and not execution.settlement_fences.exists()
+    )
+
+
 def _referenced(attempt):
     if attempt.referenced_prior_snapshots.exclude(attempt=attempt).exists():
         return True
@@ -79,6 +92,10 @@ def _eligible(attempt, management):
     executions = list(attempt.executions.all())
     if not executions:
         return False
+    acknowledged = [execution for execution in executions if execution.consumption_state == "acknowledged"]
+    if not all(_acknowledged_history(execution, management) for execution in acknowledged):
+        return False
+    executions = [execution for execution in executions if execution.consumption_state != "acknowledged"]
     for execution in executions:
         if (
             execution.consumption_state not in {"consumed", "superseded"}
@@ -106,6 +123,7 @@ def _eligible(attempt, management):
                     "http_status": attempt.http_status,
                     "response": attempt.response,
                     "generations": [execution.terminal_projection for execution in executions],
+                    "acknowledged_generation_ids": [execution.generation_id for execution in acknowledged],
                 },
                 attempt,
             )
@@ -156,13 +174,18 @@ def _remote_generations(management_id):
 
 
 def _historical_certificate_required(attempt, management, remote):
-    from .apply_settlement import generation_certificates
+    from .settlement_resolution import RESOLVED_STATES, cursor_epoch_executions
 
     if attempt.executions.exclude(store_incarnation=remote.store_incarnation).exists():
         return True
+    # A retained remote generation needs its certificate or its acknowledged disposition.
     return (
-        generation_certificates(management, remote.store_incarnation, *remote.generations)
-        .filter(attempt=attempt)
+        cursor_epoch_executions(management, remote.store_incarnation)
+        .filter(
+            attempt=attempt,
+            generation_id__in=[generation["generation_id"] for generation in remote.generations],
+            consumption_state__in=RESOLVED_STATES,
+        )
         .exists()
     )
 

@@ -106,10 +106,19 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
         management.refresh_from_db()
         return ConsumeResult(management.adapter_device_id, consumed, True, epoch_reset, management.settle_cursor_seq)
     except adapter_client.InvalidJobEvidence as exc:
-        return replace(_invalid_evidence_stall(management, fence, exc), consumed=consumed, epoch_reset=epoch_reset)
+        stall = _invalid_evidence_stall(management, fence, exc, "invalid_evidence")
     except EvidenceInvariantError as exc:
         logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
-        return replace(_invariant_evidence_stall(management, fence, exc), consumed=consumed, epoch_reset=epoch_reset)
+        stall = _invariant_evidence_stall(management, fence, exc)
+    _publish_stall_issue(pk)
+    return replace(stall, consumed=consumed, epoch_reset=epoch_reset)
+
+
+def _publish_stall_issue(pk):
+    """Publish the identified stall from pure reads; the diagnostic stays when this fails."""
+    from .settlement_issue import publish_stall_issue
+
+    publish_stall_issue(pk)
 
 
 def _align_carrier_read(read, row, jobs, incarnation):
@@ -193,20 +202,25 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
     )
     from .outcome_settlement import settle_terminal_generations
     from .settlement_evidence import matches_request_fence
+    from .settlement_resolution import acknowledged_jobs
 
     identity = job or {"id": carrier_id, "device_id": management.adapter_device_id}
     stalled = False
     sequences = _settlement_sequences(read.feed_jobs) if read is not None else {}
+    released = job is not None and job["id"] in acknowledged_jobs(management, incarnation)
     with identify_evidence_stall(identity, incarnation, sequences=sequences):
-        if job is not None:
+        if released:
+            _validate_released_job(management, job, cursor, seen, incarnation)
+        elif job is not None:
             _validate_feed_page([job], management.adapter_device_id, cursor, seen, incarnation)
-        evidence = prepare_carrier_evidence(management, read, carrier_id) if read is not None else None
+        evidence = prepare_carrier_evidence(management, read, carrier_id) if read is not None and not released else None
 
         def before_settle():
             management.refresh_from_db()
             if not matches_request_fence(management, fence):
                 raise _SettlementReadChanged
-            _validate_locked_carrier(read, job)
+            if not released:
+                _validate_locked_carrier(read, job)
             if evidence is not None:
                 validate_carrier_under_lock(management, evidence)
 
@@ -214,7 +228,7 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
             nonlocal cursor, stalled
             management.refresh_from_db()
             if job is not None:
-                if _settle_job(management, job, incarnation):
+                if released or _settle_job(management, job, incarnation):
                     cursor = job["settle_seq"]
                     _clear_stall(management)
                 else:
@@ -230,6 +244,30 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
         else:
             settle_terminal_generations(management, [], incarnation, before_settle=before_settle, after_settle=finish)
     return cursor, stalled
+
+
+def _validate_released_job(management, job, cursor, seen, incarnation):
+    """Walk past an acknowledged job by its trusted identity; its evidence stays unreadable."""
+    from .apply_settlement import EvidenceInvariantError
+    from .models import NSOSettlementIssue
+
+    sequence = job["settle_seq"]
+    if (
+        type(sequence) is not int
+        or sequence <= cursor
+        or job["device_id"] != management.adapter_device_id
+        or job["id"] in seen
+        or not NSOSettlementIssue.objects.filter(
+            management=management,
+            adapter_device_id=management.adapter_device_id,
+            store_incarnation=incarnation,
+            job_id=job["id"],
+            settle_seq=sequence,
+            state="acknowledged",
+        ).exists()
+    ):
+        raise EvidenceInvariantError("invalid_settlement_order")
+    seen.add(job["id"])
 
 
 def _validate_locked_carrier(read, job):
@@ -281,17 +319,19 @@ def _historical_carriers(read, management):
 
 def _invariant_evidence_stall(management, fence, error):
     """Persist the invariant through its request fence."""
+    from .settlement_evidence import invariant_code
+
     invalid_job = getattr(error, "invalid_job", adapter_client.InvalidJobEvidence({}, "invalid settlement evidence"))
-    return _invalid_evidence_stall(management, fence, invalid_job)
+    return _invalid_evidence_stall(management, fence, invalid_job, "evidence_invariant", invariant_code(error))
 
 
-def _invalid_evidence_stall(management, fence, error):
+def _invalid_evidence_stall(management, fence, error, stall_class, code=None):
     """Retain invalid evidence without advancing its settlement cursor."""
     from .models import NSODeviceManagement
 
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
-        write_diagnostic(row, fence, error)
+        write_diagnostic(row, fence, error, stall_class=stall_class, code=code)
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
 
 

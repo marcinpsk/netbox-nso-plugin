@@ -87,6 +87,7 @@ def check_active_streams():
     from .intent_drift import _delivery_key, _scopes
     from .models import NSOIntentRevision
     from .selection_manifest import frozen_manifest
+    from .settlement_resolution import acknowledged_obligations
 
     _require(
         not NSOApplyAttempt.objects.filter(lifecycle="open", trigger_kind="manual").exists()
@@ -182,7 +183,11 @@ def check_active_streams():
         adapter_client.raise_evidence_errors(generations)
         terminal = [generation for generation in generations if terminal_carrier_requires_certificate(generation)]
         certificates = generation_certificate_candidates(management, incarnation, terminal)
+        acknowledged = acknowledged_obligations(management, incarnation)
         for generation in generations:
+            if (generation["generation_id"], generation["carrier_job_id"]) in acknowledged:
+                # Resolved without a certificate: no success or provenance claim exists for it.
+                continue
             if terminal_carrier_requires_certificate(generation):
                 identity = generation["generation_id"], generation["carrier_job_id"]
                 _require(

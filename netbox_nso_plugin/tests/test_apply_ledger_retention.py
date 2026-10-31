@@ -504,3 +504,78 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         call_command("nso_prune_apply_ledger", execute=True, batch_size=1, after=cursor, stdout=StringIO())
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=blocked.pk).exists())
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
+
+    def acknowledged_history(self, *, listed):
+        from netbox_nso_plugin.models import NSOSettlementIssue
+
+        attempt, execution = self.history()
+        now = timezone.now()
+        issue = NSOSettlementIssue.objects.create(
+            management=self.management,
+            mapping_epoch=mapping_epoch(self.management),
+            adapter_device_id=self.management.adapter_device_id,
+            store_incarnation=execution.store_incarnation,
+            job_id=900,
+            settle_seq=1,
+            request_fence={},
+            stall_class="evidence_invariant",
+            stall_reason="missing_generation_evidence",
+            position="historical",
+            cursor_before=2,
+            cursor_after=2,
+            evidence_digest="b" * 64,
+            impact_digest="c" * 64,
+            contract_fingerprint="d" * 64,
+            revision_digest="e" * 64,
+            proposal={"obligations": []},
+            state="acknowledged",
+            closed_at=now,
+            actor_id=1,
+            actor_label="placeholder-operator",
+            acknowledgement_reason="placeholder reason",
+            acknowledged_at=now,
+            committed_effects=[],
+        )
+        NSOApplyExecution.objects.create(
+            attempt=attempt,
+            management=self.management,
+            mapping_epoch=mapping_epoch(self.management),
+            adapter_device_id=self.management.adapter_device_id,
+            store_incarnation=execution.store_incarnation,
+            generation_id=900,
+            generation_seq=1,
+            carrier_job_id=900,
+            settle_seq=1,
+            consumption_state="acknowledged",
+            settlement_issue=issue,
+        )
+        if listed:
+            self.adapter.store.add_generation(
+                1767,
+                generation_id=900,
+                seq=1,
+                status="failed",
+                job_id=900,
+                carrier_job_id=900,
+                carrier_job_status="succeeded",
+                mode="networked",
+                settlement_cohort=None,
+                digest="a" * 64,
+                stream_revisions={"bgp": 7},
+                source_push_seq={"bgp": 41},
+            )
+        return attempt, issue
+
+    def test_an_acknowledged_obligation_stays_while_the_adapter_lists_its_generation(self):
+        attempt, _issue = self.acknowledged_history(listed=True)
+        self.prune(execute=True)
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+
+    def test_an_unlisted_acknowledged_obligation_is_pruned_and_its_audit_stays(self):
+        from netbox_nso_plugin.models import NSOSettlementIssue
+
+        attempt, issue = self.acknowledged_history(listed=False)
+        self.prune(execute=True)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertFalse(NSOApplyExecution.objects.filter(settlement_issue=issue).exists())
+        self.assertEqual(NSOSettlementIssue.objects.get(pk=issue.pk).state, "acknowledged")
