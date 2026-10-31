@@ -439,6 +439,7 @@ def _matches(
     check_watermark=True,
     check_revisions=True,
     check_bookkeeping_revision=True,
+    check_bookkeeping=True,
 ):
     from .selection_manifest import current_content_digest
 
@@ -449,7 +450,10 @@ def _matches(
     ):
         return False
     return (
-        all(getattr(row, field) == getattr(snapshot, f"{prefix}_{field}") for field in _BOOKKEEPING)
+        (
+            not check_bookkeeping
+            or all(getattr(row, field) == getattr(snapshot, f"{prefix}_{field}") for field in _BOOKKEEPING)
+        )
         and row.accepted_at == snapshot.accepted_at
         and current_content_digest(row) == snapshot.content_digest
         and (

@@ -22,6 +22,7 @@ from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
 from .refusal_registry import OVERLAYS
 from .settlement_resolution import (
     RESOLVED_STATES,
+    acknowledged_since,
     close_completed_attempt,
     cover_unknown_contributions,
     unknown_bookkeeping,
@@ -647,7 +648,8 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
     generation = execution.terminal_projection
     fence = fence_for(row) if row is not None else None
     matches = capture._matches(snapshot, row, management, {}, "expected", check_revisions=False)
-    if not matches or _earlier_execution(fence, generation, execution.store_incarnation, settle_seq):
+    acknowledged = None if matches else acknowledged_since(snapshot, row, fence, management)
+    if not (matches or acknowledged) or _earlier_execution(fence, generation, execution.store_incarnation, settle_seq):
         disposition = "superseded"
     else:
         disposition = OwnerOutcome(snapshot, tuple(outcomes)).disposition
@@ -656,7 +658,10 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
 
             if not static_route_success_proven(snapshot, generation):
                 disposition = "unavailable"
-        values = {name: copy.deepcopy(getattr(snapshot, "prior_" + name)) for name in capture._BOOKKEEPING}
+        # After an acknowledgement, the state before this execution is the acknowledged one.
+        source = row if acknowledged else snapshot
+        prefix = "" if acknowledged else "prior_"
+        values = {name: copy.deepcopy(getattr(source, prefix + name)) for name in capture._BOOKKEEPING}
         if disposition == "refused":
             causes = [cause for outcome in outcomes for cause in outcome["refusals"]]
             error = refusal_error(causes, json_error=OVERLAYS[snapshot.model_label].error_type == "JSONField")

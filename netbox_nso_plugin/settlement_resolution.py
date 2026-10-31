@@ -158,6 +158,50 @@ def cover_unknown_contributions(row, fence, execution, outcomes):
     return rest
 
 
+def acknowledged_since(snapshot, row, fence, management):
+    """Return the acknowledgement that is the only change since this snapshot froze its expectation."""
+    from . import durable_capture as capture
+    from .models import NSOSettlementIssueOwner
+
+    if fence is None or row.status != "apply_failed":
+        return None
+    expected = {
+        "status": snapshot.expected_status,
+        "last_apply_at": instant(snapshot.expected_last_apply_at),
+        "last_apply_error": canonical_digest(snapshot.expected_last_apply_error),
+        "apply_attempt_id": None
+        if snapshot.expected_apply_attempt_id is None
+        else str(snapshot.expected_apply_attempt_id),
+    }
+    owners = NSOSettlementIssueOwner.objects.filter(
+        issue__management_id=fence.management_id,
+        issue__mapping_epoch=snapshot.mapping_epoch,
+        issue__state=ACKNOWLEDGED,
+        model_label=row._meta.label_lower,
+        overlay_pk=row.pk,
+        committed_effect=UNKNOWN_EFFECT,
+    ).select_related("issue")
+    for owner in owners:
+        revision = owner.authority["fence"]["bookkeeping_revision"]
+        if (
+            revision == snapshot.expected_fence_revision
+            and fence.bookkeeping_revision == revision + 1
+            and all(owner.authority.get(name) == value for name, value in expected.items())
+            and capture._matches(
+                snapshot,
+                row,
+                management,
+                {},
+                "expected",
+                check_revisions=False,
+                check_bookkeeping_revision=False,
+                check_bookkeeping=False,
+            )
+        ):
+            return owner
+    return None
+
+
 def unknown_advisory(job_ids) -> str:
     jobs = sorted(set(job_ids))
     noun = "job" if len(jobs) == 1 else "jobs"

@@ -81,7 +81,7 @@ def acknowledge(issue, revision_digest, actor, reason) -> AcknowledgementReceipt
     """Acknowledge one exact issue revision as outcome unknown, or change nothing."""
     from .intent_state import mirror_transaction
     from .lifecycle_fence import authoritative_bookkeeping
-    from .models import NSODeviceManagement, NSOSettlementIssue
+    from .models import NSOApplyAttempt, NSODeviceManagement, NSOSettlementIssue
     from .settlement_evidence import request_fence
     from .signals import suppress_intent_push
 
@@ -104,6 +104,12 @@ def acknowledge(issue, revision_digest, actor, reason) -> AcknowledgementReceipt
             or management.adapter_device_id != locked.adapter_device_id
         ):
             raise AcknowledgementRefused("stale")
+        # Attempt answers are written without management serialization, so the decision reads them locked.
+        list(
+            NSOApplyAttempt.objects.select_for_update()
+            .filter(pk__in=[UUID(value) for value in locked.proposal["attempt_locks"]])
+            .order_by("pk")
+        )
         try:
             decision = decide(
                 management,

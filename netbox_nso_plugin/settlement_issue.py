@@ -924,6 +924,7 @@ def decide(management, stall, *, request=None, provenance=None) -> Decision:
     )
     proposal = {
         "observation_request": {"apply_attempt_ids": sorted(str(attempt_id) for attempt_id in attempts)},
+        "attempt_locks": sorted({str(attempt_id) for attempt_id in (*attempts, *linked)}),
         "obligations": obligations,
         "provenance": local["provenance"],
     }

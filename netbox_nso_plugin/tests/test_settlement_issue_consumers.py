@@ -22,7 +22,7 @@ from netbox_nso_plugin.settlement_resolution import instant
 from ._adapter_http import make_response
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import content_update, mirror_update
-from ._settlement_observation import INCARNATION, serve_observation
+from ._settlement_observation import INCARNATION, failed_item, serve_observation
 from .test_durable_bgp_capture import BGPCaptureCase
 from .test_settlement_issue import ADVISORY, HistoricalStore, SettlementIssueHelpers
 
@@ -358,3 +358,169 @@ class TestAcknowledgedHistoryConsumers(SettlementIssueHelpers, HistoricalStore, 
         acknowledge(issue, issue.revision_digest, self.operator(), "pre-ledger generation")
         with transaction.atomic():
             check_active_streams()
+
+
+def _retarget(generation, generation_id, seq, carrier_job_id):
+    """Return the same frozen outcomes as evidence of another generation and carrier."""
+    moved = copy.deepcopy(generation)
+    moved.update(generation_id=generation_id, seq=seq, carrier_job_id=carrier_job_id)
+    for outcome in moved["row_outcomes"]:
+        outcome["generation_id"] = generation_id
+        outcome["carrier"]["generation_id"] = generation_id
+    for owner in moved["carrier_job_result"]["settlement_owners"]:
+        owner["generation_id"] = generation_id
+    return moved
+
+
+class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, BGPCaptureCase):
+    """Apply B freezes the owners, then carrier A is acknowledged, then B's certificate arrives."""
+
+    def second_apply(self):
+        from uuid import UUID
+
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        from ._bgp_settlement import promoted_streams
+
+        def admission(selected):
+            response = promoted_streams(selected, {"bgp"})
+            response["job_id"] = 502
+            response["generations"][0].update(generation_id=83, seq=6, job_id=502, digest="c" * 64)
+            return 202, response
+
+        self.adapter.apply_response = admission
+        answer = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(answer.status_code, 200, answer.content)
+        return NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
+
+    def serve_two_carriers(self, first, second, carriers):
+        from ._adapter_http import make_generation_listing
+        from ._settlement_wire import deployment_wire, generation_wire, job_wire
+        from .test_durable_bgp_capture import _CaptureHandler
+
+        class Handler(_CaptureHandler):
+            def end_headers(handler):
+                handler.send_header("X-Store-Incarnation", INCARNATION)
+                super().end_headers()
+
+        self.server.RequestHandlerClass = Handler
+        from netbox_nso_plugin import adapter_client
+
+        adapter_client.reset_session()
+        device_id = self.management.adapter_device_id
+        jobs = []
+        listing = []
+        for settle_seq, (attempt, generation) in enumerate(carriers, start=1):
+            link = attempt.response["generations"][0]
+            jobs.append(
+                {
+                    "id": generation["carrier_job_id"],
+                    "type": "apply",
+                    "device_id": device_id,
+                    "status": "succeeded",
+                    "result": generation["carrier_job_result"],
+                    "row_outcomes": generation["row_outcomes"],
+                    "refusals": generation["refusals"],
+                    "error": None,
+                    "context": None,
+                    "created_at": self.stamp.isoformat(),
+                    "updated_at": generation["updated_at"],
+                    "started_at": None,
+                    "heartbeat_at": None,
+                    "settle_seq": settle_seq,
+                }
+            )
+            listing.append(
+                make_generation_listing(
+                    generation_id=generation["generation_id"],
+                    seq=generation["seq"],
+                    status=generation["status"],
+                    job_id=generation["carrier_job_id"],
+                    carrier_job_id=generation["carrier_job_id"],
+                    digest=link["digest"],
+                    stream_revisions=generation["stream_revisions"],
+                    source_push_seq=generation["source_push_seq"],
+                    updated_at=generation["updated_at"],
+                )
+            )
+        by_attempt = {str(attempt.pk): (attempt, generation) for attempt, generation in carriers}
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs"):
+                after = int(kwargs["params"]["after_settle_seq"])
+                rows = [job_wire(job) for job in jobs if job["settle_seq"] > after]
+                return make_response(200, [failed_item(row) if row["identity"]["id"] == 501 else row for row in rows])
+            if method == "GET" and url.endswith("/generations"):
+                return make_response(200, [generation_wire(row, device_id) for row in listing])
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                requested = kwargs["json"]["apply_attempt_ids"]
+                known = [value for value in requested if value in by_attempt]
+                return make_response(
+                    200,
+                    deployment_wire(
+                        {
+                            "device_id": device_id,
+                            "head": None,
+                            "blocked": False,
+                            "write_work_pending": False,
+                            "held_jobs": [],
+                            "pending_generations": 0,
+                            "attempts": [
+                                {
+                                    "apply_attempt_id": value,
+                                    "admission_state": "admitted",
+                                    "http_status": 202,
+                                    "response": by_attempt[value][0].response,
+                                    "generations": [by_attempt[value][1]],
+                                }
+                                for value in known
+                            ],
+                            "unknown_apply_attempt_ids": [value for value in requested if value not in known],
+                        }
+                    ),
+                )
+            return make_response(404, {"error": {"code": "not_found", "message": "unexpected request"}})
+
+        self.adapter._handle = handle
+        serve_observation(self)
+
+    def acknowledge_then_certify(self, dispositions):
+        self.prepare()
+        first = self.attempt
+        stalled = _retarget(
+            self.evidence(dispositions={"bgp.router": "in_sync", "bgp.router.scope.peer": "in_sync"}), 81, 4, 501
+        )
+        second = self.second_apply()
+        self.attempt = second
+        certified = _retarget(self.evidence(dispositions=dispositions), 83, 6, 502)
+        self.serve_two_carriers(first, second, [(first, stalled), (second, certified)])
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        issue = NSOSettlementIssue.objects.get(state="open")
+        acknowledge(issue, issue.revision_digest, self.operator(), "carrier result unreadable")
+        result = consume_static_route_settlements(self.management)
+        self.assertEqual((result.cursor, result.stalled), (2, False))
+        return second
+
+    def test_a_later_manual_certificate_frozen_before_the_acknowledgement_clears_the_unknown(self):
+        second = self.acknowledge_then_certify({"bgp.router": "in_sync", "bgp.router.scope.peer": "in_sync"})
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual((owner.status, owner.apply_attempt_id), ("in_sync", second.pk))
+        self.assertEqual(set(second.overlay_snapshots.values_list("settlement_disposition", flat=True)), {"in_sync"})
+
+    def test_a_later_not_applied_decision_keeps_the_acknowledged_state(self):
+        second = self.acknowledge_then_certify({"bgp.router": "in_sync", "bgp.router.scope.peer": "not_applied"})
+        router, *peers = self.owners
+        router.refresh_from_db()
+        self.assertEqual(router.status, "in_sync")
+        for peer in peers:
+            peer.refresh_from_db()
+            self.assertEqual((peer.status, peer.last_apply_error), ("apply_failed", ADVISORY.format(501)))
+            snapshot = second.overlay_snapshots.get(model_label=peer._meta.label_lower, overlay_pk=peer.pk)
+            self.assertEqual(snapshot.settlement_disposition, "not_applied")

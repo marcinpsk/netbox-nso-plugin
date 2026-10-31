@@ -511,6 +511,46 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         acknowledge(following, following.revision_digest, self.operator("placeholder-other"), "second carrier")
         self.assertTrue(consume_static_route_settlements(self.management).drained)
 
+    def test_attempt_answers_the_decision_reads_stay_locked_until_the_commit(self):
+        from uuid import uuid4
+
+        from django.db import OperationalError, transaction
+
+        self.serve_history()
+        lost_id = uuid4()
+        lost = NSOApplyAttempt.objects.create(
+            id=lost_id,
+            adapter_apply_attempt_id=lost_id,
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            source_epoch=self.management.adapter_source_epoch,
+            selected={"bgp": 999},
+            scope_revisions={"bgp": 1},
+        )
+        issue = self.stall_history()
+        self.assertIn(str(lost.pk), issue.proposal["attempt_locks"])
+        armed, outcome = [], {}
+
+        def record_answer(_document):
+            if not armed:
+                return
+            try:
+                with transaction.atomic(), connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL lock_timeout = '500ms'")
+                    NSOApplyAttempt.objects.filter(pk=lost.pk, response__isnull=True).update(
+                        http_status=202, response={"generations": []}
+                    )
+                outcome["recorded"] = True
+            except OperationalError:
+                outcome["recorded"] = False
+
+        serve_observation(self, edit=record_answer)
+        armed.append(True)
+        acknowledge(issue, issue.revision_digest, self.operator(), "pre-ledger generation")
+        self.assertEqual(outcome, {"recorded": False})
+        lost.refresh_from_db()
+        self.assertIsNone(lost.response)
+
     def manual_reference(self, *, promoted=True, **response):
         from uuid import uuid4
 
