@@ -325,6 +325,22 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             {"error": "The NSO adapter returned an invalid response. See the server log."},
         )
 
+    def test_jobs_poll_rejects_a_listing_truncated_before_the_requested_generation(self):
+        self.serve_feed([])
+        row = make_generation_listing()
+        regressed = {**row, "generation_id": row["generation_id"] + 1}
+        unread = make_generation_listing(generation_id=row["generation_id"] + 2, seq=row["seq"] + 1)
+        self.generation_page = [row, regressed, unread]
+        response = self.client.get(
+            reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=(self.device.pk,)),
+            {"generation_id": unread["generation_id"]},
+        )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json(),
+            {"error": "The NSO adapter returned an invalid response. See the server log."},
+        )
+
     def test_malformed_successful_apply_replays_stall_with_a_banner(self):
         from netbox_nso_plugin.models import NSOApplyAttempt
 

@@ -3375,3 +3375,36 @@ def subtest_diagnostic_reads_after_one_reset(
             consume(row)
             # ok: nso-test-subtest-stale-diagnostic
             self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+
+
+def generation_listing_filters(client, adapter_client, wanted, released):
+    listing = client.list_device_generations(7) if wanted else []
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    listing = [row for row in listing if row.get("generation_id") in wanted]
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    kept = [row for row in adapter_client.list_device_generations(7) if not released(row)]
+    return listing, kept
+
+
+def generation_listing_filter_after_truncation_check(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            client.raise_item_error(row)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return [row for row in listing if row.get("generation_id") in wanted]
+
+
+def generation_listing_filter_keeps_truncation(adapter_client, acknowledged):
+    def released(row):
+        return not isinstance(row, adapter_client.ListingTruncation) and row["generation_id"] in acknowledged
+
+    # ok: nso-generation-listing-filter-drops-truncation
+    return [row for row in adapter_client.list_device_generations(7) if not released(row)]
+
+
+def generation_listing_lookup_after_evidence_check(adapter_client, generation_id):
+    listing = adapter_client.list_device_generations(7)
+    adapter_client.raise_evidence_errors(listing)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return next(row for row in listing if row["generation_id"] == generation_id)
