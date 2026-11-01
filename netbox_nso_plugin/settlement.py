@@ -67,6 +67,8 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
                 return ConsumeResult(None, 0, False, False, row.settle_cursor_seq)
             jobs, cursor, incarnation, epoch_reset = _read_locked_page(row)
         read = _align_carrier_read(read, row, jobs, incarnation)
+        if read is not None:
+            _require_complete_listing(management, read)
         historical = _historical_carriers(read, row) if read is not None else []
         work = [(carrier, None) for carrier in historical] + [(job["id"], job) for job in jobs]
         if not work:
@@ -134,6 +136,20 @@ def _align_carrier_read(read, row, jobs, incarnation):
     known = {job["id"] for job in read.feed_jobs}
     read.feed_jobs = _Rows([*read.feed_jobs, *(job for job in jobs if job["id"] not in known)])
     return read
+
+
+def _require_complete_listing(management, read):
+    """Stall before any carrier commits: rows after a listing truncation can belong to any carrier."""
+    from .apply_settlement import _rows, identify_evidence_stall
+
+    for row in read.generation_listing:
+        if isinstance(row, adapter_client.ListingTruncation):
+            with identify_evidence_stall(
+                {"device_id": management.adapter_device_id},
+                read.store_incarnation,
+                sequences=_rows(read.feed_jobs).sequences,
+            ):
+                adapter_client.raise_item_error(row)
 
 
 def _complete_evidence_result(result, read, management, fence, expected_fence, epoch):
