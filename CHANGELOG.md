@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.15.0 (2026-10-28)
+
+### Testing
+
+- **observation**: Isolate the invalid name and index document cases
+  ([`1f26c65`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1f26c655e14aef1ea35a90e67ca0fa69cefd92fe))
+
+
 ## v1.14.0 (2026-10-27)
 
 ### Bug Fixes

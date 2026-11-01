@@ -284,9 +284,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _drain(self) -> bytes:
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
     def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(length) or b"{}")
+        return json.loads(self._drain() or b"{}")
 
     def _device_id_from_path(self, parsed) -> int:
         return int(parsed.path.split("/")[4])
@@ -316,13 +318,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         # Drain the body so an unexpected POST cannot corrupt the next request on this connection.
-        self._body()
+        self._drain()
         self._send(404, {"error": {"code": "not_found", "message": f"unexpected request {self.path}"}})
 
     def do_PUT(self):  # noqa: N802 — BaseHTTPRequestHandler's dispatch name
         parsed = urlparse(self.path)
         store = self._store
-        body = self._body()
+        raw = self._drain()
 
         if parsed.path.endswith("/scope"):
             device_id = self._device_id_from_path(parsed)
@@ -342,7 +344,7 @@ class _Handler(BaseHTTPRequestHandler):
                 200,
                 store.put_static_route_intent(
                     device_id,
-                    body["routes"],
+                    json.loads(raw)["routes"],
                     source_push_seq=int(selector) if selector is not None else None,
                 ),
             )
