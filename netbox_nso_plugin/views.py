@@ -4063,6 +4063,10 @@ class NSODeviceJobsView(AuthorizedView):
             generations = (
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
+            # Rows after a truncation are unread and can be requested ones, so the filter must not drop the marker.
+            for row in generations:
+                if isinstance(row, client.ListingTruncation):
+                    client.raise_item_error(row)
             generations = [row for row in generations if row.get("generation_id") in generation_ids]
             client.raise_evidence_errors(generations)
             generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}

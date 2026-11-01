@@ -997,3 +997,31 @@ rules:
                   ...
     paths:
       include: ["netbox_nso_plugin/tests/**"]
+
+  - id: nso-generation-listing-filter-drops-truncation
+    languages: [python]
+    severity: ERROR
+    message: A filter over a generation listing can drop its ListingTruncation marker, and the rows after the marker are unread. Raise the marker before the filter, as views.NSODeviceJobsView.get does, or keep it in the filter predicate.
+    patterns:
+      - pattern-either:
+          - pattern: '[$ROW for $ROW in $CLIENT.list_device_generations(...) if $COND]'
+          - patterns:
+              - pattern-inside: |
+                  $LIST = <... $CLIENT.list_device_generations(...) ...>
+                  ...
+              - pattern: '[$ROW for $ROW in $LIST if $COND]'
+      - pattern-not-inside: |
+          for $R in $LIST:
+              if isinstance($R, $T.ListingTruncation):
+                  ...
+          ...
+      - pattern-not-inside: |
+          def $PRED($ARG):
+              ...
+              return <... $T.ListingTruncation ...>
+          ...
+      - pattern-not-inside: |
+          $C.raise_evidence_errors($LIST)
+          ...
+    paths:
+      exclude: ["netbox_nso_plugin/tests/**"]
