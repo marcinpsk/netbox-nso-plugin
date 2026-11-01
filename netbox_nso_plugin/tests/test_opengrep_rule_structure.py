@@ -29,7 +29,7 @@ _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside
 _PATTERN_LIST_KEYS = {"patterns", "pattern-either"}
 _ROOT_NAME = re.compile(r"(?<![\w.$])(?<!\bdef )([A-Za-z_]\w*)(?=\s*[.(])")
 # These literal rule roots are not imported modules.
-_ALLOWED_ROOT_NAMES = frozenset({"self", "bool", "getattr", "int", "open", "repr", "str", "super"})
+_ALLOWED_ROOT_NAMES = frozenset({"self", "bool", "getattr", "int", "isinstance", "open", "repr", "str", "super"})
 
 _COVERAGE_SPEC = importlib.util.spec_from_file_location("_opengrep_coverage", _COVERAGE_PATH)
 assert _COVERAGE_SPEC is not None
