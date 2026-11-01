@@ -184,7 +184,11 @@ def check_active_streams():
         acknowledged = acknowledged_obligations(management, incarnation)
 
         def released(row):
-            return row is not None and (row["generation_id"], row["carrier_job_id"]) in acknowledged
+            return (
+                row is not None
+                and not isinstance(row, adapter_client.ListingTruncation)
+                and (row["generation_id"], row["carrier_job_id"]) in acknowledged
+            )
 
         # Resolved without a certificate: no success or provenance claim exists for it.
         generations = [
