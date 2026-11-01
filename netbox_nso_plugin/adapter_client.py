@@ -426,6 +426,10 @@ class EvidenceItem(dict):
         return copied
 
 
+class ListingTruncation(EvidenceItem):
+    """Mark the row where a generation listing stopped; no acknowledgement releases the rows after it."""
+
+
 def raise_item_error(item):
     """Refuse one failed item at the consumer's carrier boundary."""
     if isinstance(item, EvidenceItem):
@@ -1505,7 +1509,7 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
                 error = InvalidJobEvidence(
                     {"device_id": adapter_device_id, "id": row["carrier_job_id"]}, "invalid settlement evidence"
                 )
-                failed = EvidenceItem(row.evidence_identity, error, digest=row.evidence_digest)
+                failed = ListingTruncation(row.evidence_identity, error, digest=row.evidence_digest)
                 return [*generations, *page[:index], failed]
             generation_ids.add(generation_id)
             last_seq = seq

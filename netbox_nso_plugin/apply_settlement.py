@@ -1011,6 +1011,7 @@ def prepare_carrier_evidence(management, read, carrier_id=None):
 
 def without_acknowledged(read, management):
     """Remove only acknowledged obligations; siblings and retry carriers keep ordinary evidence."""
+    from .adapter_client import ListingTruncation
     from .settlement_resolution import acknowledged_jobs, acknowledged_obligations
 
     acknowledged = acknowledged_obligations(management, read.store_incarnation)
@@ -1023,7 +1024,11 @@ def without_acknowledged(read, management):
         return cached[2]
 
     def kept(row):
-        return row is None or (row["generation_id"], row["carrier_job_id"]) not in acknowledged
+        return (
+            row is None
+            or isinstance(row, ListingTruncation)
+            or (row["generation_id"], row["carrier_job_id"]) not in acknowledged
+        )
 
     view = _BoundEvidence(read)
     view.__dict__.update(vars(read))
