@@ -6,6 +6,7 @@ import copy
 from uuid import UUID
 
 import requests
+from django.test import SimpleTestCase
 from django.urls import reverse
 
 from netbox_nso_plugin import adapter_client
@@ -588,3 +589,41 @@ class TestCarrierIsolation(CarrierIsolationHelpers, CoalescedCarrierHelpers, BGP
         vlan.refresh_from_db()
         self.assertEqual(vlan.status, "deploying")
         self.assertTrue(attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists())
+
+
+class TestEvidenceRows(SimpleTestCase):
+    def test_indexed_rows_refuse_in_place_mutation_and_survive_copies(self):
+        from netbox_nso_plugin.apply_settlement import _Rows
+
+        rows = _Rows([{"id": 1, "carrier_job_id": 7}, {"id": 2, "carrier_job_id": 8}])
+        self.assertEqual(rows.matching(carrier_job_id=[7]), [rows[0]])
+        mutations = {
+            "append": lambda: rows.append({"id": 3, "carrier_job_id": 7}),
+            "extend": lambda: rows.extend([{"id": 3, "carrier_job_id": 7}]),
+            "insert": lambda: rows.insert(0, {"id": 3, "carrier_job_id": 7}),
+            "pop": rows.pop,
+            "remove": lambda: rows.remove(rows[0]),
+            "clear": rows.clear,
+            "sort": lambda: rows.sort(key=lambda row: -row["id"]),
+            "reverse": rows.reverse,
+            "setitem": lambda: rows.__setitem__(0, {"id": 3, "carrier_job_id": 8}),
+            "delitem": lambda: rows.__delitem__(0),
+            "iadd": lambda: rows.__iadd__([{"id": 3, "carrier_job_id": 7}]),
+            "imul": lambda: rows.__imul__(2),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name), self.assertRaises(TypeError):
+                mutate()
+        self.assertEqual(rows.matching(carrier_job_id=[7]), [{"id": 1, "carrier_job_id": 7}])
+        for name, clone in (("copy", copy.copy), ("deepcopy", copy.deepcopy), ("pickle", _pickle_round_trip)):
+            with self.subTest(clone=name):
+                cloned = clone(rows)
+                self.assertIs(type(cloned), _Rows)
+                self.assertEqual(cloned, rows)
+                self.assertEqual(cloned.matching(carrier_job_id=[8]), [rows[1]])
+
+
+def _pickle_round_trip(value):
+    import pickle
+
+    return pickle.loads(pickle.dumps(value))
