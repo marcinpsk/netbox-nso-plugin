@@ -368,25 +368,61 @@ class TestAcknowledgedHistoryConsumers(SettlementIssueHelpers, HistoricalStore, 
         with transaction.atomic():
             check_active_streams()
 
-    def test_readiness_ignores_a_conflicting_listing_row_of_an_acknowledged_obligation(self):
+    def truncate_listing_at_the_acknowledged_obligation(self):
+        """Repeat the acknowledged generation, then list a later unacknowledged carrier."""
+        for generation_id, seq, carrier in ((60, 3, 40), (61, 4, 41)):
+            self.history_listing.append(
+                make_generation_listing(
+                    generation_id=generation_id,
+                    seq=seq,
+                    job_id=carrier,
+                    carrier_job_id=carrier,
+                    stream_revisions={"bgp": 3},
+                    source_push_seq={"bgp": 999},
+                )
+            )
+
+    def test_readiness_blocks_on_a_listing_truncated_at_an_acknowledged_obligation(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence
+        from netbox_nso_plugin.deployment_checks import check_active_streams
+
+        self.acknowledged_readiness_store()
+        self.truncate_listing_at_the_acknowledged_obligation()
+        with transaction.atomic(), self.assertRaises(InvalidJobEvidence):
+            check_active_streams()
+
+    def test_readiness_ignores_a_failed_listing_row_of_an_acknowledged_obligation(self):
         from django.db import transaction
 
         from netbox_nso_plugin.deployment_checks import check_active_streams
 
         self.acknowledged_readiness_store()
-        # A repeated generation_id decodes to an evidence item with the acknowledged identity.
-        self.history_listing.append(
-            make_generation_listing(
-                generation_id=60,
-                seq=3,
-                job_id=40,
-                carrier_job_id=40,
-                stream_revisions={"bgp": 3},
-                source_push_seq={"bgp": 999},
-            )
-        )
+        original = self.adapter._handle
+        device_id = self.management.adapter_device_id
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/generations"):
+                return make_response(
+                    200, [failed_item(generation_wire(row, device_id)) for row in self.history_listing]
+                )
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
         with transaction.atomic():
             check_active_streams()
+
+    def test_settlement_stalls_on_a_listing_truncated_at_an_acknowledged_obligation(self):
+        self.acknowledged_history()
+        self.assertTrue(consume_static_route_settlements(self.management).drained)
+        self.truncate_listing_at_the_acknowledged_obligation()
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error["identity"]["generation_id"], 60)
+        self.assertEqual(self.management.settle_evidence_error["identity"]["seq"], 3)
 
     def test_readiness_ignores_a_failed_head_of_an_acknowledged_obligation(self):
         from django.db import transaction
