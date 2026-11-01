@@ -1704,6 +1704,16 @@ class _Rows(list):
         self._positions = {}
         self._last = {}
 
+    def _immutable(self, *_args, **_kwargs):
+        raise TypeError("evidence rows are immutable; build a new _Rows instead")
+
+    append = extend = insert = pop = remove = clear = sort = reverse = _immutable
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = _immutable
+
+    def __reduce__(self):
+        # copy and pickle rebuild a list subclass by appending, so rebuild through the constructor.
+        return (type(self), (list(self),))
+
     def _group(self, key):
         if key not in self._positions:
             positions = {}
