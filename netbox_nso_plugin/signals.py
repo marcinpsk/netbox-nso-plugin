@@ -665,6 +665,7 @@ _MANAGEMENT_MIRROR_FIELDS = frozenset(
         "settle_stall_seq",
         "settle_stall_attempts",
         "settle_stall_first_seen_at",
+        "settle_evidence_error",
         "onboard_status",
         "onboard_error",
         "onboarded_at",

@@ -284,7 +284,7 @@ def owner_deletion_proven(management, snapshot):
 
     if snapshot.mapping_epoch != mapping_epoch(management):
         return False
-    return NSOOverlaySettlementFence.objects.filter(
+    evidence = NSOOverlaySettlementFence.objects.filter(
         management=management,
         mapping_epoch=snapshot.mapping_epoch,
         model_label=snapshot.model_label,
@@ -293,6 +293,123 @@ def owner_deletion_proven(management, snapshot):
         content_digest=deleted_owner_digest(snapshot.model_label, snapshot.overlay_pk),
         current_attempt__isnull=True,
     ).exists()
+    # The existence read comes last: a row with this key on any device is not deleted.
+    return evidence and not apps.get_model(snapshot.model_label).objects.filter(pk=snapshot.overlay_pk).exists()
+
+
+def _write_deletion_evidence(fence, ref):
+    fence.bookkeeping_revision += 1
+    fence.owner_revision += 1
+    fence.content_digest = deleted_owner_digest(ref.model_label, ref.pk)
+    fence.current_attempt = None
+    fence.save(update_fields=("bookkeeping_revision", "owner_revision", "content_digest", "current_attempt"))
+
+
+def _carries_deletion_evidence(fence):
+    """Every retained snapshot of the owner can read this fence as deletion evidence."""
+    return (
+        fence.current_attempt_id is None
+        and fence.content_digest == deleted_owner_digest(fence.model_label, fence.overlay_pk)
+        and (fence.expected_revision is None or fence.bookkeeping_revision > fence.expected_revision)
+    )
+
+
+def _owner_snapshots():
+    from django.db.models import OuterRef
+
+    from .models import NSOApplyOverlaySnapshot
+
+    return NSOApplyOverlaySnapshot.objects.filter(
+        model_label=OuterRef("model_label"), overlay_pk=OuterRef("overlay_pk"), mapping_epoch=OuterRef("mapping_epoch")
+    )
+
+
+def _selection_history():
+    """Durable history only: the owner row is gone, so its last status is not available."""
+    from django.db.models import Exists, Q
+
+    return (
+        Q(owner_revision__gt=0)
+        | Q(accepted_at__isnull=False)
+        | Q(current_attempt__isnull=False)
+        | Q(last_execution__isnull=False)
+        | Exists(_owner_snapshots())
+    )
+
+
+def _absent_owner_fences(management, epoch, scopes):
+    """Select current fences whose owner row is gone from every device."""
+    from django.db.models import Exists, Max, OuterRef, Subquery
+
+    from .models import NSOOverlaySettlementFence
+    from .refusal_registry import OVERLAYS
+
+    fences = []
+    for label, spec in OVERLAYS.items():
+        if scopes.isdisjoint(spec.delivery_keys):
+            continue
+        fences.extend(
+            NSOOverlaySettlementFence.objects.filter(management=management, mapping_epoch=epoch, model_label=label)
+            .filter(~Exists(spec.model.objects.filter(pk=OuterRef("overlay_pk"))))
+            .filter(_selection_history())
+            .annotate(
+                expected_revision=Subquery(
+                    _owner_snapshots()
+                    .values("overlay_pk")
+                    .annotate(highest=Max("expected_fence_revision"))
+                    .values("highest")
+                )
+            )
+        )
+    return [fence for fence in fences if not _carries_deletion_evidence(fence)]
+
+
+def prove_absent_owners(device_id, scopes):
+    """Write deletion evidence for owners that a foreign delete removed outside any plugin writer."""
+    from .durable_capture import mapping_epoch
+    from .intent_state import (
+        _ACTIVE_PERMIT,
+        IntentMutationProtocolError,
+        MutationFootprint,
+        SourceRow,
+        mirror_transaction,
+    )
+    from .models import NSODeviceManagement
+
+    if _ACTIVE_PERMIT.get() is not None:
+        raise IntentMutationProtocolError("absent owner evidence needs its own mutation transaction")
+    management = NSODeviceManagement.objects.filter(device_id=device_id).first()
+    if management is None:
+        return 0
+    epoch = mapping_epoch(management)
+    candidates = _absent_owner_fences(management, epoch, frozenset(scopes))
+    if not candidates:
+        return 0
+    refs = tuple(SourceRow(fence.model_label, fence.overlay_pk) for fence in candidates)
+    footprint = MutationFootprint.merge(
+        MutationFootprint.for_keys((), overlay_rows=refs), MutationFootprint(device_ids=(int(device_id),))
+    )
+    proven = 0
+    with mirror_transaction(footprint) as permit:
+        locked = NSODeviceManagement.objects.filter(device_id=device_id).first()
+        if locked is None or locked.pk != management.pk or mapping_epoch(locked) != epoch:
+            return 0
+        # Re-select under the fence locks: discovery only estimated the work.
+        current = {
+            (fence.model_label, fence.overlay_pk) for fence in _absent_owner_fences(locked, epoch, frozenset(scopes))
+        }
+        for ref in refs:
+            fence = permit.owner_fences.get(ref)
+            if (
+                fence is None
+                or ref in permit.owner_before
+                or (fence.management_id, fence.mapping_epoch) != (locked.pk, epoch)
+                or (ref.model_label, ref.pk) not in current
+            ):
+                continue
+            _write_deletion_evidence(fence, ref)
+            proven += 1
+    return proven
 
 
 def owner_projection(row):
@@ -381,11 +498,7 @@ def finish_locked_owners(before, *, repend=False, deleted_rows=()):
                 )
             if fence.management_id in deleted_managements or ref in unselected:
                 continue
-            fence.bookkeeping_revision += 1
-            fence.owner_revision += 1
-            fence.content_digest = deleted_owner_digest(ref.model_label, ref.pk)
-            fence.current_attempt = None
-            fence.save(update_fields=("bookkeeping_revision", "owner_revision", "content_digest", "current_attempt"))
+            _write_deletion_evidence(fence, ref)
             continue
         after = owner_projection(row)
         if projection == after:

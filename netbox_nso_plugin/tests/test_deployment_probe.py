@@ -21,6 +21,7 @@ from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution, NSOInte
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import make_managed
 from ._settlement_adapter import FakeAdapter, LoopbackOnlySession
+from ._settlement_wire import deployment_wire, generation_wire, job_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
@@ -73,11 +74,14 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
                 params = kwargs.get("params") or {}
                 return make_response(
                     200,
-                    self.socket_adapter.store.feed(
-                        self.management.adapter_device_id,
-                        int(params.get("after_settle_seq", 0)),
-                        int(params.get("limit", 100)),
-                    ),
+                    [
+                        job_wire(job)
+                        for job in self.socket_adapter.store.feed(
+                            self.management.adapter_device_id,
+                            int(params.get("after_settle_seq", 0)),
+                            int(params.get("limit", 100)),
+                        )
+                    ],
                 )
             if method == "GET" and url.endswith("/intent-receipts"):
                 response = original(method, url, **kwargs)
@@ -810,14 +814,16 @@ class TestDeploymentProbe(DeploymentCase):
             if method == "GET" and url.endswith("/generations"):
                 generations = response.json()
                 historical = {
-                    **generations[0],
+                    **generations[0]["projection"],
                     "generation_id": 79,
                     "seq": 2,
                     "job_id": 499,
                     "carrier_job_id": 499,
                     "status": "failed",
                 }
-                return make_response(200, [historical, *generations])
+                return make_response(
+                    200, [generation_wire(historical, self.management.adapter_device_id), *generations]
+                )
             return response
 
         self.adapter._handle = gap
@@ -867,7 +873,7 @@ class TestDeploymentProbe(DeploymentCase):
             document = response.json()
             if method == "GET" and url.endswith("/generations"):
                 historical = {
-                    **document[0],
+                    **document[0]["projection"],
                     **{
                         key: execution.terminal_projection[key]
                         for key in ("generation_id", "seq", "stream_revisions", "source_push_seq")
@@ -877,17 +883,25 @@ class TestDeploymentProbe(DeploymentCase):
                     "carrier_job_id": retained["carrier_job_id"],
                     "carrier_job_status": retained["carrier_job_status"],
                 }
-                return make_response(200, [historical, *document])
+                return make_response(200, [generation_wire(historical, self.management.adapter_device_id), *document])
             if method == "POST" and url.endswith("/deployment-evidence"):
                 if str(execution.attempt_id) in kwargs["json"]["apply_attempt_ids"]:
-                    document["attempts"].append(
-                        {
-                            "apply_attempt_id": str(execution.attempt_id),
-                            "admission_state": "admitted",
-                            "http_status": execution.attempt.http_status,
-                            "response": execution.attempt.response,
-                            "generations": [retained],
-                        }
+                    document["attempts"].extend(
+                        deployment_wire(
+                            {
+                                **document,
+                                "head": None,
+                                "attempts": [
+                                    {
+                                        "apply_attempt_id": str(execution.attempt_id),
+                                        "admission_state": "admitted",
+                                        "http_status": execution.attempt.http_status,
+                                        "response": execution.attempt.response,
+                                        "generations": [retained],
+                                    }
+                                ],
+                            }
+                        )["attempts"]
                     )
                 return make_response(200, document)
             return response

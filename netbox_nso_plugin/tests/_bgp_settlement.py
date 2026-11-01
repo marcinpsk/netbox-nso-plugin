@@ -11,6 +11,7 @@ from django.urls import reverse
 from netbox_nso_plugin.models import NSOApplyAttempt
 from netbox_nso_plugin.refusal_registry import OVERLAYS
 
+from ._settlement_wire import deployment_wire, generation_wire, job_wire
 from .test_apply_selector import _promoted
 
 
@@ -176,7 +177,7 @@ class BGPSettlementHelpers:
                 super().end_headers()
 
         self.server.RequestHandlerClass = EvidenceHandler
-        self.server.evidence_incarnation = "placeholder-store"
+        self.server.evidence_incarnation = "00000000-0000-4000-8000-000000000004"
         from netbox_nso_plugin import adapter_client
 
         adapter_client.reset_session()
@@ -190,7 +191,7 @@ class BGPSettlementHelpers:
             if method == "GET" and url.endswith("/jobs"):
                 feed_requests += 1
                 if epoch_change and feed_requests > 1:
-                    self.server.evidence_incarnation = "placeholder-reset-store"
+                    self.server.evidence_incarnation = "00000000-0000-4000-8000-000000000003"
                 job = {
                     "id": generation["carrier_job_id"],
                     "type": "apply",
@@ -208,28 +209,31 @@ class BGPSettlementHelpers:
                     "settle_seq": settle_seq,
                 }
                 after = int(kwargs["params"]["after_settle_seq"])
-                return make_response(200, [] if pruned or job["settle_seq"] <= after else [job])
+                return make_response(200, [] if pruned or job["settle_seq"] <= after else [job_wire(job)])
             if method == "GET" and url.endswith("/generations"):
                 return make_response(
                     200,
                     [
-                        *earlier_generations,
-                        {
-                            "generation_id": generation["generation_id"],
-                            "seq": generation["seq"],
-                            "status": generation["status"],
-                            "job_id": None if pruned else generation["carrier_job_id"],
-                            "carrier_job_id": generation["carrier_job_id"],
-                            "carrier_job_status": generation["carrier_job_status"],
-                            **(listed_carrier or {}),
-                            "mode": "networked",
-                            "settlement_cohort": 9,
-                            "digest": "a" * 64,
-                            "stream_revisions": generation["stream_revisions"],
-                            "source_push_seq": generation["source_push_seq"],
-                            "created_at": self.stamp.isoformat(),
-                            "updated_at": generation["updated_at"],
-                        },
+                        generation_wire(row, self.management.adapter_device_id)
+                        for row in [
+                            *earlier_generations,
+                            {
+                                "generation_id": generation["generation_id"],
+                                "seq": generation["seq"],
+                                "status": generation["status"],
+                                "job_id": None if pruned else generation["carrier_job_id"],
+                                "carrier_job_id": generation["carrier_job_id"],
+                                "carrier_job_status": generation["carrier_job_status"],
+                                **(listed_carrier or {}),
+                                "mode": "networked",
+                                "settlement_cohort": 9,
+                                "digest": "a" * 64,
+                                "stream_revisions": generation["stream_revisions"],
+                                "source_push_seq": generation["source_push_seq"],
+                                "created_at": self.stamp.isoformat(),
+                                "updated_at": generation["updated_at"],
+                            },
+                        ]
                     ],
                 )
             if method == "POST" and url.endswith("/deployment-evidence"):
@@ -239,26 +243,28 @@ class BGPSettlementHelpers:
                 )
                 return make_response(
                     200,
-                    {
-                        "device_id": self.management.adapter_device_id,
-                        "head": head_row if head else None,
-                        "blocked": generation["status"] == "failed",
-                        "write_work_pending": False,
-                        "held_jobs": [],
-                        "pending_generations": 0,
-                        "attempts": [
-                            {
-                                "apply_attempt_id": str(self.attempt.pk),
-                                "admission_state": "admitted",
-                                "http_status": 202,
-                                "response": self.attempt.response,
-                                "generations": [generation],
-                            }
-                        ]
-                        if manual and str(self.attempt.pk) in kwargs["json"]["apply_attempt_ids"]
-                        else [],
-                        "unknown_apply_attempt_ids": [],
-                    },
+                    deployment_wire(
+                        {
+                            "device_id": self.management.adapter_device_id,
+                            "head": head_row if head else None,
+                            "blocked": generation["status"] == "failed",
+                            "write_work_pending": False,
+                            "held_jobs": [],
+                            "pending_generations": 0,
+                            "attempts": [
+                                {
+                                    "apply_attempt_id": str(self.attempt.pk),
+                                    "admission_state": "admitted",
+                                    "http_status": 202,
+                                    "response": self.attempt.response,
+                                    "generations": [generation],
+                                }
+                            ]
+                            if manual and str(self.attempt.pk) in kwargs["json"]["apply_attempt_ids"]
+                            else [],
+                            "unknown_apply_attempt_ids": [],
+                        }
+                    ),
                 )
             return original(method, url, **kwargs)
 
@@ -453,5 +459,5 @@ class BGPSettlementHelpers:
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         return settle_terminal_generation(
-            self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=1
+            self.management, generation, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=1
         )

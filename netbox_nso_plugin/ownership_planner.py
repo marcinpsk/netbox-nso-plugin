@@ -2388,6 +2388,9 @@ def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object
     management = NSODeviceManagement.objects.filter(device_id=device_id).first()
     if management is None:
         return ()
+    from .lifecycle_fence import prove_absent_owners
+
+    prove_absent_owners(device_id, requested)
     bindings = _native_bindings(management, requested)
     qualifying = _qualifying_overlay_signatures(
         device_id,

@@ -10,9 +10,24 @@ from django.utils import timezone
 
 from . import delivery, refusal_contract
 from . import durable_capture as capture
-from .apply_settlement import EvidenceInvariantError, _parse_time
+from .apply_settlement import (
+    EvidenceInvariantError,
+    _carrier_job,
+    _parse_time,
+    _validate_generation,
+    identify_evidence_stall,
+    identify_generation_stall,
+)
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
 from .refusal_registry import OVERLAYS
+from .settlement_resolution import (
+    RESOLVED_STATES,
+    acknowledged_since,
+    close_completed_attempt,
+    cover_unknown_contributions,
+    unknown_bookkeeping,
+)
+from .settlement_schemas import canonical_uuid
 
 
 @dataclass(frozen=True)
@@ -155,11 +170,13 @@ def _join(management, generation, incarnation, attempt, authorities=None, receip
         bindings[key] = binding
         actual[key] = outcome
     _require(set(actual) == set(expected), "incomplete_frozen_outcomes")
+    attempted = {refusal_contract.logical_key(outcome) for outcome in generation["carrier_job_result"]["row_outcomes"]}
     for cause in generation["refusals"]:
-        if cause["provenance"] != "current":
-            continue
         for logical in cause["logical_rows"]:
-            if logical["generation_id"] != generation["generation_id"]:
+            if (
+                refusal_contract.logical_key(logical) not in attempted
+                or logical["generation_id"] != generation["generation_id"]
+            ):
                 continue
             key = _logical(logical)
             _require(key in expected, "cause_unknown_logical_owner")
@@ -258,12 +275,19 @@ def _earlier_execution(fence, generation, incarnation, settle_seq):
 
 def _record_invariant(management, generation, incarnation, attempt, code):
     """Persist safe diagnostics after the rejected batch transaction rolled back."""
-    if not isinstance(generation, dict) or not isinstance(incarnation, str) or not incarnation or len(incarnation) > 64:
+    if not isinstance(generation, dict) or not canonical_uuid(incarnation):
         return
     generation_id, carrier_id = generation.get("generation_id"), generation.get("carrier_job_id")
     if type(generation_id) is not int or type(carrier_id) is not int or generation_id <= 0 or carrier_id <= 0:
         return
+    from .models import NSODeviceManagement
+    from .settlement_evidence import matches_request_fence, request_fence
+
+    fence = request_fence(management)
     with transaction.atomic():
+        management = NSODeviceManagement.objects.select_for_update().get(pk=management.pk)
+        if not matches_request_fence(management, fence):
+            return
         identity = dict(
             management=management,
             mapping_epoch=capture.mapping_epoch(management),
@@ -293,17 +317,21 @@ def validate_terminal_generation(
     management, generation, store_incarnation, *, attempt=None, authorities=None, receipt_recoveries=None
 ):
     """Prove complete ownership without binding selections or writing overlays."""
-    try:
-        return _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
-    except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
-        code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
-        _record_invariant(management, generation, store_incarnation, attempt, code)
-        raise EvidenceInvariantError(code) from exc
+    with identify_generation_stall(generation):
+        try:
+            return _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
+        except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
+            code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
+            _record_invariant(management, generation, store_incarnation, attempt, code)
+            error = EvidenceInvariantError(code)
+            if hasattr(exc, "invalid_job"):
+                error.invalid_job = exc.invalid_job
+            raise error from exc
 
 
 def _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries):
-    refusal_contract.validate_generation(generation)
-    _require(isinstance(store_incarnation, str) and 0 < len(store_incarnation) <= 64, "missing_store_incarnation")
+    _validate_generation(generation)
+    _require(canonical_uuid(store_incarnation), "missing_store_incarnation")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
         return None
     return _join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
@@ -320,11 +348,12 @@ def settle_terminal_generation(
     management, generation, store_incarnation, *, attempt=None, settle_seq=None, mode="networked"
 ):
     """Validate a complete terminal batch, then commit owner CAS decisions together."""
-    try:
-        refusal_contract.validate_generation(generation)
-    except refusal_contract.ContractError as exc:
-        _record_invariant(management, generation, store_incarnation, attempt, "invalid_terminal_batch")
-        raise EvidenceInvariantError("invalid_terminal_batch") from exc
+    with identify_generation_stall(generation, settle_seq=settle_seq):
+        try:
+            _validate_generation(generation)
+        except EvidenceInvariantError:
+            _record_invariant(management, generation, store_incarnation, attempt, "invalid_terminal_batch")
+            raise
     return settle_terminal_generations(
         management,
         [generation],
@@ -333,6 +362,22 @@ def settle_terminal_generation(
         settle_sequences={generation["carrier_job_id"]: settle_seq},
         modes={generation["generation_id"]: mode},
     )[0]
+
+
+def _validated_carrier_authorities(adapter_device_id, generations, incarnation, sequences):
+    authorities, groups = {}, {}
+    for generation in generations:
+        carrier_id = generation.get("carrier_job_id") if isinstance(generation, dict) else None
+        job = _carrier_job(adapter_device_id, carrier_id, sequences)
+        with identify_evidence_stall(job, incarnation):
+            _validate_generation(generation)
+            groups.setdefault(carrier_id, []).append(generation)
+            authorities.setdefault(carrier_id, {})[generation["generation_id"]] = generation
+    for carrier_id, group in groups.items():
+        job = _carrier_job(adapter_device_id, carrier_id, sequences)
+        with identify_evidence_stall(job, incarnation):
+            refusal_contract.validate_carrier_generations(group)
+    return authorities
 
 
 def settle_terminal_generations(
@@ -345,6 +390,8 @@ def settle_terminal_generations(
     modes=None,
     restorations=(),
     receipt_recoveries=None,
+    before_settle=None,
+    after_settle=None,
 ):
     """Commit all generation authorities in each carrier as one owner transaction."""
     from .intent_state import MutationFootprint, SourceRow, mirror_transaction
@@ -355,23 +402,24 @@ def settle_terminal_generations(
     receipt_recoveries = receipt_recoveries or {}
     generations = list(generations)
     try:
-        refusal_contract.validate_carrier_generations(generations)
-        authorities = {}
-        for generation in generations:
-            authorities.setdefault(generation["carrier_job_id"], {})[generation["generation_id"]] = generation
+        authorities = _validated_carrier_authorities(
+            management.adapter_device_id, generations, store_incarnation, settle_sequences
+        )
         grouped = set()
         keys = set()
         for generation in generations:
             identity = generation["generation_id"], generation["carrier_job_id"]
             # The batch handler below records the invariant for every generation.
-            joined = _validated_join(
-                management,
-                generation,
-                store_incarnation,
-                attempts.get(identity),
-                authorities[generation["carrier_job_id"]],
-                receipt_recoveries,
-            )
+            job = _carrier_job(management.adapter_device_id, generation["carrier_job_id"], settle_sequences)
+            with identify_evidence_stall(job, store_incarnation):
+                joined = _validated_join(
+                    management,
+                    generation,
+                    store_incarnation,
+                    attempts.get(identity),
+                    authorities[generation["carrier_job_id"]],
+                    receipt_recoveries,
+                )
             if joined is not None:
                 grouped.update(joined[-1])
         for label, _pk in grouped:
@@ -387,21 +435,38 @@ def settle_terminal_generations(
             authoritative_bookkeeping(),
             mirror_transaction(footprint),
         ):
-            acknowledge_recoveries(management, receipt_recoveries, store_incarnation, states)
-            for attempt_id, keep in restorations:
-                capture.restore_attempt(attempt_id, keep_streams=keep)
-            return [
-                _settle(
+            if before_settle is not None:
+                before_settle()
+            for generation in generations:
+                _validated_join(
                     management,
                     generation,
                     store_incarnation,
-                    attempt=attempts.get((generation["generation_id"], generation["carrier_job_id"])),
-                    settle_seq=settle_sequences.get(generation["carrier_job_id"]),
-                    mode=modes.get(generation["generation_id"], "networked"),
-                    authorities=authorities[generation["carrier_job_id"]],
+                    attempts.get((generation["generation_id"], generation["carrier_job_id"])),
+                    authorities[generation["carrier_job_id"]],
+                    receipt_recoveries,
                 )
-                for generation in generations
-            ]
+            acknowledge_recoveries(management, receipt_recoveries, store_incarnation, states)
+            for attempt_id, keep in restorations:
+                capture.restore_attempt(attempt_id, keep_streams=keep)
+            executions = []
+            for generation in generations:
+                job = _carrier_job(management.adapter_device_id, generation["carrier_job_id"], settle_sequences)
+                with identify_evidence_stall(job, store_incarnation):
+                    executions.append(
+                        _settle(
+                            management,
+                            generation,
+                            store_incarnation,
+                            attempt=attempts.get((generation["generation_id"], generation["carrier_job_id"])),
+                            settle_seq=settle_sequences.get(generation["carrier_job_id"]),
+                            mode=modes.get(generation["generation_id"], "networked"),
+                            authorities=authorities[generation["carrier_job_id"]],
+                        )
+                    )
+            if after_settle is not None:
+                after_settle()
+            return executions
     except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
         code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
         for generation in generations:
@@ -412,7 +477,10 @@ def settle_terminal_generations(
                 _attempt_for(attempts, generation),
                 code,
             )
-        raise EvidenceInvariantError(code) from exc
+        error = EvidenceInvariantError(code)
+        if hasattr(exc, "invalid_job"):
+            error.invalid_job = exc.invalid_job
+        raise error from exc
 
 
 def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, authorities=None):
@@ -420,8 +488,8 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
     from .lifecycle_fence import authoritative_bookkeeping, fence_for
     from .models import NSODeviceManagement
 
-    refusal_contract.validate_generation(generation)
-    _require(isinstance(incarnation, str) and 0 < len(incarnation) <= 64, "missing_store_incarnation")
+    _validate_generation(generation)
+    _require(canonical_uuid(incarnation), "missing_store_incarnation")
     _require(settle_seq is None or type(settle_seq) is int and settle_seq > 0, "invalid_settlement_sequence")
     if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
         return None
@@ -472,7 +540,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
                 store_incarnation=incarnation,
                 generation_id=generation["generation_id"],
                 attempt=attempt,
-                consumption_state="consumed",
+                consumption_state__in=RESOLVED_STATES,
             )
             .exclude(carrier_job_id=generation["carrier_job_id"])
             .exists()
@@ -496,7 +564,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
                     management=management,
                     store_incarnation=incarnation,
                     generation_id=generation["generation_id"],
-                    consumption_state="consumed",
+                    consumption_state__in=RESOLVED_STATES,
                 ).exists()
                 else "cadence",
                 selected={row.stream: row.source_push_seq or row.selection_revision for row in selections.values()},
@@ -568,10 +636,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
         )
         execution.consumed_at = timezone.now()
         execution.save(update_fields=("consumption_state", "consumed_at"))
-        if not attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists():
-            attempt.lifecycle = "terminal"
-            attempt.completed_at = timezone.now()
-            attempt.save(update_fields=("lifecycle", "completed_at"))
+        close_completed_attempt(attempt, timezone.now())
         return execution
 
 
@@ -583,7 +648,8 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
     generation = execution.terminal_projection
     fence = fence_for(row) if row is not None else None
     matches = capture._matches(snapshot, row, management, {}, "expected", check_revisions=False)
-    if not matches or _earlier_execution(fence, generation, execution.store_incarnation, settle_seq):
+    acknowledged = None if matches else acknowledged_since(snapshot, row, fence, management)
+    if not (matches or acknowledged) or _earlier_execution(fence, generation, execution.store_incarnation, settle_seq):
         disposition = "superseded"
     else:
         disposition = OwnerOutcome(snapshot, tuple(outcomes)).disposition
@@ -592,7 +658,10 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
 
             if not static_route_success_proven(snapshot, generation):
                 disposition = "unavailable"
-        values = {name: copy.deepcopy(getattr(snapshot, "prior_" + name)) for name in capture._BOOKKEEPING}
+        # After an acknowledgement, the state before this execution is the acknowledged one.
+        source = row if acknowledged else snapshot
+        prefix = "" if acknowledged else "prior_"
+        values = {name: copy.deepcopy(getattr(source, prefix + name)) for name in capture._BOOKKEEPING}
         if disposition == "refused":
             causes = [cause for outcome in outcomes for cause in outcome["refusals"]]
             error = refusal_error(causes, json_error=OVERLAYS[snapshot.model_label].error_type == "JSONField")
@@ -604,6 +673,11 @@ def _settle_owner(snapshot, row, outcomes, management, execution, attempt, settl
                 last_apply_error={} if OVERLAYS[snapshot.model_label].error_type == "JSONField" else "",
                 apply_attempt_id=attempt.pk,
             )
+        unknown = cover_unknown_contributions(row, fence, execution, outcomes)
+        if unknown and disposition != "refused":
+            # Every final write keeps acknowledged unknown contributions from success or prior state.
+            disposition = "unavailable"
+            values = unknown_bookkeeping(row, [owner.issue.job_id for owner, _keys in unknown], attempt)
         with suppress_intent_push(), mirror_refresh(row, values) as locked:
             _require(locked is not None, "owner_disappeared_under_lock")
             for name, value in values.items():

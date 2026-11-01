@@ -26,7 +26,8 @@ from django.urls import reverse
 from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-from ._adapter_http import make_generation_listing, make_response, make_session
+from ._adapter_http import make_evidence_envelope, make_generation_listing, make_response, make_session
+from ._settlement_wire import generation_wire, job_wire
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
@@ -38,16 +39,25 @@ _ADAPTER_CFG = {
     "ca_cert_path": None,
     "timeout": 30,
 }
+_EMPTY_REFUSAL_PROJECTION = {"refusal": None, "refusal_text": "", "summary": "", "refusal_summary": ""}
 
 
 def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T06:00:00Z"):
     """A removal job the collateral guard blocked (shape from adapter run_removal)."""
     return {
         "id": job_id,
+        "settle_seq": job_id,
         "type": "removal",
         "device_id": 10,
         "status": status,
-        "result": None,
+        "result": {
+            "row_outcomes": [],
+            "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": False,
+        },
+        "row_outcomes": [],
+        "refusals": [],
         "context": {"scope": scope},
         "error": {
             "code": "removal_blocked_collateral",
@@ -67,12 +77,24 @@ def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T0
 
 def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=True):
     """A generic removal job in *status*; scope attributed via context and/or result."""
+    terminal = status in {"succeeded", "failed"}
     return {
         "id": job_id,
+        "settle_seq": job_id if terminal else None,
         "type": "removal",
         "device_id": 10,
         "status": status,
-        "result": {"scope": scope} if status == "succeeded" else None,
+        "result": {
+            **({"scope": scope} if status == "succeeded" else {}),
+            "row_outcomes": [],
+            "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": status == "succeeded",
+        }
+        if terminal
+        else None,
+        "row_outcomes": [] if terminal else None,
+        "refusals": [] if terminal else None,
         "context": {"scope": scope} if context else None,
         "error": None,
         "created_at": updated,
@@ -84,7 +106,14 @@ def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=
 
 def _served(jobs):
     """The device-jobs listing adds each job's per-scope outcome counts."""
-    return [{**job, "outcome_counts": []} for job in jobs]
+    return [
+        {
+            **job,
+            "outcome_counts": [],
+            **(_EMPTY_REFUSAL_PROJECTION if job.get("row_outcomes") is not None else {}),
+        }
+        for job in jobs
+    ]
 
 
 def _device_generations():
@@ -172,6 +201,8 @@ class BlockedRemovalTestBase(TestCase):
         apply_state_status=200,
         job_id=None,
         stored_jobs=(),
+        failed_generation_ids=(),
+        expected_status=200,
     ):
         """Hit device_nso_jobs with the adapter's job list canned at the transport.
 
@@ -204,7 +235,14 @@ class BlockedRemovalTestBase(TestCase):
                     cursor = params.get("since_seq", 0)
                     limit = params.get("limit", 100)
                     page = [row for row in generations if row["seq"] > cursor][:limit]
-                    return make_response(200, json_data=page)
+                    wired = [generation_wire(row, 10) for row in page]
+                    wired = [
+                        make_evidence_envelope(None, identity=item["identity"], error="execution_contract")
+                        if item["identity"]["generation_id"] in failed_generation_ids
+                        else item
+                        for item in wired
+                    ]
+                    return make_response(200, json_data=wired)
                 if lookup := re.search(r"/api/v1/jobs/(\d+)$", url):
                     job_lookups.append(int(lookup.group(1)))
                     job = stored.get(int(lookup.group(1)))
@@ -212,8 +250,8 @@ class BlockedRemovalTestBase(TestCase):
                         return make_response(
                             404, json_data={"error": {"code": "not_found", "message": "Job not found"}}
                         )
-                    return make_response(200, json_data=job)
-                return make_response(200, json_data=jobs)
+                    return make_response(200, json_data=job_wire(job))
+                return make_response(200, json_data=[job_wire(job) for job in jobs])
 
             session.request.side_effect = request
             mock_session_cls.return_value = session
@@ -223,10 +261,11 @@ class BlockedRemovalTestBase(TestCase):
                 query["since_seq"] = since_seq
             if job_id is not None:
                 query["job_id"] = job_id
+            self.client.raise_request_exception = False
             response = self.client.get(url, query)
         self.generation_request_params = generation_request_params
         self.job_lookups = job_lookups
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, expected_status)
         return json.loads(response.content)
 
 
@@ -312,7 +351,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
                 )
                 self.assertEqual(data["jobs"], _served(jobs))
                 self.assertEqual(data["running"], running)
-                self.assertEqual(data["last"], blocked)
+                self.assertEqual(data["last"], {**blocked, **_EMPTY_REFUSAL_PROJECTION})
                 self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
                 self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
@@ -328,7 +367,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         self.assertEqual(data["apply_state_error"], "The NSO adapter request failed. See the server log.")
         self.assertEqual(data["jobs"], _served(jobs))
         self.assertEqual(data["running"], running)
-        self.assertEqual(data["last"], blocked)
+        self.assertEqual(data["last"], {**blocked, **_EMPTY_REFUSAL_PROJECTION})
         self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
         self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
@@ -355,7 +394,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         )
         self.assertEqual(data["jobs"], _served(jobs))
         self.assertEqual(data["running"], running)
-        self.assertEqual(data["last"], blocked)
+        self.assertEqual(data["last"], {**blocked, **_EMPTY_REFUSAL_PROJECTION})
         self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
         self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
@@ -398,6 +437,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             make_generation_listing(
                 generation_id=seq,
                 seq=seq,
+                status="settled" if seq == wanted else "pending",
                 job_id=wanted if seq == wanted else None,
                 carrier_job_id=wanted if seq == wanted else None,
                 carrier_job_status="succeeded" if seq == wanted else None,
@@ -453,6 +493,26 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         self.assertEqual(self.job_lookups, [501])
         self.assertEqual(data["jobs"], _served([polled]))
 
+    def test_a_failed_unrequested_generation_keeps_the_status_strip(self):
+        generations = _device_generations()
+        jobs = [_removal_job(501, "vlan", "succeeded")]
+
+        data = self._get_jobs(jobs, generations=generations, generation_ids=(81,), failed_generation_ids=(90,))
+
+        self.assertEqual(data["generations"], [generations[0]])
+        self.assertEqual(data["jobs"], _served(jobs))
+
+    def test_a_failed_requested_generation_fails_closed(self):
+        data = self._get_jobs(
+            [],
+            generations=_device_generations(),
+            generation_ids=(81,),
+            failed_generation_ids=(81,),
+            expected_status=502,
+        )
+
+        self.assertEqual(data["error"], "The NSO adapter returned an invalid response. See the server log.")
+
     def test_a_non_integer_job_id_is_rejected(self):
         with patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG):
             url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=[self.device.pk])
@@ -466,6 +526,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             make_generation_listing(
                 generation_id=seq,
                 seq=seq,
+                status="settled" if seq == wanted else "pending",
                 job_id=wanted if seq == wanted else None,
                 carrier_job_id=wanted if seq == wanted else None,
                 carrier_job_status="succeeded" if seq == wanted else None,
@@ -563,10 +624,13 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         """Sync/apply jobs never contribute to blocked_removals or mask a block."""
         sync = {
             "id": 70,
+            "settle_seq": 70,
             "type": "sync",
             "device_id": 10,
             "status": "succeeded",
             "result": None,
+            "row_outcomes": None,
+            "refusals": None,
             "context": None,
             "error": None,
             "created_at": "2026-07-10T08:00:00Z",
@@ -652,14 +716,21 @@ def _residue_job(job_id=60, scope="svi", residue=None, updated="2026-07-11T20:00
     """A SUCCEEDED removal whose post-retract check found device residue (#104-A)."""
     return {
         "id": job_id,
+        "settle_seq": job_id,
         "type": "removal",
         "device_id": 10,
         "status": "succeeded",
         "result": {
+            "row_outcomes": [],
+            "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": True,
             "scope": scope,
             "residue_check": "found",
             "residue": residue or {"interface": [["Vlan987"]]},
         },
+        "row_outcomes": [],
+        "refusals": [],
         "context": {"scope": scope, "removed": {"interface": [["Vlan987"]]}},
         "error": None,
         "created_at": "2026-07-11T19:59:00Z",
@@ -689,19 +760,19 @@ class TestDeviceJobsResidueRemovals(BlockedRemovalTestBase):
 
     def test_clean_removal_yields_no_entry(self):
         job = _residue_job()
-        job["result"] = {"scope": "svi", "residue_check": "clean"}
+        job["result"].update(scope="svi", residue_check="clean", residue={})
         data = self._get_jobs([job])
         self.assertEqual(data["residue_removals"], [])
 
     def test_newer_clean_removal_masks_stale_residue(self):
         newer = _residue_job(job_id=61)
-        newer["result"] = {"scope": "svi", "residue_check": "clean"}
+        newer["result"].update(scope="svi", residue_check="clean", residue={})
         data = self._get_jobs([newer, _residue_job(job_id=60)])  # most-recent-first
         self.assertEqual(data["residue_removals"], [])
 
     def test_other_scope_clean_removal_keeps_residue(self):
         clean_static = _residue_job(job_id=62, scope="static_route")
-        clean_static["result"] = {"scope": "static_route", "residue_check": "clean"}
+        clean_static["result"].update(scope="static_route", residue_check="clean", residue={})
         data = self._get_jobs([clean_static, _residue_job(job_id=60)])
         self.assertEqual(len(data["residue_removals"]), 1)
         self.assertEqual(data["residue_removals"][0]["scope"], "svi")
@@ -738,7 +809,9 @@ class TestCategoryGridResidueBadges(BlockedRemovalTestBase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_ADAPTER_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session") as mock_session_cls,
         ):
-            mock_session_cls.return_value = make_session(response=make_response(200, json_data=jobs))
+            mock_session_cls.return_value = make_session(
+                response=make_response(200, json_data=[job_wire(job) for job in jobs])
+            )
             url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": key})
             return self.client.get(url)
 
@@ -955,7 +1028,7 @@ class TestFreeFormResidue(TestCase):
         from netbox_nso_plugin.views import _annotate_residue_rows
 
         job = _removal_job(90, "vlan", "succeeded")
-        job["result"] = {"scope": "vlan", "residue": residue}
+        job["result"].update(scope="vlan", residue=residue)
         mgmt = NSODeviceManagement(adapter_device_id=10)
         row = SimpleNamespace(vlan=SimpleNamespace(vid="b"))
         ctx = {"vlan_states": [row]}
