@@ -38,13 +38,10 @@ class TestAcknowledgedObligationConsumers(
         issue.refresh_from_db()
         return issue
 
-    def serve_retry(self, *, dispositions=None):
+    def serve_retry(self, *, disposition=None):
         """Retry generation 81 under carrier 503, joined to the manual attempt through the head."""
-        retry = self.terminal(refused=None)
+        retry = self.terminal(refused=None, disposition=disposition)
         retry["carrier_job_id"] = 503
-        if dispositions is not None:
-            for outcome in retry["row_outcomes"]:
-                outcome["disposition"] = dispositions
         self.serve_terminal_evidence(retry, settle_seq=2)
         original = self.adapter._handle
         attempt_id = str(self.attempt.pk)
@@ -143,7 +140,7 @@ class TestAcknowledgedObligationConsumers(
         router = self.owners[0]
         router.refresh_from_db()
         self.unknown_owner(router, ["bgp", "bgp.router", "f" * 64], 499)
-        self.serve_retry()
+        self.serve_retry(disposition="unavailable")
         self.assertFalse(consume_static_route_settlements(self.management).stalled)
         expected = {
             "state": "apply_failed",
