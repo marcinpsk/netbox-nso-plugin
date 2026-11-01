@@ -19,10 +19,11 @@ from netbox_nso_plugin.settlement import consume_static_route_settlements
 from netbox_nso_plugin.settlement_acknowledgement import acknowledge
 from netbox_nso_plugin.settlement_resolution import instant
 
-from ._adapter_http import make_response
+from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import content_update, mirror_update
 from ._settlement_observation import INCARNATION, failed_item, serve_observation
+from ._settlement_wire import generation_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 from .test_settlement_issue import ADVISORY, HistoricalStore, SettlementIssueHelpers
 
@@ -328,7 +329,8 @@ class TestAcknowledgedHistoryConsumers(SettlementIssueHelpers, HistoricalStore, 
         self.assertFalse(result.stalled)
         self.assertTrue(result.drained)
 
-    def test_readiness_resolves_the_acknowledged_generation_without_a_certificate(self):
+    def acknowledged_readiness_store(self):
+        """Serve a store whose only obligation an operator acknowledged after readiness refused it."""
         from django.db import transaction
 
         from netbox_nso_plugin.deployment_checks import check_active_streams
@@ -356,6 +358,52 @@ class TestAcknowledgedHistoryConsumers(SettlementIssueHelpers, HistoricalStore, 
         consume_static_route_settlements(self.management)
         issue = NSOSettlementIssue.objects.get(state="open")
         acknowledge(issue, issue.revision_digest, self.operator(), "pre-ledger generation")
+
+    def test_readiness_resolves_the_acknowledged_generation_without_a_certificate(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.deployment_checks import check_active_streams
+
+        self.acknowledged_readiness_store()
+        with transaction.atomic():
+            check_active_streams()
+
+    def test_readiness_ignores_a_conflicting_listing_row_of_an_acknowledged_obligation(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.deployment_checks import check_active_streams
+
+        self.acknowledged_readiness_store()
+        # A repeated generation_id decodes to an evidence item with the acknowledged identity.
+        self.history_listing.append(
+            make_generation_listing(
+                generation_id=60,
+                seq=3,
+                job_id=40,
+                carrier_job_id=40,
+                stream_revisions={"bgp": 3},
+                source_push_seq={"bgp": 999},
+            )
+        )
+        with transaction.atomic():
+            check_active_streams()
+
+    def test_readiness_ignores_a_failed_head_of_an_acknowledged_obligation(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.deployment_checks import check_active_streams
+
+        self.acknowledged_readiness_store()
+        original = self.adapter._handle
+        head = failed_item(generation_wire(self.history_listing[0], self.management.adapter_device_id))
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                return make_response(200, {**response.json(), "head": head})
+            return response
+
+        self.adapter._handle = handle
         with transaction.atomic():
             check_active_streams()
 
