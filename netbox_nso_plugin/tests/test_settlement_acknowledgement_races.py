@@ -79,6 +79,26 @@ class RaceHelpers:
         self.addCleanup(post_init.disconnect, receiver, sender=NSODeviceManagement)
         return state, paused, resume
 
+    def hold_before_clear(self):
+        """Hold the pass that run_pass starts after its drained evidence result, before its resume clear."""
+        from netbox_nso_plugin import settlement
+
+        ready, go = threading.Event(), threading.Event()
+        real = settlement._complete_evidence_result
+        state = {}
+
+        def held(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if threading.get_ident() == state.get("thread"):
+                ready.set()
+                self.wait_released(go, "clearing pass")
+            return result
+
+        patcher = patch.object(settlement, "_complete_evidence_result", new=held)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return state, ready, go
+
     def run_pass(self, state):
         outcome = {}
 
@@ -413,22 +433,7 @@ class TestHistoricalAcknowledgementAgainstSettlement(
         self.assert_new_job_recorded()
 
     def test_a_stall_of_a_job_that_no_acknowledgement_released_survives_a_racing_clear(self):
-        from netbox_nso_plugin import settlement
-
-        ready, go = threading.Event(), threading.Event()
-        real = settlement._complete_evidence_result
-        state = {}
-
-        def held(*args, **kwargs):
-            result = real(*args, **kwargs)
-            if threading.get_ident() == state.get("thread"):
-                ready.set()
-                self.wait_released(go, "clearing pass")
-            return result
-
-        patcher = patch.object(settlement, "_complete_evidence_result", new=held)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        state, ready, go = self.hold_before_clear()
 
         def drained_pass_waits_before_its_clear():
             self.clearing, self.cleared = self.run_pass(state)
@@ -439,3 +444,46 @@ class TestHistoricalAcknowledgementAgainstSettlement(
         self.join(self.clearing)
         self.assertTrue(self.cleared["result"].drained)
         self.assert_new_job_recorded()
+
+    def test_a_historical_acknowledgement_before_a_drained_clear_keeps_its_resume_request(self):
+        from netbox_nso_plugin.settlement import sweep_static_route_settlements
+
+        self.serve_history()
+        client = self.client_for(self.acknowledger())
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        first = NSOSettlementIssue.objects.get(state="open")
+        client.post(self.action_url(), self.form(first, reason="placeholder first carrier"))
+        state, ready, go = self.hold_before_clear()
+        clearing, cleared = self.run_pass(state)
+        self.assertTrue(ready.wait(WAIT))
+        second = copy.deepcopy(self.history_jobs[0])
+        second.update(id=41, settle_seq=4)
+        self.history_jobs.append(second)
+        self.history_listing.append(
+            make_generation_listing(
+                generation_id=61,
+                seq=3,
+                job_id=41,
+                carrier_job_id=41,
+                stream_revisions={"bgp": 4},
+                source_push_seq={"bgp": 1000},
+            )
+        )
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        issue = NSOSettlementIssue.objects.get(state="open")
+        self.assertEqual((issue.job_id, issue.position), (41, "historical"))
+        response = client.post(self.action_url(), self.form(issue, reason="placeholder later carrier"), follow=True)
+        self.assertContains(response, "Acknowledged adapter job 41 as outcome unknown.")
+        # The follow-up pass of the acknowledgement is lost, so only the resume request can recover it.
+        self.queue.empty()
+        go.set()
+        self.join(clearing)
+        self.assertNotIn("error", cleared)
+        self.assertTrue(cleared["result"].drained)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_cursor_seq, 5)
+        self.assertTrue(self.management.settle_resume_pending)
+        self.assertEqual(sweep_static_route_settlements(), (1, 0))
+        self.management.refresh_from_db()
+        self.assertFalse(self.management.settle_resume_pending)
+        self.assertFalse(NSOSettlementIssue.objects.filter(state="open").exists())
