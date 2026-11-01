@@ -246,6 +246,87 @@ class TestGatedReconcileBehavior(_L2Base):
         self.assertEqual(ctx["_gate"]["l2_service"], "skipped_stale_attempt")
 
 
+_NON_CANONICAL_INCARNATIONS = (
+    _INC[0].upper(),
+    "{" + _INC[0] + "}",
+    "urn:uuid:" + _INC[0],
+    _INC[0].replace("-", ""),
+)
+
+
+class TestIncarnationSpelling(_L2Base):
+    """#1856: the read path accepts only a canonical store incarnation and fails closed otherwise."""
+
+    def _http_reconcile(self, doc):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        from ._adapter_http import make_session
+
+        cfg = {"url": "http://adapter.test", "token": "t", "timeout": 30, "verify_tls": True, "ca_cert_path": ""}
+        with (
+            patch.object(adapter_client, "_resolve_config", return_value=cfg),
+            patch.object(adapter_client, "_get_session", return_value=make_session(json_data=doc)),
+        ):
+            return reconcile_category(self.device, self.mgmt, "l2_services")
+
+    def _http_observe(self, families):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.views import _observe_live_read_state
+
+        from ._adapter_http import make_session
+
+        doc = {"device_id": self.mgmt.adapter_device_id, "families_version": 1, "families": families}
+        cfg = {"url": "http://adapter.test", "token": "t", "timeout": 30, "verify_tls": True, "ca_cert_path": ""}
+        with (
+            patch.object(adapter_client, "_resolve_config", return_value=cfg),
+            patch.object(adapter_client, "_get_session", return_value=make_session(json_data=doc)),
+        ):
+            _observe_live_read_state(self.device, self.mgmt)
+
+    def _markers(self):
+        self.mgmt.refresh_from_db()
+        return (self.mgmt.reset_pending_incarnation, self.mgmt.reset_pending_born, self.mgmt.reset_conflict_born)
+
+    def test_canonical_incarnation_is_adopted_through_http(self):
+        ctx = self._http_reconcile(_l2_payload(("TL",), read_state=_rs()))
+        self.assertEqual(ctx["_gate"]["l2_service"], "ran")
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_incarnation, _INC[0])
+        self.assertEqual(_sap_names(self.mgmt), ["TL"])
+
+    def test_non_canonical_incarnation_is_never_adopted(self):
+        for spelling in _NON_CANONICAL_INCARNATIONS:
+            with self.subTest(spelling=spelling):
+                ctx = self._http_reconcile(_l2_payload(("TL",), read_state={**_rs(), "incarnation": spelling}))
+                self.assertEqual(ctx["_gate"]["l2_service"], "skipped_unavailable")
+                self.mgmt.refresh_from_db()
+                self.assertEqual(self.mgmt.adapter_incarnation, "")
+                self.assertEqual(_sap_names(self.mgmt), [])
+
+    def test_non_canonical_spelling_of_the_adopted_incarnation_fails_closed(self):
+        self._prime()
+        for attempt_id, spelling in enumerate(_NON_CANONICAL_INCARNATIONS, start=2):
+            with self.subTest(spelling=spelling):
+                read_state = {**_rs(attempt_id=attempt_id), "incarnation": spelling}
+                ctx = self._http_reconcile(_l2_payload(("NEW",), read_state=read_state))
+                self.assertEqual(ctx["_gate"]["l2_service"], "skipped_unavailable")
+                self.assertEqual(_sap_names(self.mgmt), ["TL"])
+                self.assertEqual(self._markers(), ("", None, None))
+
+    def test_aggregate_read_state_ignores_a_non_canonical_incarnation(self):
+        self._prime()
+        newer_born = "2026-07-03T00:00:00Z"
+        for spelling in (*_NON_CANONICAL_INCARNATIONS, "66666666-eeee-4eee-8eee-666666666666".upper()):
+            for born in (_INC[1], newer_born):
+                with self.subTest(spelling=spelling, born=born):
+                    read_state = {**_rs(attempt_id=9), "incarnation": spelling, "incarnation_born": born}
+                    with self.assertNoLogs("netbox_nso_plugin.views", level="ERROR"):
+                        self._http_observe({"l2_service": read_state})
+                    self.assertEqual(self._markers(), ("", None, None))
+                    self.assertEqual(self.mgmt.adapter_incarnation, _INC[0])
+
+
 class TestIsisCompoundGate(TestCase):
     """R3-6: ONE isis document → ONE gate decision → both bodies (or neither)."""
 

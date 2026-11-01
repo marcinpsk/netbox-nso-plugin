@@ -529,7 +529,8 @@ class TestRefusalCallbackEndToEnd(BGPSettlementHelpers, BGPCaptureCase, LiveServ
                 from ._adapter_http import make_response
 
                 body = response.json()
-                body["head"]["apply_attempt_id"] = str(self.attempt.pk)
+                body["head"]["projection"]["apply_attempt_id"] = str(self.attempt.pk)
+                body["head"]["identity"]["apply_attempt_id"] = str(self.attempt.pk)
                 body["attempts"] = (
                     [
                         {
@@ -543,7 +544,10 @@ class TestRefusalCallbackEndToEnd(BGPSettlementHelpers, BGPCaptureCase, LiveServ
                     if str(self.attempt.pk) in kwargs["json"]["apply_attempt_ids"]
                     else []
                 )
-                return make_response(200, body)
+                from ._settlement_wire import deployment_wire
+
+                plain = {**body, "head": body["head"]["projection"]}
+                return make_response(200, deployment_wire(plain))
             return response
 
         self.adapter._handle = manual_evidence

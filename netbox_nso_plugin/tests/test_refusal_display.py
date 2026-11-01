@@ -16,6 +16,7 @@ from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import without_commit_drain
 from ._ownership_case import acquire_overlay
 from ._refusal_display import RefusalDisplayHelpers
+from ._settlement_wire import job_wire
 from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
 
@@ -499,7 +500,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.prepare()
         generation = self.terminal()
         projection = document_projection(generation["carrier_job_result"])
-        self.assertIn("nothing committed", projection["summary"])
+        self.assertIn("commit not attempted", projection["summary"])
         for phase, acknowledged in (
             ("pre_commit_dry_run", True),
             ("post_commit_verification", False),
@@ -883,6 +884,13 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         generation = self.terminal()
         canary = "placeholder-forged-secret-canary"
         job = {
+            "device_id": self.management.adapter_device_id,
+            "settle_seq": 1,
+            "context": None,
+            "created_at": self.stamp.isoformat(),
+            "updated_at": self.stamp.isoformat(),
+            "started_at": None,
+            "heartbeat_at": None,
             "id": 501,
             "type": "apply",
             "status": "failed",
@@ -895,14 +903,14 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
 
         def handle(method, url, **kwargs):
             if method == "GET" and url.endswith("/jobs"):
-                return make_response(200, [job])
+                return make_response(200, [job_wire(job)])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
         response = self.client.get(reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=(self.device.pk,)))
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(canary, response.content.decode())
-        self.assertIn("nothing committed", response.json()["jobs"][0]["refusal_summary"])
+        self.assertIn("commit not attempted", response.json()["jobs"][0]["refusal_summary"])
 
     def test_all_category_grids_project_safe_refusal(self):
         from netbox_routing.models import ISISInstance, OSPFInstance
@@ -1101,7 +1109,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         execution = settle_terminal_generation(
-            self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=2
+            self.management, generation, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
         )
         self.assertEqual(execution.consumption_state, "consumed")
         row.refresh_from_db()
@@ -1139,7 +1147,9 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.settle(generation)
         retry = self.terminal(refused=2)
         retry["carrier_job_id"] = 502
-        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        settle_terminal_generation(
+            self.management, retry, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
+        )
         row = self.owners[1]
         row.refresh_from_db()
         mirror_update(row, last_apply_error="placeholder-forged-secret-canary")
@@ -1160,7 +1170,9 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.settle(generation)
         retry = self.terminal(refused=2)
         retry["carrier_job_id"] = 502
-        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        settle_terminal_generation(
+            self.management, retry, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
+        )
         row = self.owners[1]
         mirror_update(row, last_apply_error="placeholder ordinary failure")
         (row,) = project_rows([type(row).objects.get(pk=row.pk)])
@@ -1198,7 +1210,9 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.settle(self.terminal())
         retry = self.terminal(refused=2)
         retry["carrier_job_id"] = 502
-        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        settle_terminal_generation(
+            self.management, retry, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
+        )
         refused, other = self.owners[1], self.owners[2]
         snapshot = NSOApplyOverlaySnapshot.objects.get(
             attempt=self.attempt, overlay_pk=refused.pk, settlement_disposition="refused"

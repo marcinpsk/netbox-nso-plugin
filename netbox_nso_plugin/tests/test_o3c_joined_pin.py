@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "882ef5fd9adfcea5ed5d3afa9b229f65bf153035993d0a48cc1b07d48332abce"
+_ADAPTER_RUNTIME_DIGEST = "bda1111e539c280eaa19fddc1a7b759a562bf286fcf79db139d08e3dd98346b0"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -138,6 +138,7 @@ class _RestconfState:
         self.nso_devices: set[str] = set()
         self.plugin_callbacks: list[tuple[str, dict]] = []
         self.unavailable_reads: set[str] = set()
+        self.refused_svi_devices: set[str] = set()
 
     @staticmethod
     def key(entry: dict) -> tuple[str, str, str]:
@@ -306,6 +307,26 @@ class _RestconfHandler(BaseHTTPRequestHandler):
             return
         query = parse_qs(parsed.query, keep_blank_values=True)
         dry_run = "dry-run" in query
+        if not dry_run and device_name in self.state.refused_svi_devices:
+            from netbox_nso_plugin.refusal_protocol import refusal, render_refusals, row_ref
+
+            name = entries[0]["svi"]["interface"][0]["interface-name"]
+            record = refusal("svi", row_ref("svi", "svi.interface", (("interface", (name,)),)), "parent-absent")
+            self._send_json(
+                500,
+                {
+                    "ietf-restconf:errors": {
+                        "error": [
+                            {
+                                "error-type": "application",
+                                "error-tag": "operation-failed",
+                                "error-message": render_refusals((record,)),
+                            }
+                        ]
+                    }
+                },
+            )
+            return
         self.state.write(
             device_name,
             entries[0],
@@ -690,6 +711,7 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         self.addCleanup(adapter_client.reset_session)
         self.addCleanup(self.environment.restconf.allow_removal.set)
         self.addCleanup(self.environment.restconf.unavailable_reads.clear)
+        self.addCleanup(self.environment.restconf.refused_svi_devices.clear)
 
     def _link(self, device, instance, name: str):
         from netbox_nso_plugin import adapter_client
@@ -745,6 +767,32 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         parsed = urlparse(request["url"])
         assert parsed.path == f"/api/v1/devices/{management.adapter_device_id}/generations"
         assert parse_qs(parsed.query) == {"limit": ["500"]}
+
+    def test_pinned_adapter_serves_the_settlement_observation_reader(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSOInstance
+
+        instance = NSOInstance.objects.create(name="o3c-pin", adapter_instance_id="o3c-pin")
+        management = self._link(make_device("observation-pin"), instance, "observation-pin")
+        unknown = uuid4()
+        _AdapterWireSession.reset(self.environment.adapter_port)
+
+        observation = adapter_client.get_settlement_observation(
+            management.adapter_device_id, job_id=2**31 - 1, after_settle_seq=0, apply_attempt_ids=[unknown, unknown]
+        )
+
+        assert observation["job"] is None
+        assert observation["absent"]["job_id"] == 2**31 - 1
+        assert observation["absent"]["apply_attempt_ids"] == [str(unknown)]
+        assert observation["device"]["device_id"] == management.adapter_device_id
+        assert observation["deployment"]["unknown_apply_attempt_ids"] == [str(unknown)]
+        [request] = _AdapterWireSession.snapshot()
+        assert urlparse(request["url"]).path == (
+            f"/api/v1/devices/{management.adapter_device_id}/settlement-observation"
+        )
+        assert request["body"] == {"job_id": 2**31 - 1, "after_settle_seq": 0, "apply_attempt_ids": [str(unknown)]}
 
     def test_a_plugin_onboard_completes_through_the_pinned_provision_attempt_contract(self):
         from uuid import uuid4
@@ -987,6 +1035,80 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
             route["next-hop"] for route in self.environment.restconf.device_section(retained.nso_device_name)["route"]
         ] == ["198.18.3.2"]
         assert NSODeviceManagement.objects.get(pk=removed.pk).adapter_device_id == removed.adapter_device_id
+
+    def test_foreign_stream_commit_refusal_survives_settlement_and_display(self):
+        from dcim.models import Interface
+        from django.utils import timezone
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin import adapter_client, drain
+        from netbox_nso_plugin.models import (
+            NSOApplyExecution,
+            NSOInstance,
+            NSOStaticRouteState,
+            NSOSVIState,
+            NSOVLANState,
+        )
+        from netbox_nso_plugin.refusal_display import device_execution_summaries
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        from ._ownership_case import acquire_overlay
+
+        name = "o3c-foreign-refusal"
+        instance = NSOInstance.objects.create(name="o3c-pin", adapter_instance_id="o3c-pin")
+        device = make_device(name, index=6)
+        management = self._link(device, instance, name)
+        self.environment.restconf.refused_svi_devices.add(name)
+        with without_commit_drain(), transaction.atomic():
+            vlan = VLAN.objects.create(group=_device_vlan_group(device), vid=71, name="placeholder-foreign")
+            NSOVLANState.objects.create(management=management, vlan=vlan, status="imported")
+            interface = Interface.objects.create(device=device, name="Vlan71", type="virtual")
+            acquire_overlay(
+                NSOSVIState,
+                management=management,
+                interface=interface,
+                vlan=vlan,
+                status="accepted",
+                accepted_at=timezone.now(),
+            )
+        self._enable_auto_apply(management)
+        assert drain.drain_key(device.pk, "svi", chain=0) == drain.SUCCEEDED
+        first = _wait_until(
+            lambda: self._terminal_job(management.adapter_device_id, "apply"),
+            "the initial SVI refusal did not finish",
+        )
+        assert first["status"] == "failed", first
+        assert not consume_static_route_settlements(management).stalled
+        generation_id = self._blocked_generation_id(management, first["id"])
+        adapter_client.abandon_generation(management.adapter_device_id, generation_id)
+
+        route = own_route(management, "198.18.6.0/28", "198.18.6.1")
+        assert drain.drain_key(device.pk, "static_route", chain=0) == drain.SUCCEEDED
+        failed = _wait_until(
+            lambda: self._terminal_job(management.adapter_device_id, "apply", after_id=first["id"]),
+            "the foreign-stream refusal did not finish",
+        )
+        assert failed["status"] == "failed", failed
+        result = failed["result"]
+        assert result["row_outcomes"]
+        assert {row["stream"] for row in result["row_outcomes"]} == {"static_route"}
+        assert {row["disposition"] for row in result["row_outcomes"]} == {"not_applied"}
+        [cause] = result["refusals"]
+        assert (cause["family"], cause["message_id"], cause["sender_phase"]) == ("svi", "parent-absent", "commit")
+        assert {row["stream"] for row in cause["logical_rows"]} == {"svi"}
+        consumed = consume_static_route_settlements(management)
+        assert not consumed.stalled, consumed
+        management.refresh_from_db()
+        assert management.settle_cursor_seq >= failed["settle_seq"]
+        execution = NSOApplyExecution.objects.get(management=management, carrier_job_id=failed["id"])
+        assert execution.terminal_projection["carrier_job_result"]["refusals"] == [cause]
+        state = NSOStaticRouteState.objects.get(management=management, static_route=route)
+        assert state.status != "deploying"
+        summaries = device_execution_summaries(management)
+        expected = f"Blocked by svi svi.interface {cause['row']['key']} (not part of this Apply): {cause['message']}"
+        assert any(expected in summary["summary"] for summary in summaries), summaries
+        assert any("nothing committed" in summary["summary"] for summary in summaries), summaries
 
     def _settle_unprepared_failure(self, name: str, index: int):
         """Fail a real apply before preparation, then consume it through the unchanged settlement."""

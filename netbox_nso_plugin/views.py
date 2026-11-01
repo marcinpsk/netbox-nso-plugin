@@ -223,6 +223,7 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
         connection / last-sync banner and is the only adapter touch here.
         """
         from .adapter_client import AdapterError
+        from .refusal_display import settlement_stall_projection
         from .summary import category_summaries, execution_summaries
         from .template_content import _STATUS_BADGE
 
@@ -306,6 +307,7 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
             "execution_summaries": execution_summaries(mgmt),
+            "settlement_stall": settlement_stall_projection(mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
@@ -4061,7 +4063,12 @@ class NSODeviceJobsView(AuthorizedView):
             generations = (
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
+            # Rows after a truncation are unread and can be requested ones, so the filter must not drop the marker.
+            for row in generations:
+                if isinstance(row, client.ListingTruncation):
+                    client.raise_item_error(row)
             generations = [row for row in generations if row.get("generation_id") in generation_ids]
+            client.raise_evidence_errors(generations)
             generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
             unlisted = _unlisted_device_jobs(mgmt.adapter_device_id, jobs, polled_job_ids | generation_job_ids)
         except AdapterError as exc:

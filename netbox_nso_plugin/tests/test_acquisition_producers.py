@@ -111,6 +111,7 @@ CONTINUATIONS = {
         "Clones frozen bookkeeping for a proven deleted owner without acquiring ownership.",
     ),
     ("renderer_audit.py", "_repair_plan"): (3, "Repairs rows selected from owned statuses."),
+    ("settlement_issue.py", "_authority"): (1, "Captures the owner status as decision input; it writes nothing."),
     ("vlan_reconciler.py", "save_vlan_content"): (1, "Repends only owned attachments after a native edit."),
 }
 

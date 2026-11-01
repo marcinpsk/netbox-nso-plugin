@@ -9,14 +9,15 @@ from . import adapter_client
 from .deployment_probe import _require, authority
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution, NSODeviceManagement
 
+PLUGIN_MIGRATION_HEAD = "0040_snapshot_owner_epoch_index"
+
 
 def check_contracts():
     """Require the installed plugin migration leaf with no pending migrations."""
     executor = MigrationExecutor(connection)
     _require(not executor.migration_plan(executor.loader.graph.leaf_nodes()), "Database migration heads are pending")
     _require(
-        executor.loader.graph.leaf_nodes("netbox_nso_plugin")
-        == [("netbox_nso_plugin", "0037_delete_stale_observations")],
+        executor.loader.graph.leaf_nodes("netbox_nso_plugin") == [("netbox_nso_plugin", PLUGIN_MIGRATION_HEAD)],
         "Unexpected plugin migration head",
     )
 
@@ -88,6 +89,7 @@ def check_active_streams():
     from .intent_drift import _delivery_key, _scopes
     from .models import NSOIntentRevision
     from .selection_manifest import frozen_manifest
+    from .settlement_resolution import acknowledged_obligations
 
     _require(
         not NSOApplyAttempt.objects.filter(lifecycle="open", trigger_kind="manual").exists()
@@ -179,7 +181,20 @@ def check_active_streams():
                 ),
                 "An adapter receipt has no captured local selection",
             )
-        generations = adapter_client.list_device_generations(management.adapter_device_id)
+        acknowledged = acknowledged_obligations(management, incarnation)
+
+        def released(row):
+            return (
+                row is not None
+                and not isinstance(row, adapter_client.ListingTruncation)
+                and (row["generation_id"], row["carrier_job_id"]) in acknowledged
+            )
+
+        # Resolved without a certificate: no success or provenance claim exists for it.
+        generations = [
+            row for row in adapter_client.list_device_generations(management.adapter_device_id) if not released(row)
+        ]
+        adapter_client.raise_evidence_errors(generations)
         terminal = [generation for generation in generations if terminal_carrier_requires_certificate(generation)]
         certificates = generation_certificate_candidates(management, incarnation, terminal)
         for generation in generations:
@@ -215,6 +230,9 @@ def check_active_streams():
                 "Adapter redistribution membership has no exact prepared ownership",
             )
         evidence = adapter_client.get_deployment_evidence(management.adapter_device_id, [])
+        if released(evidence["head"]):
+            evidence = {**evidence, "head": None}
+        adapter_client.raise_evidence_errors(evidence)
         _require(
             not evidence["held_jobs"] and not evidence["write_work_pending"] and evidence["pending_generations"] == 0,
             "Adapter work is still in flight",

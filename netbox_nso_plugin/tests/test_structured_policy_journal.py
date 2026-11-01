@@ -31,7 +31,7 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
             state.status = "accepted"
             save_overlay_fixture(state, update_fields=("status",))
 
-    def execution(self, *, disposition="in_sync", job_id=23, store="placeholder-policy-store"):
+    def execution(self, *, disposition="in_sync", job_id=23, store="00000000-0000-4000-8000-000000000005"):
         management = self._make_mgmt()
         self._owned_reconcile()
         row = NSORoutePolicyState.objects.get(management=management, family="community_list")
@@ -192,7 +192,8 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
 
         # A store rebuild: the feed cursor moved to the new store, the read gate still holds the old one.
         NSODeviceManagement.objects.filter(pk=self._make_mgmt().pk).update(
-            settle_cursor_incarnation="placeholder-policy-store", adapter_incarnation="placeholder-old-store"
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000005",
+            adapter_incarnation="00000000-0000-4000-8000-000000000006",
         )
         management, row, execution, job = self.execution()
         _journal_route_policy_apply(management, job)
@@ -409,7 +410,9 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
         from netbox_nso_plugin.reconcile import _journal_route_policy_apply
 
         management, row, prior, result, generation, cause = self.policy_terminal()
-        execution = settle_terminal_generation(management, generation, "placeholder-policy-store", settle_seq=1)
+        execution = settle_terminal_generation(
+            management, generation, "00000000-0000-4000-8000-000000000005", settle_seq=1
+        )
         assert execution.consumption_state == "consumed"
         row.refresh_from_db()
         assert row.status == "apply_failed"
@@ -419,7 +422,12 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
             assert (sibling.status, sibling.last_apply_at, sibling.last_apply_error, sibling.apply_attempt_id) == prior[
                 sibling.pk
             ]
-        job = {"id": 23, "generation_id": 17, "store_incarnation": "placeholder-policy-store", "result": result}
+        job = {
+            "id": 23,
+            "generation_id": 17,
+            "store_incarnation": "00000000-0000-4000-8000-000000000005",
+            "result": result,
+        }
         _journal_route_policy_apply(management, job)
         assert JournalEntry.objects.count() == 2
         object_entry = JournalEntry.objects.get(assigned_object_type=row.content_type, assigned_object_id=row.object_id)
@@ -439,7 +447,7 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
         )
         generation["refusals"][0]["row"].update(subject=missing.subject, key=missing.key)
         with self.assertRaises(EvidenceInvariantError):
-            settle_terminal_generation(management, generation, "placeholder-policy-store", settle_seq=1)
+            settle_terminal_generation(management, generation, "00000000-0000-4000-8000-000000000005", settle_seq=1)
         for owner in NSORoutePolicyState.objects.filter(management=management):
             assert (owner.status, owner.last_apply_at, owner.last_apply_error, owner.apply_attempt_id) == prior[
                 owner.pk
