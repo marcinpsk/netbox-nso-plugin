@@ -258,6 +258,43 @@ class TestCommittedSettlementPrefix(CarrierPageHelpers, CoalescedCarrierHelpers,
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
 
+    def test_a_truncated_listing_stalls_before_an_earlier_carrier_commits(self):
+        generations = self.prepare_carrier()
+        self.serve_carriers(generations)
+        original = self.adapter._handle
+        device_id = self.management.adapter_device_id
+
+        def truncate_after_the_carrier(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            body = response.json()
+            if method == "GET" and url.endswith("/jobs"):
+                body = [item for item in body if item["identity"]["id"] == 501]
+            elif method == "GET" and url.endswith("/generations"):
+                seq = max(item["identity"]["seq"] for item in body) + 1
+                sibling = make_generation_envelope(
+                    {**body[0]["projection"], "generation_id": 83, "seq": seq, "carrier_job_id": 502, "job_id": 502},
+                    device_id=device_id,
+                )
+                body.extend([sibling, sibling])
+            return make_response(response.status_code, body)
+
+        self.adapter._handle = truncate_after_the_carrier
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertEqual(result.consumed, 0)
+        self.assertIsNone(result.cursor)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        issue = settlement_stall_projection(self.management)
+        self.assertEqual(issue["job_id"], 502)
+        self.assertEqual(issue["identity"]["generation_id"], 83)
+        self.assertEqual(issue["identity"]["carrier_job_id"], 502)
+        self.assertFalse(NSOApplyExecution.objects.filter(consumption_state="consumed").exists())
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "deploying")
+
     def test_a_diagnostic_write_failure_cannot_roll_back_the_committed_carrier(self):
         generations = self.prepare_carrier()
         self.serve_carriers(generations)
