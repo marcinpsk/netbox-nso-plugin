@@ -156,6 +156,30 @@ describe("static route grid", () => {
     expect(badgeClass).not.toContain("text-bg-danger");
   });
 
+  it("labels an acknowledged unknown outcome with its state label, not as unproven", () => {
+    const advisory =
+      "Outcome unknown for adapter job 501. Settlement evidence was acknowledged. This does not certify deployment.";
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "apply_failed",
+      label: "outcome unknown",
+      error: null,
+      advisory,
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+
+    expect(result.querySelector(".badge").textContent).toBe("outcome unknown");
+    expect(result.querySelector(".badge").className).toContain("text-bg-danger");
+    expect(result.textContent).not.toContain("unproven");
+    expect(result.querySelector(".text-warning-emphasis").textContent).toBe(advisory);
+  });
+
   it("labels a restored prior error as history without a failed badge", () => {
     const row = {
       vrf: "global",

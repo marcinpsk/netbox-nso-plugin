@@ -1,0 +1,81 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba #}
+{# The paused-settlement banner: the fenced diagnostic, then its exit or the reason it has none. #}
+<div class="alert alert-warning d-flex align-items-start" role="alert" id="nso-settlement-stall">
+  <span class="mdi mdi-pause-circle-outline me-2 mt-1"></span>
+  <div class="flex-grow-1">
+    <div>
+      {% if settlement_stall.job_id %}
+        <strong>Settlement is paused.</strong>
+        Adapter job {{ settlement_stall.job_id }}{% if settlement_stall.settle_seq %}, settle_seq {{ settlement_stall.settle_seq }}{% endif %}:
+        {{ settlement_stall.reason }}.
+      {% else %}
+        <strong>Settlement is paused: {{ settlement_stall.reason }}.</strong>
+      {% endif %}
+      Later executions remain unsettled until this evidence validates{% if settlement_exit.issue %} or an operator acknowledges it{% endif %}.
+    </div>
+    {% if settlement_exit.stall_class or settlement_exit.code %}
+      <div class="small mt-1">
+        {% if settlement_exit.stall_class %}<span class="me-3">Stall class: {{ settlement_exit.stall_class }}.</span>{% endif %}
+        {% if settlement_exit.code %}<span>Closed reason: <code>{{ settlement_exit.code }}</code></span>{% endif %}
+      </div>
+    {% endif %}
+    {% with issue=settlement_exit.issue %}
+      {% if issue %}
+        <hr class="my-2">
+        <div>
+          {% if issue.historical %}
+            The cursor is already past the carrier of this job. The cursor does not move.
+          {% else %}
+            An acknowledgement moves the cursor from {{ issue.cursor_before }} to {{ issue.cursor_after }}, past this job only.
+          {% endif %}
+        </div>
+        <div>
+          Affected generations: {{ issue.generation_ids|length }} ({{ issue.generation_ids|join:", " }}).
+          Affected rows: {{ issue.counts.unavailable }} outcome unknown, {{ issue.counts.superseded }} kept with a newer state, {{ issue.counts.missing_owner }} missing.
+        </div>
+        {% if issue.rows %}
+          <details class="mt-1">
+            <summary>Show the {{ issue.rows|length }} affected rows</summary>
+            <div class="table-responsive mt-1">
+              <table class="table table-sm mb-0">
+                <thead><tr><th>Row</th><th>Effect</th><th>Unknown contributions</th></tr></thead>
+                <tbody>
+                  {% for row in issue.rows %}
+                    <tr data-owner="{{ row.key }}">
+                      <td>{{ row.name }}</td>
+                      <td class="text-nowrap"><span class="badge {{ row.badge }}">{{ row.effect }}</span></td>
+                      <td class="text-nowrap">{{ row.unknown }} of {{ row.contributors }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        {% endif %}
+        <div class="mt-2">
+          <span class="mdi mdi-alert-outline me-1"></span><strong>The device may have changed.</strong>
+          The acknowledgement records the affected rows as outcome unknown. It does not certify deployment and it does not change the device.
+        </div>
+        {% if can_acknowledge_settlement %}
+          <form method="post" class="mt-2" action="{% url 'plugins:netbox_nso_plugin:settlement_issue_acknowledge' object.pk %}">
+            {% csrf_token %}
+            <input type="hidden" name="issue" value="{{ issue.pk }}">
+            <input type="hidden" name="revision_digest" value="{{ issue.revision_digest }}">
+            <label class="form-label small mb-1" for="nso-settlement-reason">Reason (required)</label>
+            <div class="d-flex flex-wrap gap-2 align-items-start">
+              <textarea id="nso-settlement-reason" name="reason" class="form-control form-control-sm nso-settlement-reason" rows="2" maxlength="{{ settlement_exit.max_reason }}" required></textarea>
+              <button type="submit" class="btn btn-sm btn-warning">
+                <span class="mdi mdi-check-decagram-outline"></span> Acknowledge outcome unknown
+              </button>
+            </div>
+          </form>
+        {% else %}
+          <div class="small mt-2">Acknowledging needs the change and acknowledge_settlement_issue permissions on this device.</div>
+        {% endif %}
+      {% else %}
+        <div class="mt-2">{{ settlement_exit.text }} No acknowledgement is available for this stall.</div>
+      {% endif %}
+    {% endwith %}
+  </div>
+</div>

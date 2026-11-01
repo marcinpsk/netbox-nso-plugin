@@ -265,6 +265,11 @@ urlpatterns = [
         views.NSOGenerationAbandonView.as_view(),
         name="generation_abandon",
     ),
+    path(
+        "devices/<int:pk>/actions/acknowledge-settlement-issue/",
+        views.NSOSettlementIssueAcknowledgeView.as_view(),
+        name="settlement_issue_acknowledge",
+    ),
     # Interface State CRUD (read-only list + detail; delete allowed for cleanup)
     path("interface-state/", views.NSOInterfaceStateListView.as_view(), name="nsointerfacestate_list"),
     path(

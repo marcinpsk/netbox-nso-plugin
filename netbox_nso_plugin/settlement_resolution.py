@@ -116,7 +116,6 @@ def unknown_contributions(row, fence):
 
     if fence is None:
         return []
-    pending = []
     owners = NSOSettlementIssueOwner.objects.filter(
         issue__management_id=fence.management_id,
         issue__mapping_epoch=fence.mapping_epoch,
@@ -125,7 +124,12 @@ def unknown_contributions(row, fence):
         overlay_pk=row.pk,
         committed_effect=UNKNOWN_EFFECT,
     ).select_related("issue")
-    for owner in owners.order_by("pk"):
+    return _binding_unknowns(row, fence, owners.order_by("pk"))
+
+
+def _binding_unknowns(row, fence, owners):
+    pending = []
+    for owner in owners:
         # A new acceptance fences the old advisory into history.
         if (
             owner.authority.get("accepted_at") != instant(getattr(row, "accepted_at", None))
@@ -136,6 +140,46 @@ def unknown_contributions(row, fence):
         if remaining:
             pending.append((owner, remaining))
     return pending
+
+
+def acknowledged_unknown_jobs(rows) -> dict:
+    """Map each owner key to the acknowledged jobs whose unknown contributions still bind the row."""
+    from .durable_capture import mapping_epoch
+    from .models import NSOOverlaySettlementFence, NSOSettlementIssueOwner
+
+    keyed = {(row._meta.label_lower, row.pk): row for row in rows}
+    jobs = dict.fromkeys(keyed, ())
+    if not keyed:
+        return jobs
+    labels, pks = {label for label, _pk in keyed}, {pk for _label, pk in keyed}
+    owners = {}
+    for owner in (
+        NSOSettlementIssueOwner.objects.filter(
+            issue__state=ACKNOWLEDGED, committed_effect=UNKNOWN_EFFECT, model_label__in=labels, overlay_pk__in=pks
+        )
+        .select_related("issue")
+        .order_by("pk")
+    ):
+        owners.setdefault((owner.model_label, owner.overlay_pk), []).append(owner)
+    if not owners.keys() & keyed.keys():
+        return jobs
+    fences = NSOOverlaySettlementFence.objects.filter(
+        model_label__in={label for label, _pk in owners}, overlay_pk__in={pk for _label, pk in owners}
+    ).select_related("management")
+    for fence in fences:
+        key = (fence.model_label, fence.overlay_pk)
+        # Only the current mapping epoch binds, as in the success guard.
+        if key not in keyed or key not in owners or fence.mapping_epoch != mapping_epoch(fence.management):
+            continue
+        candidates = [
+            owner
+            for owner in owners[key]
+            if owner.issue.management_id == fence.management_id and owner.issue.mapping_epoch == fence.mapping_epoch
+        ]
+        jobs[key] = tuple(
+            sorted({owner.issue.job_id for owner, _rest in _binding_unknowns(keyed[key], fence, candidates)})
+        )
+    return jobs
 
 
 def cover_unknown_contributions(row, fence, execution, outcomes):
