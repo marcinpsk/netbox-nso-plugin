@@ -7,6 +7,93 @@ from netbox_nso_plugin.models import NSOApplyExecution
 from . import test_durable_bgp_capture as bgp_case
 from ._bgp_settlement import BGPSettlementHelpers
 from ._settlement_wire import generation_wire, job_wire
+from .test_carrier_isolation import CarrierIsolationHelpers
+from .test_coalesced_settlement import CoalescedCarrierHelpers
+
+
+class TestCarrierReceiptIsolation(
+    CarrierIsolationHelpers, CoalescedCarrierHelpers, BGPSettlementHelpers, bgp_case.BGPCaptureCase
+):
+    def test_invalid_receipt_records_only_the_current_carrier(self):
+        from netbox_nso_plugin.models import NSOAcceptedSelection, NSOApplyAttempt
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_response
+
+        first, sibling = self.prepare_carrier()
+        sibling["carrier_job_id"] = 502
+        for generation in (first, sibling):
+            result = generation["carrier_job_result"]
+            counters = {key for section in generation["sections"] for key in SECTION_COUNTER_KEYS[section]}
+            result = {
+                key: value for key, value in result.items() if not key.endswith("count_by_outcome") or key in counters
+            }
+            for key in ("row_outcomes", "settlement_owners"):
+                result[key] = [row for row in result[key] if row["generation_id"] == generation["generation_id"]]
+            generation.update(carrier_job_result=result, row_outcomes=result["row_outcomes"])
+        selection = self.attempt.overlay_snapshots.get(model_label=self.owners[0]._meta.label_lower).selection
+        NSOAcceptedSelection.objects.filter(pk=selection.pk).update(acknowledged_at=None)
+        self.serve_terminal_evidence(first, manual=True)
+        original = self.adapter._handle
+        jobs = [self.job(first, 1), self.job(sibling, 2)]
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs"):
+                after = int(kwargs["params"]["after_settle_seq"])
+                return make_response(200, [job_wire(job) for job in jobs if job["settle_seq"] > after])
+            if method == "GET" and url.endswith("/intent-receipts"):
+                return make_response(200, {"receipts": [], "global_max_push_seq": None, "global_max_route_id": None})
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                template = response.json()[0]["projection"]
+                return make_response(
+                    200,
+                    [
+                        generation_wire(
+                            {
+                                **template,
+                                **{key: generation[key] for key in template.keys() & generation.keys()},
+                                "job_id": generation["carrier_job_id"],
+                                "digest": link["digest"],
+                                "settlement_cohort": 9 + index,
+                            },
+                            self.management.adapter_device_id,
+                        )
+                        for index, (generation, link) in enumerate(
+                            zip((first, sibling), self.attempt.response["generations"], strict=True)
+                        )
+                    ],
+                )
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                document = response.json()
+                document["attempts"][0]["generations"] = [
+                    generation_wire(generation, self.management.adapter_device_id) for generation in (first, sibling)
+                ]
+                return make_response(200, document)
+            return response
+
+        self.adapter._handle = handle
+        cadence = set(NSOApplyAttempt.objects.filter(trigger_kind="cadence").values_list("pk", flat=True))
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertEqual(result.consumed, 0)
+        execution = NSOApplyExecution.objects.get(
+            generation_id=first["generation_id"], carrier_job_id=501, invariant_code="invalid_selection_receipt"
+        )
+        self.assertFalse(
+            NSOApplyExecution.objects.filter(generation_id=sibling["generation_id"], carrier_job_id=502)
+            .exclude(invariant_code="")
+            .exists()
+        )
+        self.assertEqual(
+            set(
+                NSOApplyAttempt.objects.filter(trigger_kind="cadence")
+                .exclude(pk__in=cadence)
+                .values_list("pk", flat=True)
+            ),
+            {execution.attempt_id},
+        )
 
 
 class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):

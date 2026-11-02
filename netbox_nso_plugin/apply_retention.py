@@ -153,13 +153,17 @@ class _RemoteGenerations:
 
 def _remote_generations(management_id):
     """Read one stable generation listing per device, without a row lock; None retains its history."""
-    device_id = NSODeviceManagement.objects.filter(pk=management_id).values_list("adapter_device_id", flat=True).first()
-    if device_id is None:
+    from .settlement_resolution import unreleased_generations
+
+    management = NSODeviceManagement.objects.filter(pk=management_id).first()
+    if management is None or management.adapter_device_id is None:
         return None
+    device_id = management.adapter_device_id
     try:
         _page, incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
         generations = adapter_client.list_device_generations(device_id)
-        adapter_client.raise_evidence_errors(generations)
+        unreleased, _released = unreleased_generations(management, incarnation, generations)
+        adapter_client.raise_evidence_errors(unreleased)
         _page, final_incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
     except adapter_client.AdapterError as exc:
         if exc.code in ADAPTER_DOWN_CODES:

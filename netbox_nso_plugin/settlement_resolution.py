@@ -74,6 +74,28 @@ def acknowledged_obligations(management, incarnation) -> frozenset[tuple[int, in
     )
 
 
+def unreleased_generations(management, incarnation, listing):
+    """Release acknowledged obligations while keeping listing truncation errors."""
+    from .adapter_client import ListingTruncation
+
+    acknowledged = acknowledged_obligations(management, incarnation)
+
+    def released(row):
+        return (
+            row is not None
+            and not isinstance(row, ListingTruncation)
+            and (row["generation_id"], row["carrier_job_id"]) in acknowledged
+        )
+
+    rows, identifiers = [], set()
+    for row in listing:
+        if released(row):
+            identifiers.add(row["generation_id"])
+        else:
+            rows.append(row)
+    return rows, frozenset(identifiers)
+
+
 def acknowledged_jobs(management, incarnation) -> frozenset[int]:
     """Return the feed jobs whose every obligation an acknowledged issue released."""
     from .models import NSOSettlementIssue

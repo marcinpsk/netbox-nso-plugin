@@ -3431,6 +3431,75 @@ def generation_listing_filter_keeps_truncation(adapter_client, acknowledged):
 
 def generation_listing_lookup_after_evidence_check(adapter_client, generation_id):
     listing = adapter_client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
     adapter_client.raise_evidence_errors(listing)
     # ok: nso-generation-listing-filter-drops-truncation
     return next(row for row in listing if row["generation_id"] == generation_id)
+
+
+def carrier_generation_bypass(bound):
+    # ruleid: nso-carrier-generations-bypass-helper
+    rows = (generation for attempt in bound["attempts"] for generation in attempt["generations"])
+    # ruleid: nso-carrier-generations-bypass-helper
+    filtered = [
+        generation
+        for attempt in bound["attempts"]
+        for generation in attempt["generations"]
+        if generation["carrier_job_id"] == bound.carrier_id
+    ]
+    # ruleid: nso-carrier-generations-bypass-helper
+    collected = [generation for attempt in bound["attempts"] for generation in attempt["generations"]]
+    # ruleid: nso-carrier-generations-bypass-helper
+    terminal = (
+        generation
+        for attempt in bound["attempts"]
+        for generation in attempt["generations"]
+        if generation["row_outcomes"] is not None
+    )
+    return rows, filtered, collected, terminal
+
+
+def _carrier_generations(bound):
+    # ok: nso-carrier-generations-bypass-helper
+    return [generation for attempt in bound["attempts"] for generation in attempt["generations"]]
+
+
+def carrier_generations_from_helper(bound):
+    # ok: nso-carrier-generations-bypass-helper
+    return [row for row in _carrier_generations(bound) if row["row_outcomes"] is not None]
+
+
+def unchecked_generation_listing(client):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(listing)
+
+
+def unchecked_generation_listing_imported(client):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    raise_evidence_errors(listing)
+
+
+def unchecked_generation_listing_direct(client):
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(client.list_device_generations(7))
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    raise_evidence_errors(client.list_device_generations(7))
+
+
+def released_generation_listing(client, management, incarnation):
+    listing = client.list_device_generations(7)
+    rows, released = unreleased_generations(management, incarnation, listing)
+    # ok: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(rows)
+
+
+def requested_generation_listing(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            client.raise_item_error(row)
+    listing = [row for row in listing if row["generation_id"] in wanted]
+    # ok: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(listing)

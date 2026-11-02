@@ -261,7 +261,7 @@ class BlockedRemovalTestBase(TestCase):
                 query["since_seq"] = since_seq
             if job_id is not None:
                 query["job_id"] = job_id
-            self.client.raise_request_exception = False
+            self.client.raise_request_exception = expected_status == 200
             response = self.client.get(url, query)
         self.generation_request_params = generation_request_params
         self.job_lookups = job_lookups

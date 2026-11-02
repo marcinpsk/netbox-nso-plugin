@@ -1146,16 +1146,22 @@ def validate_carrier_under_lock(management, evidence):
     _record_replay_answers(evidence.replay_answers)
 
 
-def _require_ordered_terminal_evidence(evidence, management, incarnation):
-    """Keep unsequenced remote terminal evidence from authorizing local effects."""
-    generations = list(evidence.automatic_generations)
+def _carrier_generations(bound):
+    """Return automatic and attempt generations for the bound carrier."""
+    carrier_id = getattr(bound, "carrier_id", None)
+    generations = list(bound.automatic_generations)
     generations.extend(
         generation
-        for attempt in evidence["attempts"]
+        for attempt in bound["attempts"]
         for generation in attempt["generations"]
-        if evidence.carrier_id is None or generation["carrier_job_id"] == evidence.carrier_id
+        if carrier_id is None or generation["carrier_job_id"] == carrier_id
     )
-    for generation in generations:
+    return generations
+
+
+def _require_ordered_terminal_evidence(evidence, management, incarnation):
+    """Keep unsequenced remote terminal evidence from authorizing local effects."""
+    for generation in _carrier_generations(evidence):
         if terminal_carrier_requires_certificate(generation) and not _positive_int(
             evidence.settlement_sequences.get(generation["carrier_job_id"])
         ):
@@ -1167,14 +1173,7 @@ def _restore_consumed_sequences(bound, management, incarnation):
     """Recover omitted carrier order from exact durable execution certificates."""
     from .outcome_settlement import immutable_execution_projection
 
-    generations = list(bound.automatic_generations)
-    generations.extend(
-        generation
-        for attempt in bound["attempts"]
-        for generation in attempt["generations"]
-        if (getattr(bound, "carrier_id", None) is None or generation["carrier_job_id"] == bound.carrier_id)
-        and generation["row_outcomes"] is not None
-    )
+    generations = [generation for generation in _carrier_generations(bound) if generation["row_outcomes"] is not None]
     by_identity = {}
     for generation in generations:
         identity = generation["generation_id"], generation["carrier_job_id"]
@@ -1216,9 +1215,7 @@ def _prepare_receipt_recoveries(management, bound, selections, document, incarna
     try:
         return prepare_recoveries(management, selections, document, incarnation)
     except EvidenceInvariantError:
-        generations = list(bound.automatic_generations)
-        generations.extend(generation for attempt in bound["attempts"] for generation in attempt["generations"])
-        for generation in generations:
+        for generation in _carrier_generations(bound):
             _record_invariant(management, generation, incarnation, None, "invalid_selection_receipt")
         raise
 
@@ -1517,14 +1514,7 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
     generations = _rows(generations)
     by_id = generations.last_by("generation_id")
     present = set()
-    evidence = list(bound.automatic_generations)
-    evidence.extend(
-        generation
-        for attempt in bound["attempts"]
-        for generation in attempt["generations"]
-        if (getattr(bound, "carrier_id", None) is None or generation["carrier_job_id"] == bound.carrier_id)
-        and generation["row_outcomes"] is not None
-    )
+    evidence = [generation for generation in _carrier_generations(bound) if generation["row_outcomes"] is not None]
     for row in evidence:
         job = _carrier_job(management.adapter_device_id, row["carrier_job_id"], bound.settlement_sequences)
         with identify_evidence_stall(job, incarnation):
