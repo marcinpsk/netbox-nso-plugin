@@ -12,6 +12,7 @@ from netbox_nso_plugin.models import NSOApplyExecution
 from netbox_nso_plugin.refusal_display import device_execution_summaries, document_projection
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._outbox_case import mirror_update
 from ._settlement_wire import job_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
@@ -76,6 +77,7 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
             consumption_state="consumed",
         )
         self.assertFalse(execution.overlay_snapshots.exists())
+        mirror_update(self.management, settle_cursor_incarnation=execution.store_incarnation)
         return result
 
     def test_ownerless_prior_cause_appears_on_device_tab(self):
@@ -91,6 +93,34 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.assertIn("commit not attempted", summaries[0]["summary"])
         response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
         self.assertContains(response, expected)
+
+    def test_ownerless_refusals_from_an_older_store_are_hidden_on_device_tab(self):
+        result = self.ownerless()
+        current = NSOApplyExecution.objects.get(management=self.management)
+        old_projection = copy.deepcopy(current.terminal_projection)
+        old_cause = old_projection["carrier_job_result"]["refusals"][0]
+        old_cause["row"]["key"] = "f" * 64
+        old_cause["logical_rows"][0]["row"]["key"] = "f" * 64
+        old = NSOApplyExecution.objects.create(
+            attempt=self.attempt,
+            management=self.management,
+            mapping_epoch=current.mapping_epoch,
+            adapter_device_id=current.adapter_device_id,
+            store_incarnation="00000000-0000-4000-8000-000000000003",
+            generation_id=current.generation_id,
+            generation_seq=current.generation_seq,
+            carrier_job_id=current.carrier_job_id,
+            terminal_projection=old_projection,
+            terminal_at=self.stamp,
+            consumed_at=self.stamp,
+            consumption_state="consumed",
+        )
+        self.assertFalse(old.overlay_snapshots.exists())
+
+        self.assertEqual(device_execution_summaries(self.management), [document_projection(result)])
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, document_projection(result)["summary"])
+        self.assertNotContains(response, "f" * 64)
 
     def test_ownerless_current_cause_uses_foreign_text(self):
         result = self.ownerless(provenance="current", phase="commit")

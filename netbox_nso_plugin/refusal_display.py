@@ -467,6 +467,7 @@ def device_execution_summaries(management):
         for execution in management.apply_executions.filter(
             mapping_epoch=mapping_epoch(management),
             adapter_device_id=management.adapter_device_id,
+            store_incarnation=management.settle_cursor_incarnation,
             overlay_snapshots__isnull=True,
             consumption_state="consumed",
         )
