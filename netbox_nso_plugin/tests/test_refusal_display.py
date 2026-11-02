@@ -509,7 +509,9 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
             result = copy.deepcopy(generation["carrier_job_result"])
             result["commit_acknowledged"] = acknowledged
             result["refusals"][0]["sender_phase"] = phase
-            self.assertNotIn("nothing committed", document_projection(result)["summary"])
+            summary = document_projection(result)["summary"]
+            self.assertNotIn("commit not attempted", summary)
+            self.assertNotIn("nothing committed", summary)
 
     def test_refusal_secret_canary_is_absent_from_ui_logs_and_errors(self):
         iface, row, generation = self.interface_execution()
@@ -1471,6 +1473,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         projection = document_projection(result)
         self.assertIn("unapplied", projection["summary"])
         self.assertIsNone(projection["refusal"])
+        self.assertNotIn("commit not attempted", projection["summary"])
         self.assertNotIn("nothing committed", projection["summary"])
 
 
