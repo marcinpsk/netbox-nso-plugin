@@ -39,6 +39,29 @@ rules:
     paths:
       exclude: ["netbox_nso_plugin/tests/**"]
 
+  - id: nso-deployment-evidence-head-release-bypass
+    languages: [python]
+    severity: ERROR
+    message: Pass deployment evidence through released_head_evidence before raising evidence errors.
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              $EVIDENCE = $CLIENT.get_deployment_evidence(...)
+              ...
+          - pattern-not-inside: |
+              $EVIDENCE = $CLIENT.get_deployment_evidence(...)
+              ...
+              $EVIDENCE = $VALUE
+              ...
+          - pattern-either:
+              - pattern: $C.raise_evidence_errors($EVIDENCE)
+              - pattern: raise_evidence_errors($EVIDENCE)
+      - pattern: $C.raise_evidence_errors($CLIENT.get_deployment_evidence(...))
+      - pattern: raise_evidence_errors($CLIENT.get_deployment_evidence(...))
+    paths:
+      # load_deployment_evidence releases acknowledged rows per carrier in prepare_carrier_evidence.
+      exclude: ["netbox_nso_plugin/tests/**", "netbox_nso_plugin/apply_settlement.py"]
+
   - id: nso-observation-collection-empty-default
     languages: [python]
     severity: ERROR

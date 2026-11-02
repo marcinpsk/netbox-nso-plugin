@@ -89,7 +89,7 @@ def check_active_streams():
     from .intent_drift import _delivery_key, _scopes
     from .models import NSOIntentRevision
     from .selection_manifest import frozen_manifest
-    from .settlement_resolution import unreleased_generations
+    from .settlement_resolution import released_head_evidence, unreleased_generations
 
     _require(
         not NSOApplyAttempt.objects.filter(lifecycle="open", trigger_kind="manual").exists()
@@ -220,9 +220,9 @@ def check_active_streams():
                 type(count) is int and count == captured,
                 "Adapter redistribution membership has no exact prepared ownership",
             )
-        evidence = adapter_client.get_deployment_evidence(management.adapter_device_id, [])
-        heads, _released = unreleased_generations(management, incarnation, [evidence["head"]])
-        evidence = {**evidence, "head": heads[0] if heads else None}
+        evidence = released_head_evidence(
+            management, incarnation, adapter_client.get_deployment_evidence(management.adapter_device_id, [])
+        )
         adapter_client.raise_evidence_errors(evidence)
         _require(
             not evidence["held_jobs"] and not evidence["write_work_pending"] and evidence["pending_generations"] == 0,

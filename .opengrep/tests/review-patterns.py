@@ -3503,3 +3503,35 @@ def requested_generation_listing(client, wanted):
     listing = [row for row in listing if row["generation_id"] in wanted]
     # ok: nso-unreleased-generation-listing-evidence-check
     client.raise_evidence_errors(listing)
+
+
+def unreleased_deployment_evidence_head(client):
+    evidence = client.get_deployment_evidence(7, [])
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(evidence)
+
+
+def unreleased_deployment_evidence_head_imported(client):
+    evidence = client.get_deployment_evidence(7, [])
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    raise_evidence_errors(evidence)
+
+
+def unreleased_deployment_evidence_head_direct(client):
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(client.get_deployment_evidence(7, []))
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    raise_evidence_errors(client.get_deployment_evidence(7, []))
+
+
+def released_deployment_evidence_head(client, management, incarnation):
+    evidence = released_head_evidence(management, incarnation, client.get_deployment_evidence(7, []))
+    # ok: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(evidence)
+
+
+def reassigned_deployment_evidence_head(client, management, incarnation):
+    evidence = client.get_deployment_evidence(7, [])
+    evidence = released_head_evidence(management, incarnation, evidence)
+    # ok: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(evidence)
