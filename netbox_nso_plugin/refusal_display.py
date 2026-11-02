@@ -317,7 +317,7 @@ def row_projection(row, interface=None):
         projection["error"] = projection["refusal_text"]
     elif error and projection["error"] is None:
         message = (error.get("message") or str(error)) if isinstance(error, dict) else error
-        projection["error"] = None if message in advisories else message
+        projection["error"] = None if isinstance(message, str) and message in advisories else message
     if not projection["advisory"]:
         projection["advisory"] = getattr(row, "last_result_advisory", "") or ""
     spec = OVERLAYS.get(row._meta.label_lower) if hasattr(row, "_meta") else None
