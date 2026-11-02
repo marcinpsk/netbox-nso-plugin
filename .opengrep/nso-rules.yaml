@@ -1005,15 +1005,27 @@ rules:
     patterns:
       - pattern-either:
           - pattern: '[$ROW for $ROW in $CLIENT.list_device_generations(...) if $COND]'
+          - pattern: '($ROW for $ROW in $CLIENT.list_device_generations(...) if $COND)'
           - patterns:
               - pattern-inside: |
                   $LIST = <... $CLIENT.list_device_generations(...) ...>
                   ...
-              - pattern: '[$ROW for $ROW in $LIST if $COND]'
+              - pattern-either:
+                  - pattern: '[$ROW for $ROW in $LIST if $COND]'
+                  - pattern: '($ROW for $ROW in $LIST if $COND)'
+      # An isinstance check counts only when its branch raises the marker.
       - pattern-not-inside: |
           for $R in $LIST:
               if isinstance($R, $T.ListingTruncation):
                   ...
+                  $C.raise_item_error($R)
+                  ...
+          ...
+      - pattern-not-inside: |
+          for $R in $LIST:
+              if isinstance($R, $T.ListingTruncation):
+                  ...
+                  raise $E
           ...
       - pattern-not-inside: |
           def $PRED($ARG):
