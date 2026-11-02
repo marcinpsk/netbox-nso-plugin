@@ -505,7 +505,7 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=blocked.pk).exists())
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
 
-    def acknowledged_history(self, *, listed):
+    def acknowledged_history(self, *, listed, stall_class="evidence_invariant"):
         from netbox_nso_plugin.models import NSOSettlementIssue
 
         attempt, execution = self.history()
@@ -518,7 +518,7 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
             job_id=900,
             settle_seq=1,
             request_fence={},
-            stall_class="evidence_invariant",
+            stall_class=stall_class,
             stall_reason="missing_generation_evidence",
             position="historical",
             cursor_before=2,
@@ -570,6 +570,28 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         attempt, _issue = self.acknowledged_history(listed=True)
         self.prune(execute=True)
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+
+    def test_failed_acknowledged_listing_keeps_only_its_own_history(self):
+        from ._settlement_observation import failed_item
+        from ._settlement_wire import generation_wire
+
+        acknowledged, issue = self.acknowledged_history(listed=True, stall_class="invalid_evidence")
+        removable, _execution = self.history()
+        base = self.adapter._server.RequestHandlerClass
+        rows = [failed_item(generation_wire(row, 1767)) for row in self.adapter.store.generations[1767]]
+
+        class FailedListingHandler(base):
+            def do_GET(handler):
+                if handler.path.split("?", 1)[0].endswith("/generations"):
+                    handler._send(200, rows)
+                    return
+                super().do_GET()
+
+        self.adapter._server.RequestHandlerClass = FailedListingHandler
+        self.prune(execute=True)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=acknowledged.pk).exists())
+        self.assertTrue(NSOApplyExecution.objects.filter(attempt=acknowledged, settlement_issue=issue).exists())
 
     def test_an_unlisted_acknowledged_obligation_is_pruned_and_its_audit_stays(self):
         from netbox_nso_plugin.models import NSOSettlementIssue

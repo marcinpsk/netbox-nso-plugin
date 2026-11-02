@@ -226,6 +226,77 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
 
 
 class TestDeploymentProbe(DeploymentCase):
+    def test_probe_registration_ignores_an_acknowledged_failed_listing_row(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.durable_capture import mapping_epoch
+        from netbox_nso_plugin.models import NSOSettlementIssue
+
+        from ._adapter_http import make_generation_listing, make_response
+        from ._settlement_observation import failed_item
+
+        self.probe()
+        incarnation = self.socket_adapter.store.incarnation
+        now = timezone.now()
+        issue = NSOSettlementIssue.objects.create(
+            management=self.management,
+            mapping_epoch=mapping_epoch(self.management),
+            adapter_device_id=self.management.adapter_device_id,
+            store_incarnation=incarnation,
+            job_id=499,
+            settle_seq=1,
+            request_fence={},
+            stall_class="invalid_evidence",
+            stall_reason="invalid job envelope",
+            position="historical",
+            cursor_before=1,
+            cursor_after=1,
+            evidence_digest="b" * 64,
+            impact_digest="c" * 64,
+            contract_fingerprint="d" * 64,
+            revision_digest="e" * 64,
+            proposal={"obligations": []},
+            state="acknowledged",
+            closed_at=now,
+            actor_id=1,
+            actor_label="placeholder-operator",
+            acknowledgement_reason="placeholder reason",
+            acknowledged_at=now,
+            committed_effects=[],
+        )
+        prior = NSOApplyAttempt.objects.create(management=self.management, trigger_kind="cadence")
+        NSOApplyExecution.objects.create(
+            attempt=prior,
+            management=self.management,
+            mapping_epoch=mapping_epoch(self.management),
+            adapter_device_id=self.management.adapter_device_id,
+            store_incarnation=incarnation,
+            generation_id=80,
+            generation_seq=3,
+            carrier_job_id=499,
+            settle_seq=1,
+            consumption_state="acknowledged",
+            settlement_issue=issue,
+        )
+        failed = failed_item(
+            generation_wire(
+                make_generation_listing(generation_id=80, seq=3, job_id=499, carrier_job_id=499),
+                self.management.adapter_device_id,
+            )
+        )
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                return make_response(200, [failed, *response.json()])
+            return response
+
+        self.adapter._handle = handle
+        self.command(register_probe=str(self.attempt.pk))
+        self.assertEqual(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id, self.attempt.pk)
+        self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")
+
     def test_pruning_preserves_nonhead_certificate_when_remote_carrier_is_unavailable(self):
         from datetime import timedelta
 

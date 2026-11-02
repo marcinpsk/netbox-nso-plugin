@@ -1,6 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-carrier-generations-bypass-helper
+    languages: [python]
+    severity: ERROR
+    message: Collect carrier generations through _carrier_generations so sibling carriers stay isolated.
+    patterns:
+      - pattern-either:
+          - pattern: '($VALUE for $A in $E["attempts"] for $G in $A["generations"])'
+          - pattern: '[$VALUE for $A in $E["attempts"] for $G in $A["generations"]]'
+          - pattern: '($VALUE for $A in $E["attempts"] for $G in $A["generations"] if $COND)'
+          - pattern: '[$VALUE for $A in $E["attempts"] for $G in $A["generations"] if $COND]'
+      - pattern-not-inside: |
+          def _carrier_generations(...):
+              ...
+    paths:
+      include: ["netbox_nso_plugin/apply_settlement.py"]
+
+  - id: nso-unreleased-generation-listing-evidence-check
+    languages: [python]
+    severity: ERROR
+    message: Release acknowledged obligations before raising generation listing evidence errors.
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              $LIST = $CLIENT.list_device_generations(...)
+              ...
+          - pattern-not-inside: |
+              $LIST = $CLIENT.list_device_generations(...)
+              ...
+              $LIST = $VALUE
+              ...
+          - pattern-either:
+              - pattern: $C.raise_evidence_errors($LIST)
+              - pattern: raise_evidence_errors($LIST)
+      - pattern: $C.raise_evidence_errors($CLIENT.list_device_generations(...))
+      - pattern: raise_evidence_errors($CLIENT.list_device_generations(...))
+    paths:
+      exclude: ["netbox_nso_plugin/tests/**"]
+
   - id: nso-observation-collection-empty-default
     languages: [python]
     severity: ERROR

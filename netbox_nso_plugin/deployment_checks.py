@@ -89,7 +89,7 @@ def check_active_streams():
     from .intent_drift import _delivery_key, _scopes
     from .models import NSOIntentRevision
     from .selection_manifest import frozen_manifest
-    from .settlement_resolution import acknowledged_obligations
+    from .settlement_resolution import unreleased_generations
 
     _require(
         not NSOApplyAttempt.objects.filter(lifecycle="open", trigger_kind="manual").exists()
@@ -181,19 +181,10 @@ def check_active_streams():
                 ),
                 "An adapter receipt has no captured local selection",
             )
-        acknowledged = acknowledged_obligations(management, incarnation)
-
-        def released(row):
-            return (
-                row is not None
-                and not isinstance(row, adapter_client.ListingTruncation)
-                and (row["generation_id"], row["carrier_job_id"]) in acknowledged
-            )
-
         # Resolved without a certificate: no success or provenance claim exists for it.
-        generations = [
-            row for row in adapter_client.list_device_generations(management.adapter_device_id) if not released(row)
-        ]
+        generations, _released = unreleased_generations(
+            management, incarnation, adapter_client.list_device_generations(management.adapter_device_id)
+        )
         adapter_client.raise_evidence_errors(generations)
         terminal = [generation for generation in generations if terminal_carrier_requires_certificate(generation)]
         certificates = generation_certificate_candidates(management, incarnation, terminal)
@@ -230,8 +221,8 @@ def check_active_streams():
                 "Adapter redistribution membership has no exact prepared ownership",
             )
         evidence = adapter_client.get_deployment_evidence(management.adapter_device_id, [])
-        if released(evidence["head"]):
-            evidence = {**evidence, "head": None}
+        heads, _released = unreleased_generations(management, incarnation, [evidence["head"]])
+        evidence = {**evidence, "head": heads[0] if heads else None}
         adapter_client.raise_evidence_errors(evidence)
         _require(
             not evidence["held_jobs"] and not evidence["write_work_pending"] and evidence["pending_generations"] == 0,

@@ -193,10 +193,12 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         "Probe admission changed",
     )
     from .apply_settlement import reconcile_admission_links
+    from .settlement_resolution import unreleased_generations
 
     listing = adapter_client.list_device_generations(management.adapter_device_id)
-    adapter_client.raise_evidence_errors(listing)
-    reconcile_admission_links((row["response"], attempt.response), listing)
+    unreleased, released = unreleased_generations(management, incarnation, listing)
+    adapter_client.raise_evidence_errors(unreleased)
+    reconcile_admission_links((row["response"], attempt.response), listing, released=released)
     generations = row["generations"]
     _require(len(generations) == 1, "Probe requires one generation")
     generation = generations[0]
@@ -207,7 +209,7 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         _response_generation_ids(attempt.response) == {generation["generation_id"]},
         "Probe generation differs from its admitted execution",
     )
-    listed = next(row for row in listing if row["generation_id"] == generation["generation_id"])
+    listed = next(row for row in unreleased if row["generation_id"] == generation["generation_id"])
     _require(
         listed["carrier_job_id"] == generation["carrier_job_id"]
         and listed["carrier_job_status"] == generation["carrier_job_status"],
