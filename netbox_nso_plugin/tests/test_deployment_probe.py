@@ -226,16 +226,16 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
 
 
 class TestDeploymentProbe(DeploymentCase):
-    def test_probe_registration_ignores_an_acknowledged_failed_listing_row(self):
+    def acknowledged_failed_item(self):
+        """Return a failed adapter row for an obligation that an acknowledged issue released."""
         from django.utils import timezone
 
         from netbox_nso_plugin.durable_capture import mapping_epoch
         from netbox_nso_plugin.models import NSOSettlementIssue
 
-        from ._adapter_http import make_generation_listing, make_response
+        from ._adapter_http import make_generation_listing
         from ._settlement_observation import failed_item
 
-        self.probe()
         incarnation = self.socket_adapter.store.incarnation
         now = timezone.now()
         issue = NSOSettlementIssue.objects.create(
@@ -278,18 +278,42 @@ class TestDeploymentProbe(DeploymentCase):
             consumption_state="acknowledged",
             settlement_issue=issue,
         )
-        failed = failed_item(
+        return failed_item(
             generation_wire(
                 make_generation_listing(generation_id=80, seq=3, job_id=499, carrier_job_id=499),
                 self.management.adapter_device_id,
             )
         )
+
+    def test_probe_registration_ignores_an_acknowledged_failed_listing_row(self):
+        from ._adapter_http import make_response
+
+        self.probe()
+        failed = self.acknowledged_failed_item()
         original = self.adapter._handle
 
         def handle(method, url, **kwargs):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/generations"):
                 return make_response(200, [failed, *response.json()])
+            return response
+
+        self.adapter._handle = handle
+        self.command(register_probe=str(self.attempt.pk))
+        self.assertEqual(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id, self.attempt.pk)
+        self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")
+
+    def test_probe_registration_ignores_an_acknowledged_failed_evidence_head(self):
+        from ._adapter_http import make_response
+
+        self.probe()
+        head = self.acknowledged_failed_item()
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                return make_response(200, {**response.json(), "head": head})
             return response
 
         self.adapter._handle = handle

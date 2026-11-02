@@ -96,6 +96,12 @@ def unreleased_generations(management, incarnation, listing):
     return rows, frozenset(identifiers)
 
 
+def released_head_evidence(management, incarnation, evidence):
+    """Drop a deployment-evidence head that an acknowledged obligation released."""
+    heads, _released = unreleased_generations(management, incarnation, [evidence["head"]])
+    return {**evidence, "head": heads[0] if heads else None}
+
+
 def acknowledged_jobs(management, incarnation) -> frozenset[int]:
     """Return the feed jobs whose every obligation an acknowledged issue released."""
     from .models import NSOSettlementIssue

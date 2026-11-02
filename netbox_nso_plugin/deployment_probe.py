@@ -180,7 +180,11 @@ def _terminal_evidence(attempt, *, settle_seq=None):
     _page, incarnation = adapter_client.get_settlement_feed(
         management.adapter_device_id, after_settle_seq=(settle_seq or 1) - 1, limit=100
     )
-    evidence = adapter_client.get_deployment_evidence(management.adapter_device_id, [attempt.pk])
+    from .settlement_resolution import released_head_evidence, unreleased_generations
+
+    evidence = released_head_evidence(
+        management, incarnation, adapter_client.get_deployment_evidence(management.adapter_device_id, [attempt.pk])
+    )
     adapter_client.raise_evidence_errors(evidence)
     _require(evidence["device_id"] == management.adapter_device_id, "Probe evidence device changed")
     rows = evidence["attempts"]
@@ -193,7 +197,6 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         "Probe admission changed",
     )
     from .apply_settlement import reconcile_admission_links
-    from .settlement_resolution import unreleased_generations
 
     listing = adapter_client.list_device_generations(management.adapter_device_id)
     unreleased, released = unreleased_generations(management, incarnation, listing)
