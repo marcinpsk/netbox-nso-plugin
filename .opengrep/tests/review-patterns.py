@@ -3395,6 +3395,32 @@ def generation_listing_filter_after_truncation_check(client, wanted):
     return [row for row in listing if row.get("generation_id") in wanted]
 
 
+def generation_listing_generator_filters(client, adapter_client, wanted):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    found = next(row for row in listing if row["generation_id"] == wanted)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    return found, any(row for row in adapter_client.list_device_generations(7) if row["generation_id"] == wanted)
+
+
+def generation_listing_filter_after_noop_truncation_check(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            pass
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    return [row for row in listing if row.get("generation_id") in wanted]
+
+
+def generation_listing_generator_after_truncation_check(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            raise client.ListingTruncationError(row)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return next(row for row in listing if row["generation_id"] == wanted)
+
+
 def generation_listing_filter_keeps_truncation(adapter_client, acknowledged):
     def released(row):
         return not isinstance(row, adapter_client.ListingTruncation) and row["generation_id"] in acknowledged

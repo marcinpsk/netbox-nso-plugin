@@ -277,7 +277,7 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
                 validate_carrier_under_lock(management, evidence)
 
         def finish():
-            nonlocal cursor, stalled
+            nonlocal cursor, fence, stalled
             management.refresh_from_db()
             if job is not None:
                 if released or _settle_job(management, job, incarnation):
@@ -290,6 +290,7 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
                 _persist(management, cursor, management.adapter_device_id, incarnation)
                 management.refresh_from_db()
                 write_diagnostic(management, fence, cursor_written=True)
+                fence = request_fence(management)
 
         if evidence is not None:
             settle_apply_attempts(management, evidence, before_settle=before_settle, after_settle=finish)

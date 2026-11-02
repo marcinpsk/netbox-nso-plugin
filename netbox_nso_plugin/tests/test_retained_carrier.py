@@ -90,6 +90,51 @@ class TestRetainedCarrier(BGPSettlementHelpers, BGPCaptureCase):
         self.serve_listing([row])
         self.assertEqual(adapter_client.list_device_generations(self.management.adapter_device_id), [row])
 
+    def test_empty_feed_resets_cursor_without_stalling_retained_carrier(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._outbox_case import mirror_update
+
+        self.prepare_automatic()
+        generation = self.terminal(refused=None)
+        self.serve_terminal_evidence(generation)
+        initial = consume_static_route_settlements(self.management)
+        self.assertFalse(initial.stalled)
+        self.assertEqual((initial.consumed, initial.cursor), (1, 1))
+        execution = NSOApplyExecution.objects.get(generation_id=generation["generation_id"])
+        self.assertEqual((execution.consumption_state, execution.settle_seq), ("consumed", 1))
+        self.assertIsNotNone(execution.consumed_at)
+        mirror_update(
+            self.management,
+            settle_cursor_seq=99,
+            settle_cursor_incarnation="00000000-0000-4000-8000-000000000003",
+            settle_cursor_device_id=self.management.adapter_device_id,
+        )
+        self.serve_terminal_evidence(generation, pruned=True)
+
+        result = consume_static_route_settlements(self.management)
+
+        self.assertFalse(result.stalled)
+        self.assertTrue(result.drained)
+        self.assertTrue(result.epoch_reset)
+        self.assertEqual((result.consumed, result.cursor), (0, 0))
+        self.management.refresh_from_db()
+        self.assertEqual(
+            (
+                self.management.settle_cursor_seq,
+                self.management.settle_cursor_incarnation,
+                self.management.settle_cursor_device_id,
+            ),
+            (0, self.server.evidence_incarnation, self.management.adapter_device_id),
+        )
+        execution.refresh_from_db()
+        self.assertEqual((execution.consumption_state, execution.settle_seq), ("consumed", 1))
+        self.assertIsNotNone(execution.consumed_at)
+        self.assertEqual(result.deployment_evidence["head"]["carrier_job_id"], execution.carrier_job_id)
+        for owner in self.owners:
+            owner.refresh_from_db()
+            self.assertEqual(owner.status, "in_sync")
+
     def test_null_snapshot_blocks_until_the_terminal_carrier_is_retained(self):
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
