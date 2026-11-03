@@ -1183,6 +1183,22 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         cause = generation["refusals"][0]
         self.assertEqual(projected["error"], f"{cause['reason']}: {cause['message']}")
 
+    def test_structured_error_message_projects_and_renders(self):
+        from netbox_nso_plugin.refusal_display import row_projection
+
+        from ._outbox_case import mirror_update
+
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_interfaces = True
+            self.management.manage_description = True
+            self.management.save(update_fields=("manage_interfaces", "manage_description"))
+            iface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+            row = acquire_overlay(NSOInterfaceState, interface=iface, attribute="description", status="imported")
+        mirror_update(row, status="apply_failed", last_apply_error={"message": {"detail": "placeholder"}})
+        row.refresh_from_db()
+        self.assertEqual(row_projection(row)["error"], {"detail": "placeholder"})
+        self.assertEqual(self.client.get(iface.get_absolute_url()).status_code, 200)
+
     def test_row_projection_finds_the_current_epoch_fence_beside_a_stale_one(self):
         from netbox_nso_plugin.models import NSOOverlaySettlementFence
         from netbox_nso_plugin.refusal_display import project_rows, row_projection

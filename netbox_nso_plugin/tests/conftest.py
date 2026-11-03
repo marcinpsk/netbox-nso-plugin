@@ -161,3 +161,49 @@ def _reset_intent_push_state():
     except Exception:
         pass
     yield
+
+
+_MANAGEMENT_ROW_LOCKED_WITHOUT_DEVICE_LOCK = """
+SELECT EXISTS (
+    SELECT 1 FROM netbox_nso_plugin_nsodevicemanagement
+    WHERE device_id = %(device)s
+      AND xmax IN (SELECT transactionid FROM pg_locks WHERE locktype = 'transactionid' AND pid = pg_backend_pid())
+) AND NOT EXISTS (
+    SELECT 1 FROM pg_locks
+    WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted
+      AND classid = %(namespace)s AND objid = %(device)s AND objsubid = 2
+)
+"""
+
+
+@pytest.fixture(autouse=True)
+def _device_lock_before_management_row():
+    """Fail a test whose code asks for a device intent lock (L4) while it holds that device's management row (L5).
+
+    Limits: it sees only exercised paths, only row locks this transaction took with FOR UPDATE/SHARE
+    (xmax is one of its own transaction ids, so a plain UPDATE or a multixact lock is not seen), and
+    only the management row of the device being locked.
+    """
+    from django.db import connection
+
+    from netbox_nso_plugin import apply_state
+
+    original = apply_state.lock_device_intent_transaction
+    violations = []
+
+    def guarded(device_id):
+        if connection.in_atomic_block:
+            with connection.cursor() as cursor:
+                params = {"device": int(device_id), "namespace": apply_state._DEVICE_INTENT_LOCK_NAMESPACE}
+                cursor.execute(_MANAGEMENT_ROW_LOCKED_WITHOUT_DEVICE_LOCK, params)
+                if cursor.fetchone()[0]:
+                    violations.append(f"device {device_id}: L4 requested while its management row is locked")
+        try:
+            return original(device_id)
+        except apply_state.LockOrderViolation as exc:
+            violations.append(f"device {device_id}: {exc}")
+            raise
+
+    with patch.object(apply_state, "lock_device_intent_transaction", guarded):
+        yield
+    assert not violations, f"intent lock order violated (L4 must precede L5): {violations}"

@@ -22,26 +22,26 @@ from netbox_nso_plugin.settlement_resolution import instant
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import content_update, mirror_update
+from ._refusal_display import RefusalDisplayHelpers
 from ._settlement_observation import INCARNATION, failed_item, serve_observation
 from ._settlement_wire import generation_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 from .test_settlement_issue import ADVISORY, HistoricalStore, SettlementIssueHelpers
 
 
-class TestAcknowledgedObligationConsumers(SettlementIssueHelpers, BGPSettlementHelpers, BGPCaptureCase):
+class TestAcknowledgedObligationConsumers(
+    SettlementIssueHelpers, RefusalDisplayHelpers, BGPSettlementHelpers, BGPCaptureCase
+):
     def acknowledged_carrier(self):
         issue = self.stall_invalid_manual_carrier()
         acknowledge(issue, issue.revision_digest, self.operator(), "carrier result unreadable")
         issue.refresh_from_db()
         return issue
 
-    def serve_retry(self, *, dispositions=None):
+    def serve_retry(self, *, disposition=None):
         """Retry generation 81 under carrier 503, joined to the manual attempt through the head."""
-        retry = self.terminal(refused=None)
+        retry = self.terminal(refused=None, disposition=disposition)
         retry["carrier_job_id"] = 503
-        if dispositions is not None:
-            for outcome in retry["row_outcomes"]:
-                outcome["disposition"] = dispositions
         self.serve_terminal_evidence(retry, settle_seq=2)
         original = self.adapter._handle
         attempt_id = str(self.attempt.pk)
@@ -128,6 +128,57 @@ class TestAcknowledgedObligationConsumers(SettlementIssueHelpers, BGPSettlementH
         for owner in self.owners[1:]:
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
+
+    def test_a_moved_interface_owner_drops_the_acknowledged_jobs_of_its_earlier_device(self):
+        from dcim.models import Interface
+        from django.db import transaction
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.settlement_resolution import acknowledged_unknown_jobs
+
+        from ._outbox_case import make_device, without_commit_drain
+        from ._ownership_case import acquire_overlay
+
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_interfaces = True
+            self.management.manage_description = True
+            self.management.save(update_fields=("manage_interfaces", "manage_description"))
+            iface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+            row = acquire_overlay(NSOInterfaceState, interface=iface, attribute="description", status="accepted")
+        self.unknown_owner(row, ["interface", "interface.description", "f" * 64], 499)
+        key = (row._meta.label_lower, row.pk)
+        self.assertEqual(acknowledged_unknown_jobs([row]), {key: (499,)})
+        Interface.objects.filter(pk=iface.pk).update(device=make_device("moved"))
+        self.assertEqual(acknowledged_unknown_jobs([NSOInterfaceState.objects.get(pk=row.pk)]), {key: ()})
+
+    def test_a_later_unavailable_settlement_keeps_the_acknowledged_advisory_on_the_row(self):
+        from django.urls import reverse
+
+        from netbox_nso_plugin.refusal_display import UNAVAILABLE
+
+        from .test_refusal_display_parity import OwnerHTML, owner_projections
+
+        self.acknowledged_carrier()
+        router = self.owners[0]
+        router.refresh_from_db()
+        self.unknown_owner(router, ["bgp", "bgp.router", "f" * 64], 499)
+        self.serve_retry(disposition="unavailable")
+        self.assertFalse(consume_static_route_settlements(self.management).stalled)
+        expected = {
+            "state": "apply_failed",
+            "label": "outcome unknown",
+            "pending": True,
+            "advisory": ADVISORY.format(499),
+            "error": None,
+        }
+        parsed = OwnerHTML()
+        parsed.feed(self.category("bgp").content.decode())
+        payload = dict(owner_projections(self.category("bgp", format="json").json()))
+        key = (router._meta.model_name, router.pk)
+        for surface in (parsed.owners[key], payload[key]):
+            self.assertEqual({name: surface[name] for name in expected}, expected)
+        tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(tab, UNAVAILABLE)
 
     def test_the_not_applied_restore_cannot_restore_success_over_an_unknown_contribution(self):
         self.prepare()

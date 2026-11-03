@@ -42,6 +42,16 @@
   padding: 0.45rem 0.6rem;
   border-right: none;
 }
+/* A state badge wraps in a narrow column instead of being cut off. */
+.nso-grid .tabulator-cell .badge {
+  white-space: normal;
+  text-align: start;
+}
+/* The settlement acknowledgement reason keeps a readable line length. */
+.nso-settlement-reason {
+  flex: 1 1 20rem;
+  max-width: 40rem;
+}
 .nso-grid .tabulator-header-filter input,
 .nso-grid .tabulator-header-filter select {
   font-size: 0.75rem;

@@ -748,7 +748,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.prepare_automatic()
         generation = self.terminal(refused=None)
         settle_terminal_generation(self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1)
-        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_consumed_settlement_sequence"):
             settle_terminal_generation(
                 self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=2
             )
@@ -1085,7 +1085,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
 
         # The epoch's selections no longer hold this generation's push sequences.
-        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+        with self.assertRaisesRegex(EvidenceInvariantError, "selection_not_unique"):
             settle_terminal_generation(
                 self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1
             )
@@ -1109,10 +1109,10 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
         self.management.refresh_from_db()
 
-        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+        with self.assertRaisesRegex(EvidenceInvariantError, "selection_not_unique"):
             self.settle(copy.deepcopy(generation))
         # The deployment probe consumes through this writer with its manual attempt.
-        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+        with self.assertRaisesRegex(EvidenceInvariantError, "selection_not_unique"):
             settle_terminal_generation(
                 self.management, generation, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=1
             )
