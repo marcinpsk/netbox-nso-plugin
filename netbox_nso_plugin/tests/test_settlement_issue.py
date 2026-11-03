@@ -274,6 +274,66 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
         self.assertEqual((result.consumed, result.cursor, result.stalled), (1, 2, False))
         self.assertEqual([owner[0] for owner in self.owner_state()], ["apply_failed"] * len(self.owners))
 
+    def cadence_obligation(self):
+        """Hold the carrier's execution under a cadence attempt that an earlier certified carrier resolved."""
+        self.generation = self.terminal(refused=None)
+        self.serve_terminal_evidence(self.generation)
+        self.invalid_feed_job()
+        serve_observation(self)
+        cadence = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            source_epoch=self.management.adapter_source_epoch,
+            trigger_kind="cadence",
+        )
+        identity = {
+            "attempt": cadence,
+            "management": self.management,
+            "mapping_epoch": mapping_epoch(self.management),
+            "adapter_device_id": self.management.adapter_device_id,
+            "store_incarnation": INCARNATION,
+            "generation_id": 81,
+        }
+        NSOApplyExecution.objects.create(
+            **identity,
+            generation_seq=4,
+            carrier_job_id=500,
+            terminal_projection={"generation_id": 81, "carrier_job_id": 500},
+            terminal_at=self.stamp,
+            consumed_at=self.stamp,
+            consumption_state="consumed",
+        )
+        target = NSOApplyExecution.objects.create(**identity, carrier_job_id=501)
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        return cadence, target
+
+    def test_a_cadence_obligation_with_resolved_history_is_acknowledged_under_its_attempt(self):
+        self.prepare_automatic()
+        cadence, target = self.cadence_obligation()
+        issue = NSOSettlementIssue.objects.get(management=self.management, state="open")
+        self.assertEqual(
+            issue.proposal["obligations"],
+            [
+                {
+                    "generation_id": 81,
+                    "carrier_job_id": 501,
+                    "generation_seq": 4,
+                    "attempt_id": str(cadence.pk),
+                    "placeholder_execution_id": None,
+                }
+            ],
+        )
+        acknowledge(issue, issue.revision_digest, self.operator(), "a retried cadence carrier")
+        target.refresh_from_db()
+        self.assertEqual((target.consumption_state, target.settlement_issue_id), ("acknowledged", issue.pk))
+
+    def test_a_manual_admission_of_a_cadence_held_obligation_has_no_exit(self):
+        self.prepare()
+        self.cadence_obligation()
+        self.assertFalse(NSOSettlementIssue.objects.filter(management=self.management, state="open").exists())
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.settle_evidence_error["exit"], "ownership_unbounded")
+
     def test_a_repeated_acknowledgement_returns_the_receipt_without_writes(self):
         issue = self.stall_invalid_manual_carrier()
         acknowledge(issue, issue.revision_digest, self.operator(), "first")

@@ -844,6 +844,15 @@ def _require_explained(management, stall, references, plan, members):
             raise NotAcknowledgeable("ownership_unbounded")
 
 
+def _obligation_attempt(owning, executed):
+    """Bind an obligation to the attempt that already holds its execution, as the commit requires."""
+    if owning is None:
+        return executed
+    if executed not in (None, str(owning.pk)):
+        raise NotAcknowledgeable("ownership_unbounded")
+    return str(owning.pk)
+
+
 def _observe(management, stall, cursor, attempts):
     if len(attempts) > MAX_OBSERVED_ATTEMPTS:
         raise NotAcknowledgeable("ownership_unbounded")
@@ -884,12 +893,17 @@ def decide(management, stall, *, request=None, provenance=None) -> Decision:
     else:
         owning = dict.fromkeys(members)
     remote = _remote(observation)
+    executed = {
+        state["generation_id"]: state["attempt_id"]
+        for identity, state in references.items()
+        if identity[0] == "execution" and state["carrier_job_id"] == stall.job_id
+    }
     obligations = [
         {
             "generation_id": generation_id,
             "carrier_job_id": stall.job_id,
             "generation_seq": members[generation_id],
-            "attempt_id": _uuid_text(None if owning[generation_id] is None else owning[generation_id].pk),
+            "attempt_id": _obligation_attempt(owning[generation_id], executed.get(generation_id)),
             "placeholder_execution_id": placeholders.get(generation_id),
         }
         for generation_id in sorted(members)
