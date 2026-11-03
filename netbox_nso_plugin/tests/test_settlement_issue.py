@@ -274,12 +274,8 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
         self.assertEqual((result.consumed, result.cursor, result.stalled), (1, 2, False))
         self.assertEqual([owner[0] for owner in self.owner_state()], ["apply_failed"] * len(self.owners))
 
-    def cadence_obligation(self):
-        """Hold the carrier's execution under a cadence attempt that an earlier certified carrier resolved."""
-        self.generation = self.terminal(refused=None)
-        self.serve_terminal_evidence(self.generation)
-        self.invalid_feed_job()
-        serve_observation(self)
+    def resolved_cadence(self, earlier_carrier):
+        """Return a cadence attempt that a certified earlier carrier of generation 81 resolved."""
         cadence = NSOApplyAttempt.objects.create(
             management=self.management,
             adapter_device_id=self.management.adapter_device_id,
@@ -291,19 +287,32 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
             "management": self.management,
             "mapping_epoch": mapping_epoch(self.management),
             "adapter_device_id": self.management.adapter_device_id,
-            "store_incarnation": INCARNATION,
             "generation_id": 81,
         }
         NSOApplyExecution.objects.create(
             **identity,
+            store_incarnation=INCARNATION,
             generation_seq=4,
-            carrier_job_id=500,
-            terminal_projection={"generation_id": 81, "carrier_job_id": 500},
+            carrier_job_id=earlier_carrier,
+            terminal_projection={"generation_id": 81, "carrier_job_id": earlier_carrier},
             terminal_at=self.stamp,
             consumed_at=self.stamp,
             consumption_state="consumed",
         )
-        target = NSOApplyExecution.objects.create(**identity, carrier_job_id=501)
+        return cadence, identity
+
+    def cadence_obligation(self, *, competing=False):
+        """Hold the carrier's execution under a cadence attempt that an earlier certified carrier resolved."""
+        self.generation = self.terminal(refused=None)
+        self.serve_terminal_evidence(self.generation)
+        self.invalid_feed_job()
+        serve_observation(self)
+        cadence, identity = self.resolved_cadence(500)
+        target = NSOApplyExecution.objects.create(**identity, store_incarnation=INCARNATION, carrier_job_id=501)
+        if competing:
+            # A later carrier row without a store incarnation is a reference that the commit never resolves.
+            _other, other_identity = self.resolved_cadence(498)
+            NSOApplyExecution.objects.create(**other_identity, carrier_job_id=501)
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         return cadence, target
 
@@ -323,6 +332,15 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
                 }
             ],
         )
+        acknowledge(issue, issue.revision_digest, self.operator(), "a retried cadence carrier")
+        target.refresh_from_db()
+        self.assertEqual((target.consumption_state, target.settlement_issue_id), ("acknowledged", issue.pk))
+
+    def test_only_the_execution_the_commit_resolves_names_the_obligation_attempt(self):
+        self.prepare_automatic()
+        cadence, target = self.cadence_obligation(competing=True)
+        issue = NSOSettlementIssue.objects.get(management=self.management, state="open")
+        self.assertEqual(issue.proposal["obligations"][0]["attempt_id"], str(cadence.pk))
         acknowledge(issue, issue.revision_digest, self.operator(), "a retried cadence carrier")
         target.refresh_from_db()
         self.assertEqual((target.consumption_state, target.settlement_issue_id), ("acknowledged", issue.pk))
