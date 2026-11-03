@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "bda1111e539c280eaa19fddc1a7b759a562bf286fcf79db139d08e3dd98346b0"
+_ADAPTER_RUNTIME_DIGEST = "144504922a076a09df2287e73e4774c1415df72fa1ba5113d9fc8e7b865f752f"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -1214,6 +1214,19 @@ class TestO3CJoinedPinUvVersion(SimpleTestCase):
         assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"setup-uv must pin an exact uv version, got {version!r}"
         # uv rejects --system-certs before 0.11.0.
         assert tuple(int(part) for part in version.split(".")) >= (0, 11, 0)
+
+
+class TestAdapterPins(SimpleTestCase):
+    def test_every_pinned_adapter_checkout_names_the_joined_pin(self):
+        import yaml
+
+        refs = {
+            step["with"]["ref"]
+            for job in yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))["jobs"].values()
+            for step in job["steps"]
+            if step.get("with", {}).get("repository") == "marcinpsk/nso-adapter" and step["with"]["ref"] != "main"
+        }
+        assert refs == {_adapter_commit_from_workflow()}, f"pinned adapter checkouts disagree: {sorted(refs)}"
 
 
 class TestO3CRuntimeDigest(SimpleTestCase):
