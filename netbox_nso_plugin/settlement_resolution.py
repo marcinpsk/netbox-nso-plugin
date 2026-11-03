@@ -172,7 +172,7 @@ def _binding_unknowns(row, fence, owners):
 
 def acknowledged_unknown_jobs(rows) -> dict:
     """Map each owner key to the acknowledged jobs whose unknown contributions still bind the row."""
-    from .durable_capture import mapping_epoch
+    from .lifecycle_fence import current_owner_fences
     from .models import NSOOverlaySettlementFence, NSOSettlementIssueOwner
 
     keyed = {(row._meta.label_lower, row.pk): row for row in rows}
@@ -191,14 +191,9 @@ def acknowledged_unknown_jobs(rows) -> dict:
         owners.setdefault((owner.model_label, owner.overlay_pk), []).append(owner)
     if not owners.keys() & keyed.keys():
         return jobs
-    fences = NSOOverlaySettlementFence.objects.filter(
-        model_label__in={label for label, _pk in owners}, overlay_pk__in={pk for _label, pk in owners}
-    ).select_related("management")
-    for fence in fences:
-        key = (fence.model_label, fence.overlay_pk)
-        # Only the current mapping epoch binds, as in the success guard.
-        if key not in keyed or key not in owners or fence.mapping_epoch != mapping_epoch(fence.management):
-            continue
+    # Only the fence under the row's current management and mapping epoch binds, as in the success guard.
+    fences = current_owner_fences(owners.keys() & keyed.keys(), NSOOverlaySettlementFence.objects.all())
+    for key, fence in fences.items():
         candidates = [
             owner
             for owner in owners[key]

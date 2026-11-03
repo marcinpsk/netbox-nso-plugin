@@ -129,6 +129,28 @@ class TestAcknowledgedObligationConsumers(
             owner.refresh_from_db()
             self.assertEqual(owner.status, "in_sync")
 
+    def test_a_moved_interface_owner_drops_the_acknowledged_jobs_of_its_earlier_device(self):
+        from dcim.models import Interface
+        from django.db import transaction
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.settlement_resolution import acknowledged_unknown_jobs
+
+        from ._outbox_case import make_device, without_commit_drain
+        from ._ownership_case import acquire_overlay
+
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_interfaces = True
+            self.management.manage_description = True
+            self.management.save(update_fields=("manage_interfaces", "manage_description"))
+            iface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+            row = acquire_overlay(NSOInterfaceState, interface=iface, attribute="description", status="accepted")
+        self.unknown_owner(row, ["interface", "interface.description", "f" * 64], 499)
+        key = (row._meta.label_lower, row.pk)
+        self.assertEqual(acknowledged_unknown_jobs([row]), {key: (499,)})
+        Interface.objects.filter(pk=iface.pk).update(device=make_device("moved"))
+        self.assertEqual(acknowledged_unknown_jobs([NSOInterfaceState.objects.get(pk=row.pk)]), {key: ()})
+
     def test_a_later_unavailable_settlement_keeps_the_acknowledged_advisory_on_the_row(self):
         from django.urls import reverse
 
