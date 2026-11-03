@@ -1099,30 +1099,30 @@ rules:
                   - pattern: '($VALUE for $ROW in $LIST if $COND)'
                   - pattern: '{$VALUE for $ROW in $LIST if $COND}'
                   - pattern: '{$KEY: $VALUE for $ROW in $LIST if $COND}'
-      # An isinstance check counts only when its branch raises the marker.
-      - pattern-not-inside: |
-          for $R in $LIST:
-              if isinstance($R, $T.ListingTruncation):
+              # A check exempts only the bound listing. An isinstance check counts only when its branch raises the marker.
+              - pattern-not-inside: |
+                  for $R in $LIST:
+                      if isinstance($R, $T.ListingTruncation):
+                          ...
+                          $C.raise_item_error($R)
+                          ...
                   ...
-                  $C.raise_item_error($R)
+              - pattern-not-inside: |
+                  for $R in $LIST:
+                      if isinstance($R, $T.ListingTruncation):
+                          ...
+                          raise $E
                   ...
-          ...
-      - pattern-not-inside: |
-          for $R in $LIST:
-              if isinstance($R, $T.ListingTruncation):
+              - pattern-not-inside: |
+                  $C.raise_evidence_errors($LIST)
                   ...
-                  raise $E
-          ...
+              - pattern-not-inside: |
+                  raise_evidence_errors($LIST)
+                  ...
       - pattern-not-inside: |
           def $PRED($ARG):
               ...
               return <... $T.ListingTruncation ...>
-          ...
-      - pattern-not-inside: |
-          $C.raise_evidence_errors($LIST)
-          ...
-      - pattern-not-inside: |
-          raise_evidence_errors($LIST)
           ...
     paths:
       exclude: ["netbox_nso_plugin/tests/**"]
