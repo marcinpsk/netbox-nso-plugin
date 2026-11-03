@@ -1121,5 +1121,8 @@ rules:
       - pattern-not-inside: |
           $C.raise_evidence_errors($LIST)
           ...
+      - pattern-not-inside: |
+          raise_evidence_errors($LIST)
+          ...
     paths:
       exclude: ["netbox_nso_plugin/tests/**"]

@@ -3453,6 +3453,14 @@ def generation_listing_lookup_after_evidence_check(adapter_client, generation_id
     return next(row for row in listing if row["generation_id"] == generation_id)
 
 
+def generation_listing_lookup_after_bare_evidence_check(adapter_client, generation_id):
+    listing = adapter_client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    raise_evidence_errors(listing)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return {row["seq"] for row in listing if row["generation_id"] == generation_id}
+
+
 def carrier_generation_bypass(bound):
     # ruleid: nso-carrier-generations-bypass-helper
     rows = (generation for attempt in bound["attempts"] for generation in attempt["generations"])
