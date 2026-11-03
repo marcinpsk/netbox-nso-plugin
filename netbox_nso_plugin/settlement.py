@@ -91,6 +91,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
                 fence,
                 persist_cursor=job is not None or not jobs,
                 seen=seen,
+                reset_stall=epoch_reset,
             )
             expected_fence = request_fence(management)
             if stalled:
@@ -176,6 +177,7 @@ def _complete_evidence_result(result, read, management, fence, expected_fence, e
             fence,
             persist_cursor=False,
             seen=set(),
+            reset_stall=False,
         )
     with identify_evidence_stall(
         {"device_id": management.adapter_device_id},
@@ -210,7 +212,9 @@ class _SettlementReadChanged(Exception):
     """A concurrent consumer changed the cursor after this page was fetched."""
 
 
-def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fence, *, persist_cursor, seen):
+def _commit_carrier(
+    management, read, carrier_id, job, cursor, incarnation, fence, *, persist_cursor, seen, reset_stall
+):
     """Commit one complete carrier after its receipt claims and owner footprint are locked."""
     from .apply_settlement import (
         _rows,
@@ -247,6 +251,9 @@ def _commit_carrier(management, read, carrier_id, job, cursor, incarnation, fenc
         def finish():
             nonlocal cursor, fence, stalled
             management.refresh_from_db()
+            if reset_stall:
+                # The new store or device restarts its sequence, so the refreshed row's stall describes nothing.
+                _clear_stall(management)
             if job is not None:
                 if released or _settle_job(management, job, incarnation):
                     cursor = job["settle_seq"]
