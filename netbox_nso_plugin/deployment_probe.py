@@ -180,7 +180,12 @@ def _terminal_evidence(attempt, *, settle_seq=None):
     _page, incarnation = adapter_client.get_settlement_feed(
         management.adapter_device_id, after_settle_seq=(settle_seq or 1) - 1, limit=100
     )
-    evidence = adapter_client.get_deployment_evidence(management.adapter_device_id, [attempt.pk])
+    from .settlement_resolution import released_head_evidence, unreleased_generations
+
+    evidence = released_head_evidence(
+        management, incarnation, adapter_client.get_deployment_evidence(management.adapter_device_id, [attempt.pk])
+    )
+    adapter_client.raise_evidence_errors(evidence)
     _require(evidence["device_id"] == management.adapter_device_id, "Probe evidence device changed")
     rows = evidence["attempts"]
     _require(len(rows) == 1 and rows[0]["apply_attempt_id"] == str(attempt.pk), "Probe admission is missing")
@@ -194,7 +199,9 @@ def _terminal_evidence(attempt, *, settle_seq=None):
     from .apply_settlement import reconcile_admission_links
 
     listing = adapter_client.list_device_generations(management.adapter_device_id)
-    reconcile_admission_links((row["response"], attempt.response), listing)
+    unreleased, released = unreleased_generations(management, incarnation, listing)
+    adapter_client.raise_evidence_errors(unreleased)
+    reconcile_admission_links((row["response"], attempt.response), listing, released=released)
     generations = row["generations"]
     _require(len(generations) == 1, "Probe requires one generation")
     generation = generations[0]
@@ -205,7 +212,8 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         _response_generation_ids(attempt.response) == {generation["generation_id"]},
         "Probe generation differs from its admitted execution",
     )
-    listed = next(row for row in listing if row["generation_id"] == generation["generation_id"])
+    listed = next((row for row in unreleased if row["generation_id"] == generation["generation_id"]), None)
+    _require(listed is not None, "Probe generation is released or missing from the listing")
     _require(
         listed["carrier_job_id"] == generation["carrier_job_id"]
         and listed["carrier_job_status"] == generation["carrier_job_status"],
@@ -248,6 +256,7 @@ def _terminal_evidence(attempt, *, settle_seq=None):
     _require(incarnation == final_incarnation, "Probe store changed during evidence fetch")
     _require(len(jobs) == 1 and type(jobs[0]["settle_seq"]) is int, "Probe carrier sequence is unavailable")
     job = jobs[0]
+    adapter_client.raise_item_error(job)
     _require(
         job["device_id"] == management.adapter_device_id
         and job["type"] == "apply"

@@ -18,6 +18,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from netbox_nso_plugin.models import AdapterConnection
 
 from ._adapter_http import make_response, make_session
+from ._settlement_wire import generation_wire, job_wire
 from .mixins import _CascadeFlushMixin
 
 _BASE_CFG = {
@@ -27,6 +28,8 @@ _BASE_CFG = {
     "ca_cert_path": None,
     "timeout": 30,
 }
+# A canonical store incarnation, so a feed test reaches the body checks.
+_INCARNATION = "00000000-0000-4000-8000-0000000000a1"
 
 
 class TestClientResetHelpers(unittest.TestCase):
@@ -454,7 +457,9 @@ _JOB_OUT = {
     "type": "apply",
     "device_id": 10,
     "status": "succeeded",
-    "result": {"ok": True},
+    "result": {"row_outcomes": [], "refusals": [], "settlement_owners": [], "commit_acknowledged": True},
+    "row_outcomes": [],
+    "refusals": [],
     "error": None,
     "context": {"scope": "vlan"},
     "created_at": "2026-07-10T05:59:00Z",
@@ -545,7 +550,7 @@ class TestJobBoundaryValidation(unittest.TestCase):
         return make_session(response=response)
 
     def _refuses(self, session, call):
-        """Assert *call* raises the typed refusal while *session* is the transport."""
+        """Assert *call* raises the typed refusal while *session* is the transport, and return it."""
         from netbox_nso_plugin.adapter_client import AdapterError
 
         with (
@@ -555,12 +560,13 @@ class TestJobBoundaryValidation(unittest.TestCase):
             with self.assertRaises(AdapterError) as ctx:
                 call()
         self.assertEqual(ctx.exception.code, "invalid_response")
+        return ctx.exception
 
     def test_a_job_shaped_exactly_like_jobout_is_accepted_unchanged(self):
         """The contract pin: what the adapter's model emits must pass through untouched."""
         from netbox_nso_plugin.adapter_client import get_job
 
-        session = self._session(_JOB_OUT)
+        session = self._session(job_wire(_JOB_OUT))
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
@@ -573,9 +579,9 @@ class TestJobBoundaryValidation(unittest.TestCase):
         for payload in (
             "boom",
             ["not-a-job"],
-            _job_with_scalar("result"),
-            _job_with_scalar("error"),
-            _job_with_scalar("context"),
+            job_wire(_job_with_scalar("result")),
+            job_wire(_job_with_scalar("error")),
+            job_wire(_job_with_scalar("context")),
         ):
             with self.subTest(payload=payload):
                 self._refuses(self._session(payload), lambda: get_job(7))
@@ -592,21 +598,40 @@ class TestJobBoundaryValidation(unittest.TestCase):
 
         counts = {"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0, "not_applied": 0, "unavailable": 0}}
         job = {**_JOB_OUT, "result": counts}
-        self._refuses(self._session(job), lambda: get_job(7))
-        self._refuses(self._session([job]), lambda: list_jobs(10))
+        self._refuses(self._session(job_wire(job)), lambda: get_job(7))
+        self._refuses(self._session([job_wire(job)]), lambda: list_jobs(10))
 
     def test_list_jobs_refuses_a_listing_that_is_not_a_list_of_jobs(self):
         from netbox_nso_plugin.adapter_client import list_jobs
 
-        for payload in ({"jobs": []}, ["not-a-job"], [_job_with_scalar("context")]):
+        for payload in ({"jobs": []}, ["not-a-job"], [job_wire(_job_with_scalar("context"))]):
             with self.subTest(payload=payload):
                 self._refuses(self._session(payload), lambda: list_jobs(10))
 
     def test_settlement_feed_refuses_a_malformed_page(self):
-        from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
+        from netbox_nso_plugin.adapter_client import (
+            STORE_INCARNATION_HEADER,
+            EvidenceItem,
+            InvalidJobEvidence,
+            get_settlement_feed,
+            raise_item_error,
+        )
 
-        session = self._session([_job_with_scalar("result")], headers={STORE_INCARNATION_HEADER: "inc-1"})
-        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+        session = self._session(
+            [job_wire(_job_with_scalar("result"))],
+            headers={STORE_INCARNATION_HEADER: _INCARNATION},
+        )
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            jobs, _incarnation = get_settlement_feed(10, after_settle_seq=0, limit=50)
+        self.assertEqual(len(jobs), 1)
+        self.assertIsInstance(jobs[0], EvidenceItem)
+        self.assertEqual(jobs[0]["id"], _JOB_OUT["id"])
+        self.assertIsInstance(jobs[0].evidence_error, InvalidJobEvidence)
+        with self.assertRaises(InvalidJobEvidence):
+            raise_item_error(jobs[0])
 
     def test_settlement_feed_refuses_a_body_that_is_not_json(self):
         """The feed reads the body itself, so its own decode must raise the typed refusal.
@@ -616,8 +641,9 @@ class TestJobBoundaryValidation(unittest.TestCase):
         """
         from netbox_nso_plugin.adapter_client import STORE_INCARNATION_HEADER, get_settlement_feed
 
-        session = self._session(content=b"<html>gateway</html>", headers={STORE_INCARNATION_HEADER: "inc-1"})
-        self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+        session = self._session(content=b"<html>gateway</html>", headers={STORE_INCARNATION_HEADER: _INCARNATION})
+        error = self._refuses(session, lambda: get_settlement_feed(10, after_settle_seq=0, limit=50))
+        self.assertEqual(error.reason, "invalid job envelope")
 
     def test_static_route_read_back_refuses_a_payload_without_routes(self):
         """StaticRouteIntentOut always carries a ``routes`` list; anything else is undecidable.
@@ -1036,7 +1062,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     def test_get_job(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import get_job
 
-        session = self._make_session(200, {"id": 99, "type": "apply", "status": "succeeded"})
+        session = self._make_session(200, job_wire({**_JOB_OUT, "id": 99}))
         mock_s.return_value = session
         result = get_job(99)
         self.assertEqual(result["status"], "succeeded")
@@ -1126,7 +1152,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_device_generations_reject_a_malformed_listing(self, mock_s, _cfg):
-        from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
+        from netbox_nso_plugin.adapter_client import InvalidJobEvidence, list_device_generations, reset_session
 
         from ._adapter_http import make_generation_listing
 
@@ -1137,22 +1163,39 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         for payload in (
             {"generations": []},
             [None],
-            [missing_mode],
-            [make_generation_listing(extra=1)],
         ):
             with self.subTest(payload=payload):
                 reset_session()
                 mock_s.return_value = self._make_session(200, payload)
 
-                with self.assertRaisesRegex(AdapterError, "malformed generations listing") as raised:
+                with self.assertRaises(InvalidJobEvidence) as raised:
                     list_device_generations(5)
 
-                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
+
+        from netbox_nso_plugin.adapter_client import EvidenceItem, raise_item_error
+
+        for row in (missing_mode, make_generation_listing(extra=1)):
+            with self.subTest(row=row):
+                reset_session()
+                mock_s.return_value = self._make_session(200, [generation_wire(row, 5)])
+                items = list_device_generations(5)
+                self.assertEqual(len(items), 1)
+                self.assertIsInstance(items[0], EvidenceItem)
+                self.assertEqual(items[0]["carrier_job_id"], row["carrier_job_id"])
+                with self.assertRaises(InvalidJobEvidence) as raised:
+                    raise_item_error(items[0])
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_device_generations_reject_a_repeated_or_out_of_order_page(self, mock_s, _cfg):
-        from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
+        from netbox_nso_plugin.adapter_client import (
+            InvalidJobEvidence,
+            list_device_generations,
+            raise_item_error,
+            reset_session,
+        )
 
         from ._adapter_http import make_generation_listing
 
@@ -1166,12 +1209,16 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         ):
             with self.subTest(since_seq=since_seq, payload=payload):
                 reset_session()
-                mock_s.return_value = self._make_session(200, payload)
+                mock_s.return_value = self._make_session(200, [generation_wire(row, 5) for row in payload])
 
-                with self.assertRaisesRegex(AdapterError, "malformed generations listing") as raised:
-                    list_device_generations(5, since_seq=since_seq)
-
+                rows = list_device_generations(5, since_seq=since_seq)
+                self.assertEqual(rows[:-1], payload[:-1])
+                with self.assertRaises(InvalidJobEvidence) as raised:
+                    raise_item_error(rows[-1])
+                self.assertEqual(raised.exception.reason, "invalid settlement evidence")
                 self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertEqual(raised.exception.device_id, 5)
+                self.assertEqual(raised.exception.job_id, payload[-1]["carrier_job_id"])
 
     def test_the_page_limit_stays_within_what_the_adapter_accepts(self):
         """The one thing deriving the fixtures from the constant cannot check: its VALUE.
@@ -1208,8 +1255,8 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         ]
         session = make_session()
         session.request.side_effect = [
-            make_response(200, first_page),
-            make_response(200, final_page),
+            make_response(200, [generation_wire(row, 5) for row in first_page]),
+            make_response(200, [generation_wire(row, 5) for row in final_page]),
         ]
         mock_s.return_value = session
 
@@ -1230,7 +1277,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         from netbox_nso_plugin.adapter_client import (
             _GENERATION_PAGE_LIMIT,
             _GENERATION_PAGE_MAX,
-            AdapterError,
+            InvalidJobEvidence,
             list_device_generations,
         )
 
@@ -1249,7 +1296,9 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
             return make_response(
                 200,
                 [
-                    make_generation_listing(generation_id=seq, seq=seq, status="pending", settlement_cohort=None)
+                    generation_wire(
+                        make_generation_listing(generation_id=seq, seq=seq, status="pending", settlement_cohort=None), 5
+                    )
                     for seq in range(first_seq, first_seq + _GENERATION_PAGE_LIMIT)
                 ],
             )
@@ -1258,10 +1307,13 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         session.request.side_effect = full_page
         mock_s.return_value = session
 
-        with self.assertRaisesRegex(AdapterError, "more generation pages") as raised:
+        with self.assertRaises(InvalidJobEvidence) as raised:
             list_device_generations(5)
-
+        self.assertEqual(raised.exception.reason, "invalid settlement evidence")
         self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(raised.exception.device_id, 5)
+        self.assertIsNone(raised.exception.job_id)
+
         self.assertEqual(session.request.call_count, _GENERATION_PAGE_MAX)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)

@@ -1,0 +1,42 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba #}
+{# The audit of settlement acknowledgements: who, why, when, which job, and what each row became. #}
+<div class="card mb-3" id="nso-settlement-history">
+  <h5 class="card-header">Settlement acknowledgements</h5>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0 align-top">
+      <thead>
+        <tr><th>Time</th><th>Operator</th><th>Adapter job</th><th>Generations</th><th>Cursor</th><th>Row effects</th><th>Reason</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in settlement_history.entries %}
+          <tr data-acknowledgement-job="{{ entry.job_id }}" data-acknowledgement-generations="{{ entry.generation_ids|join:',' }}">
+            <td class="text-nowrap">{{ entry.at|isodatetime }}</td>
+            <td>{{ entry.actor }}</td>
+            <td class="text-nowrap">{{ entry.job_id }} (settle_seq {{ entry.settle_seq }})</td>
+            <td>{{ entry.generation_ids|join:", " }}</td>
+            <td>
+              {% if entry.historical %}
+                <span class="text-nowrap">Cursor {{ entry.cursor_before }}, unchanged.</span>
+                The cursor was already past the carrier of this job.
+              {% else %}
+                <span class="text-nowrap">Cursor {{ entry.cursor_before }} to {{ entry.cursor_after }}</span>
+              {% endif %}
+            </td>
+            <td>
+              {% for effect in entry.effects %}
+                <div data-effect="{{ effect.key }}"><span class="badge {{ effect.badge }} me-1">{{ effect.text }}</span>{{ effect.name }}</div>
+              {% empty %}
+                No rows
+              {% endfor %}
+            </td>
+            <td class="text-break">{{ entry.reason|linebreaksbr }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if settlement_history.truncated %}
+    <div class="card-footer small">Showing the {{ settlement_history.entries|length }} most recent acknowledgements.</div>
+  {% endif %}
+</div>

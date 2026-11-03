@@ -24,6 +24,7 @@ from ._adapter_http import _REAL_SESSION, make_response
 from ._authority_case import concurrent_writer
 from ._outbox_case import make_managed, reset_renderer_audit_rotation, without_commit_drain
 from ._settlement_case import _evidence_generation
+from ._settlement_wire import deployment_wire, generation_wire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_apply_selector import _promoted
 from .test_native_only_acquisition import NativeOnlyAdapter
@@ -81,24 +82,28 @@ class LACPNativeTopologyAdapter(NativeOnlyAdapter):
                 (row for row in rows if row["seq"] > params.get("since_seq", 0)),
                 key=lambda row: row["seq"],
             )
-            return make_response(200, rows[: params["limit"]])
+            return make_response(200, [generation_wire(row, self.device_id) for row in rows[: params["limit"]]])
         if method == "POST" and url.endswith("/deployment-evidence"):
             requested = kwargs["json"]["apply_attempt_ids"]
             self.evidence_reads.append(deepcopy(requested))
             return make_response(
                 200,
-                {
-                    "device_id": self.device_id,
-                    "head": None,
-                    "blocked": False,
-                    "write_work_pending": False,
-                    "held_jobs": [],
-                    "pending_generations": 0,
-                    "attempts": [self.attempts[attempt_id] for attempt_id in requested if attempt_id in self.attempts],
-                    "unknown_apply_attempt_ids": [
-                        attempt_id for attempt_id in requested if attempt_id not in self.attempts
-                    ],
-                },
+                deployment_wire(
+                    {
+                        "device_id": self.device_id,
+                        "head": None,
+                        "blocked": False,
+                        "write_work_pending": False,
+                        "held_jobs": [],
+                        "pending_generations": 0,
+                        "attempts": [
+                            self.attempts[attempt_id] for attempt_id in requested if attempt_id in self.attempts
+                        ],
+                        "unknown_apply_attempt_ids": [
+                            attempt_id for attempt_id in requested if attempt_id not in self.attempts
+                        ],
+                    }
+                ),
             )
         response = super()._handle(method, url, **kwargs)
         if method == "POST" and url.endswith("/actions/apply"):

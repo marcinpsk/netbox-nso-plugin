@@ -98,7 +98,7 @@ class NativeOnlyAdapter(_ApplyContractAdapter):
             return make_response(200, self.documents[endpoint])
         if method == "GET" and endpoint == "jobs":
             response = make_response(200, [])
-            response.headers["X-Store-Incarnation"] = "native-only-store"
+            response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000008"
             return response
         if method == "GET" and endpoint != "intent-receipts":
             raise AssertionError(f"Unserved adapter read: {url}")

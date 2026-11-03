@@ -12,7 +12,7 @@ from uuid import uuid4
 from dcim.models import Device
 from django.apps import apps
 from django.contrib import messages
-from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
+from django.core.exceptions import BadRequest, ObjectDoesNotExist, PermissionDenied, ValidationError
 from django.db import DatabaseError, transaction
 from django.http import Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -112,7 +112,9 @@ from .request_authorization import (
     Onboarding,
     OverlayFamily,
     OverlayRow,
+    SettlementIssueAcknowledgement,
     generic_policy,
+    may_acknowledge_settlement,
     parse_object_id,
     permitted_instance,
     shared_vlan_rename,
@@ -223,6 +225,8 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
         connection / last-sync banner and is the only adapter touch here.
         """
         from .adapter_client import AdapterError
+        from .refusal_display import settlement_stall_projection
+        from .settlement_display import acknowledgement_history, stall_exit
         from .summary import category_summaries, execution_summaries
         from .template_content import _STATUS_BADGE
 
@@ -302,10 +306,15 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
             logger.debug("Degraded deletion read failed for device %s", device.pk, exc_info=True)
             deletion_records = []
 
+        stall = settlement_stall_projection(mgmt)
         return {
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
             "execution_summaries": execution_summaries(mgmt),
+            "settlement_stall": stall,
+            "settlement_exit": stall_exit(mgmt, stall),
+            "settlement_history": acknowledgement_history(mgmt),
+            "can_acknowledge_settlement": may_acknowledge_settlement(request.user, mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
@@ -3748,6 +3757,41 @@ class NSOGenerationAbandonView(_NSOGenerationActionView):
     client_method = "abandon_generation"
 
 
+_REVISION_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+class NSOSettlementIssueAcknowledgeView(AuthorizedView):
+    """Acknowledge the settlement issue revision shown on the tab as outcome unknown."""
+
+    policy = {"post": EndpointPolicy(SettlementIssueAcknowledgement(), "adapter_action")}
+
+    def post(self, request, pk):
+        """Record the acknowledgement, then request the normal settlement pass after commit."""
+        from functools import partial
+
+        from django.db import transaction
+
+        from .settlement import request_settlement_pass
+        from .settlement_acknowledgement import AcknowledgementRefused, acknowledge
+        from .settlement_display import REFUSAL_TEXT, acknowledged_text
+
+        issue, device = self.target.primary, self.target.device
+        digest = request.POST.get("revision_digest", "")
+        if not _REVISION_DIGEST.fullmatch(digest):
+            raise BadRequest("Invalid settlement issue revision")
+        try:
+            receipt = acknowledge(issue, digest, request.user, request.POST.get("reason", ""))
+        except AcknowledgementRefused as exc:
+            messages.error(request, REFUSAL_TEXT[exc.code])
+            return redirect(_device_nso_tab_url(device.pk))
+        if receipt.replayed:
+            messages.info(request, acknowledged_text(receipt.issue, replayed=True))
+        else:
+            transaction.on_commit(partial(request_settlement_pass, device.pk))
+            messages.success(request, acknowledged_text(receipt.issue, replayed=False))
+        return redirect(_device_nso_tab_url(device.pk))
+
+
 def _job_with_outcome_counts(job):
     """Add the per-scope outcome counts that the tab's Apply failure message reads."""
     result = job.get("result")
@@ -4061,7 +4105,12 @@ class NSODeviceJobsView(AuthorizedView):
             generations = (
                 client.list_device_generations(mgmt.adapter_device_id, since_seq=since_seq) if generation_ids else []
             )
+            # Rows after a truncation are unread and can be requested ones, so the filter must not drop the marker.
+            for row in generations:
+                if isinstance(row, client.ListingTruncation):
+                    client.raise_item_error(row)
             generations = [row for row in generations if row.get("generation_id") in generation_ids]
+            client.raise_evidence_errors(generations)
             generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
             unlisted = _unlisted_device_jobs(mgmt.adapter_device_id, jobs, polled_job_ids | generation_job_ids)
         except AdapterError as exc:

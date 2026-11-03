@@ -73,6 +73,19 @@ def lock_device_intent_transaction(device_id: int) -> None:
         )
 
 
+def lock_device_management(device_id: int, **filters):
+    """Lock one device's management row after its device intent lock (L4 before L5)."""
+    from .models import NSODeviceManagement
+
+    lock_device_intent_transaction(device_id)
+    return (
+        NSODeviceManagement.objects.select_for_update(of=("self",))
+        .order_by()
+        .filter(device_id=device_id, **filters)
+        .first()
+    )
+
+
 def lock_shared_dependencies(keys) -> None:
     """Lock immutable shared renderer roots in canonical order."""
     if not connection.in_atomic_block:
