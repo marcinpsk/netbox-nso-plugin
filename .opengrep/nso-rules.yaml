@@ -70,10 +70,16 @@ rules:
       - pattern-either:
           - pattern: NSOOverlaySettlementFence.objects.filter(..., overlay_pk=$PK, ...)
           - pattern: NSOOverlaySettlementFence.objects.filter(..., overlay_pk__in=$PK, ...)
+          - pattern: $MODULE.NSOOverlaySettlementFence.objects.filter(..., overlay_pk=$PK, ...)
+          - pattern: $MODULE.NSOOverlaySettlementFence.objects.filter(..., overlay_pk__in=$PK, ...)
       - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management=$M, ...)
       - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management_id=$M, ...)
       - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management_id__in=$M, ...)
       - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management__device_id=$M, ...)
+      - pattern-not: $MODULE.NSOOverlaySettlementFence.objects.filter(..., management=$M, ...)
+      - pattern-not: $MODULE.NSOOverlaySettlementFence.objects.filter(..., management_id=$M, ...)
+      - pattern-not: $MODULE.NSOOverlaySettlementFence.objects.filter(..., management_id__in=$M, ...)
+      - pattern-not: $MODULE.NSOOverlaySettlementFence.objects.filter(..., management__device_id=$M, ...)
     paths:
       exclude: ["netbox_nso_plugin/tests/**"]
 
@@ -1080,15 +1086,19 @@ rules:
     message: A filter over a generation listing can drop its ListingTruncation marker, and the rows after the marker are unread. Raise the marker before the filter, as views.NSODeviceJobsView.get does, or keep it in the filter predicate.
     patterns:
       - pattern-either:
-          - pattern: '[$ROW for $ROW in $CLIENT.list_device_generations(...) if $COND]'
-          - pattern: '($ROW for $ROW in $CLIENT.list_device_generations(...) if $COND)'
+          - pattern: '[$VALUE for $ROW in $CLIENT.list_device_generations(...) if $COND]'
+          - pattern: '($VALUE for $ROW in $CLIENT.list_device_generations(...) if $COND)'
+          - pattern: '{$VALUE for $ROW in $CLIENT.list_device_generations(...) if $COND}'
+          - pattern: '{$KEY: $VALUE for $ROW in $CLIENT.list_device_generations(...) if $COND}'
           - patterns:
               - pattern-inside: |
                   $LIST = <... $CLIENT.list_device_generations(...) ...>
                   ...
               - pattern-either:
-                  - pattern: '[$ROW for $ROW in $LIST if $COND]'
-                  - pattern: '($ROW for $ROW in $LIST if $COND)'
+                  - pattern: '[$VALUE for $ROW in $LIST if $COND]'
+                  - pattern: '($VALUE for $ROW in $LIST if $COND)'
+                  - pattern: '{$VALUE for $ROW in $LIST if $COND}'
+                  - pattern: '{$KEY: $VALUE for $ROW in $LIST if $COND}'
       # An isinstance check counts only when its branch raises the marker.
       - pattern-not-inside: |
           for $R in $LIST:
