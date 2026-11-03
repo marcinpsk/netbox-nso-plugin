@@ -3535,3 +3535,21 @@ def reassigned_deployment_evidence_head(client, management, incarnation):
     evidence = released_head_evidence(management, incarnation, evidence)
     # ok: nso-deployment-evidence-head-release-bypass
     client.raise_evidence_errors(evidence)
+
+
+def unscoped_owner_fence(row):
+    # ruleid: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(model_label=row._meta.label_lower, overlay_pk=row.pk).first()
+    # ruleid: nso-owner-fence-unscoped-lookup
+    return NSOOverlaySettlementFence.objects.filter(model_label__in={"a"}, overlay_pk__in={row.pk})
+
+
+def scoped_owner_fence(row, management):
+    # ok: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(management=management, overlay_pk=row.pk).first()
+    # ok: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(management_id__in={management.pk}, overlay_pk__in={row.pk})
+    # ok: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(management__device_id=OuterRef("device_id"), overlay_pk=OuterRef("pk"))
+    # ok: nso-owner-fence-unscoped-lookup
+    return NSOOverlaySettlementFence.objects.filter(management_id=management.pk, overlay_pk=row.pk)

@@ -9,7 +9,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin.durable_capture import mapping_epoch
 from netbox_nso_plugin.models import NSOApplyExecution
-from netbox_nso_plugin.refusal_display import device_execution_summaries, document_projection
+from netbox_nso_plugin.refusal_display import INVALID, device_execution_summaries, document_projection
 
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import mirror_update
@@ -147,6 +147,15 @@ class TestDocumentExecutionDisplay(BGPSettlementHelpers, BGPCaptureCase):
         self.prepare()
         result = self.terminal()["carrier_job_result"]
         self.assertIn("commit not attempted", document_projection(result)["summary"])
+
+    def test_an_attributed_cause_outside_the_catalog_projects_as_invalid(self):
+        self.prepare()
+        result = self.terminal()["carrier_job_result"]
+        result["refusals"][0]["message_id"] = "placeholder.unknown_message"
+        self.assertEqual(
+            document_projection(result),
+            {"refusal": {"valid": False, "causes": [], "text": INVALID}, "refusal_text": INVALID, "summary": INVALID},
+        )
 
     def test_post_commit_cause_does_not_claim_rollback(self):
         result = self.ownerless(phase="post_commit_verification")
