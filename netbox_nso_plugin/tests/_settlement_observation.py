@@ -12,6 +12,7 @@ import hashlib
 import json
 
 from ._adapter_http import make_response
+from ._settlement_wire import job_wire
 
 INCARNATION = "00000000-0000-4000-8000-000000000004"
 
@@ -19,6 +20,18 @@ INCARNATION = "00000000-0000-4000-8000-000000000004"
 def failed_item(item, code="execution_contract"):
     """Keep the trusted identity and digest; drop the projection."""
     return {**item, "projection": None, "evidence_error": {"code": code, "digest": item["digest"]}}
+
+
+STRUCTURED_RESULT_KEYS = frozenset({"row_outcomes", "refusals", "settlement_owners", "commit_acknowledged"})
+
+
+def published_job(job):
+    """Publish a feed job as the adapter does: a terminal Apply without structured evidence is an error item."""
+    result = job["result"]
+    structured = isinstance(result, dict) and result.keys() >= STRUCTURED_RESULT_KEYS
+    if job["type"] in {"apply", "removal"} and job["status"] in {"succeeded", "failed"} and not structured:
+        return failed_item(job_wire(job))
+    return job_wire(job)
 
 
 def observation_document(original, url, body, device_id, incarnation):

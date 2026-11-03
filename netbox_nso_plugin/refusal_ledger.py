@@ -14,6 +14,8 @@ ISSUE_STATES = ("open", "resolved", "superseded", "acknowledged")
 STALL_CLASSES = ("invalid_evidence", "evidence_invariant")
 ISSUE_POSITIONS = ("next_feed", "historical")
 OWNER_EFFECTS = ("unavailable", "superseded", "missing_owner")
+# The custom action on NSODeviceManagement that permits acknowledging a settlement issue.
+ACKNOWLEDGE_SETTLEMENT_ISSUE = "acknowledge_settlement_issue"
 
 
 class NSOAcceptedSelection(models.Model):
