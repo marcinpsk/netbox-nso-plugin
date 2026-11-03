@@ -613,12 +613,40 @@ def _placeholder(execution):
     )
 
 
+def _member_executions(management, stall, members, epoch):
+    """Split the members' local executions into placeholders, the attempts that hold them, and references."""
+    from .models import NSOApplyExecution
+
+    references, placeholders, held, obligations, attempts = {}, {}, {}, set(), set()
+    executions = (
+        NSOApplyExecution.objects.filter(
+            management=management, adapter_device_id=management.adapter_device_id, generation_id__in=list(members)
+        )
+        .filter(Q(store_incarnation=stall.store_incarnation) | Q(store_incarnation__isnull=True))
+        .select_related("attempt")
+        .order_by("pk")
+    )
+    for execution in executions:
+        if execution.carrier_job_id == stall.job_id:
+            if execution.consumption_state != "unconsumed" and execution.consumption_state != "unresolved":
+                raise NotAcknowledgeable("resolved_obligation")
+            obligations.add(execution.pk)
+            if execution.mapping_epoch == epoch and _placeholder(execution):
+                placeholders[execution.generation_id] = execution.pk
+                continue
+            if execution.mapping_epoch == epoch and execution.store_incarnation == stall.store_incarnation:
+                # The commit resolves this exact execution, so its attempt owns the obligation.
+                held[execution.generation_id] = str(execution.attempt_id)
+            attempts.add(execution.attempt_id)
+        references[("execution", execution.pk)] = _execution_state(execution)
+    return references, placeholders, held, obligations, attempts
+
+
 def _references(management, stall, members, provenance, linked):
     """Run the complete dependency proof: every surface that can bind a member or its attempts."""
     from . import delivery
     from .models import (
         NSOAcceptedSelection,
-        NSOApplyExecution,
         NSOApplyOverlaySnapshot,
         NSOIntentOutboxState,
         NSOOverlaySettlementFence,
@@ -626,7 +654,6 @@ def _references(management, stall, members, provenance, linked):
     from .refusal_registry import OVERLAYS
 
     references = {}
-    placeholders = {}
     selections = set()
     epoch = mapping_epoch(management)
     for generation_id in members:
@@ -649,25 +676,11 @@ def _references(management, stall, members, provenance, linked):
                 ).exists()
             ):
                 references[("claim", stream, source)] = {"push_seq": source}
-    executions = list(
-        NSOApplyExecution.objects.filter(
-            management=management, adapter_device_id=management.adapter_device_id, generation_id__in=list(members)
-        )
-        .filter(Q(store_incarnation=stall.store_incarnation) | Q(store_incarnation__isnull=True))
-        .select_related("attempt")
-        .order_by("pk")
+    executions, placeholders, held, obligation_executions, attempts = _member_executions(
+        management, stall, members, epoch
     )
-    obligation_executions = set()
-    for execution in executions:
-        if execution.carrier_job_id == stall.job_id:
-            if execution.consumption_state != "unconsumed" and execution.consumption_state != "unresolved":
-                raise NotAcknowledgeable("resolved_obligation")
-            obligation_executions.add(execution.pk)
-            if execution.mapping_epoch == epoch and _placeholder(execution):
-                placeholders[execution.generation_id] = execution.pk
-                continue
-            linked = linked | {execution.attempt_id}
-        references[("execution", execution.pk)] = _execution_state(execution)
+    references.update(executions)
+    linked = linked | attempts
     for attempt in _attempt_rows_for(linked):
         references[("attempt", str(attempt.pk))] = _attempt_state(attempt)
     snapshot_query = (
@@ -688,7 +701,7 @@ def _references(management, stall, members, provenance, linked):
             "pk", "status", "apply_attempt_id"
         ):
             references[("overlay", label, pk)] = {"status": status, "apply_attempt_id": str(attempt_id)}
-    return references, placeholders, linked
+    return references, placeholders, held, linked
 
 
 def _attempt_rows_for(attempt_ids):
@@ -844,11 +857,11 @@ def _require_explained(management, stall, references, plan, members):
             raise NotAcknowledgeable("ownership_unbounded")
 
 
-def _obligation_attempt(owning, executed):
+def _obligation_attempt(owning, held):
     """Bind an obligation to the attempt that already holds its execution, as the commit requires."""
     if owning is None:
-        return executed
-    if executed not in (None, str(owning.pk)):
+        return held
+    if held not in (None, str(owning.pk)):
         raise NotAcknowledgeable("ownership_unbounded")
     return str(owning.pk)
 
@@ -883,7 +896,7 @@ def decide(management, stall, *, request=None, provenance=None) -> Decision:
     if not candidates <= set(attempts):
         raise NotAcknowledgeable("unbound_evidence")
     linked = _linked_attempts(management, stall, observation, members, candidates)
-    references, placeholders, linked = _references(management, stall, members, known, linked)
+    references, placeholders, held, linked = _references(management, stall, members, known, linked)
     plan = _Plan()
     if references:
         owning = _owning_attempts(management, stall, observation, members, linked)
@@ -893,17 +906,12 @@ def decide(management, stall, *, request=None, provenance=None) -> Decision:
     else:
         owning = dict.fromkeys(members)
     remote = _remote(observation)
-    executed = {
-        state["generation_id"]: state["attempt_id"]
-        for identity, state in references.items()
-        if identity[0] == "execution" and state["carrier_job_id"] == stall.job_id
-    }
     obligations = [
         {
             "generation_id": generation_id,
             "carrier_job_id": stall.job_id,
             "generation_seq": members[generation_id],
-            "attempt_id": _obligation_attempt(owning[generation_id], executed.get(generation_id)),
+            "attempt_id": _obligation_attempt(owning[generation_id], held.get(generation_id)),
             "placeholder_execution_id": placeholders.get(generation_id),
         }
         for generation_id in sorted(members)
