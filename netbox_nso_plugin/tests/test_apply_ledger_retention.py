@@ -601,3 +601,35 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
         self.assertFalse(NSOApplyExecution.objects.filter(settlement_issue=issue).exists())
         self.assertEqual(NSOSettlementIssue.objects.get(pk=issue.pk).state, "acknowledged")
+
+    def test_expired_unsent_preview_can_be_pruned_without_losing_a_submitted_attempt(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        from ._adapter_http import make_apply_preflight
+
+        old = timezone.now() - timedelta(days=31)
+        preview = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=1767,
+            preflight={"selected": {"vlan": 41}, "result": make_apply_preflight({"vlan": 41})},
+            selected={"vlan": 41},
+        )
+        NSOApplyAttempt.objects.filter(pk=preview.pk).update(created_at=old)
+        submitted = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=1767,
+            adapter_apply_attempt_id=uuid4(),
+            selected={"vlan": 41},
+        )
+        NSOApplyAttempt.objects.filter(pk=submitted.pk).update(created_at=old)
+        result = prune_apply_ledger(execute=True)
+        self.assertEqual(result.deleted, 1)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=preview.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=submitted.pk).exists())
+
+    def test_expired_manual_capture_without_preflight_keeps_its_execution(self):
+        attempt, execution = self.history()
+        NSOApplyAttempt.objects.filter(pk=attempt.pk).update(trigger_kind="manual")
+        self.prune(execute=True)
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertTrue(NSOApplyExecution.objects.filter(pk=execution.pk).exists())

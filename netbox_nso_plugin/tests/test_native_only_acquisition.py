@@ -11,7 +11,6 @@ from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.test import SimpleTestCase, TransactionTestCase
-from django.urls import reverse
 from ipam.models import ASN, RIR, VLAN, IPAddress, VLANGroup
 from netbox_routing.models import (
     BGPAddressFamily,
@@ -43,6 +42,7 @@ from netbox_nso_plugin.reconcile import run_device_reconcile
 from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
 
 from ._adapter_http import make_response
+from ._manual_capture_case import post_apply
 from ._outbox_case import make_managed, reset_renderer_audit_rotation, without_commit_drain
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -388,10 +388,7 @@ class TestNativeOnlyAcquisition(_CascadeFlushMixin, IntentPushResetMixin, Transa
         )
         self.assert_management_interface_unowned(device, me0)
         # The Apply runs before any cadence audit, so its pre-capture audit is the first ownership pass.
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200, response.content)
         self.assertTrue(self.adapter.apply_requests)
         self.assertTrue(self.adapter.requests)
@@ -442,17 +439,14 @@ class TestNativeOnlyAcquisition(_CascadeFlushMixin, IntentPushResetMixin, Transa
                         ]
                     self.assertIn(drain_key(device.pk, delivery_scope, force=True), (NOTHING, SUCCEEDED))
                     self.assert_no_acquisition(device)
-                    response = self.client.post(
-                        reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(management.pk, "apply")),
-                        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-                    )
+                    response = post_apply(self.client, management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
                     self.assertEqual(response.status_code, 200, response.content)
                     self.assertTrue(self.adapter.apply_requests)
                     self.assertTrue(self.adapter.requests)
                     for body in intent_bodies(self.adapter.requests, self.adapter.apply_requests):
                         self.assertFalse(contains_wire_marker(body, wire_marker), body)
                     for body in self.adapter.apply_requests:
-                        self.assertEqual(set(body), {"apply_attempt_id", "selected"})
+                        self.assertEqual(set(body), {"apply_attempt_id", "selected", "preflight_identity"})
                         self.assertTrue(all(type(revision) is int for revision in body["selected"].values()), body)
                     self.assert_no_acquisition(device)
 

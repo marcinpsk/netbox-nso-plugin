@@ -14,6 +14,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin.models import NSOSubinterfaceState, NSOSwitchportState
 
+from ._manual_capture_case import post_apply
 from ._outbox_case import ReceiptAdapter, make_managed, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -23,7 +24,8 @@ class TestUnitZeroSwitchportOwnership(_CascadeFlushMixin, IntentPushResetMixin, 
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.delivery import MODE_STORE_ONLY, render
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
-        from netbox_nso_plugin.views import _prepare_apply
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         device, management = make_managed("unit0flow", 17540)
         with without_commit_drain(), transaction.atomic():
@@ -43,7 +45,7 @@ class TestUnitZeroSwitchportOwnership(_CascadeFlushMixin, IntentPushResetMixin, 
             drain.push_now(device.pk, "subinterface", mode=MODE_STORE_ONLY, force=True)
             audit_renderer_scopes(device.pk, ["subinterface"], "test")
             self.assertEqual(render("subinterface", device.pk, management.adapter_device_id).payload, [])
-            _prepare_apply(management)
+            prepare_and_confirm_apply(management)
         self.assertFalse(NSOSubinterfaceState.objects.filter(management=management).exists())
 
 
@@ -271,10 +273,7 @@ class TestOwnedSubinterfaceDelivery(_CascadeFlushMixin, IntentPushResetMixin, Tr
         config, session = adapter.patches()
         with config, session:
             drain.push_now(self.device.pk, "subinterface", force=True)
-            apply_response = self.client.post(
-                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"]),
-                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-            )
+            apply_response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(apply_response.status_code, 200)
         self.assertEqual(apply_response.json()["status"], "ok")
         self.assertEqual(len(adapter.apply_requests), 1)
@@ -309,10 +308,7 @@ class TestOwnedSubinterfaceDelivery(_CascadeFlushMixin, IntentPushResetMixin, Tr
         config, session = adapter.patches()
         with config, session:
             drain.push_now(self.device.pk, "subinterface", mode=MODE_STORE_ONLY, force=True)
-            response = self.client.post(
-                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"]),
-                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-            )
+            response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
         self.assertEqual(len(adapter.apply_requests), 1)
@@ -335,7 +331,9 @@ class TestOwnedSubinterfaceDelivery(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
     def test_bad_owned_row_stays_visible_and_blocks_apply_until_repaired(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.views import ApplyPreparationRefused, _prepare_apply
+        from netbox_nso_plugin.views import ApplyPreparationRefused
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         with without_commit_drain(), transaction.atomic():
             parent = Interface.objects.create(device=self.device, name="ae99", type="lag")
@@ -359,7 +357,7 @@ class TestOwnedSubinterfaceDelivery(_CascadeFlushMixin, IntentPushResetMixin, Tr
             )
             self.assertContains(category, "validation_error")
             with self.assertRaises(ApplyPreparationRefused) as raised:
-                _prepare_apply(self.management)
+                prepare_and_confirm_apply(self.management)
             self.assertEqual(raised.exception.key, "subinterface")
             self.assertEqual(
                 [request for request in adapter.requests if request["url"].endswith("/subinterface-intent")],

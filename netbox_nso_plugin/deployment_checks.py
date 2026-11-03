@@ -9,7 +9,7 @@ from . import adapter_client
 from .deployment_probe import _require, authority
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution, NSODeviceManagement
 
-PLUGIN_MIGRATION_HEAD = "0041_settle_resume_pending"
+PLUGIN_MIGRATION_HEAD = "0042_nsoapplyattempt_preflight"
 
 
 def check_contracts():

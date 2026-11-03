@@ -330,6 +330,7 @@
             data-preview-url="{% url 'plugins:netbox_nso_plugin:device_apply_preview' object.pk %}"
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'apply' %}">
         {% csrf_token %}
+        <input type="hidden" name="apply_preview" value="">
         <button type="submit" class="btn btn-success nso-action-btn">
           <span class="mdi mdi-upload-network"></span> Apply Intent
         </button>
@@ -683,9 +684,9 @@
   </div>
 
   <script>
+  var csrfToken = document.querySelector('input[name=csrfmiddlewaretoken]')?.value || '';
   (function () {
     "use strict";
-    var csrfToken = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
     var statusArea = document.getElementById('nso-job-status');
     var spinner = document.getElementById('nso-job-spinner');
     var messageEl = document.getElementById('nso-job-message');
@@ -876,7 +877,12 @@
           body: new URLSearchParams(new FormData(form)),
         });
         var data = await r.json();
-        if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
+        if (data.status === 'preflight_stale') {
+          setButtons(false);
+          await openApply();
+          setStatus(data.message, 'warning', false);
+        }
+        else if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
         else if (data.status === 'no_op') { setStatus(data.message || 'Nothing to do.', 'info', false); setButtons(false); }
         else if (data.status === 'conflict') {
           // Poll the incumbent under its own name and use the server's admission wording.
@@ -959,7 +965,8 @@
     //    diff2html; device-native syntax available behind a toggle. ──────────────
     var diffMode = 'line-by-line';           // 'line-by-line' | 'side-by-side' | 'native'
     var cliDevicesOnly = true;               // #92: hide the intent-tree part of the cli diff
-    var previewCache = {};                   // outformat → parsed preview response
+    var previewCache = {};
+    var previewLoading = false;
 
     // #92: reduce the cli tree-diff to its top-level `devices { … }` block. The cli
     // outformat shows the WHOLE NSO transaction — device config plus the intent-tree
@@ -1065,12 +1072,20 @@
       }).join('');
     }
 
+    function renderStreamVerdicts(d) {
+      return Object.keys(d.streams || {}).sort().map(function (stream) {
+        var verdict = d.streams[stream];
+        return '<p class="text-break"><strong>' + esc(stream) + ': ' + esc(verdict.status)
+          + '</strong> ' + esc(verdict.message || '') + '</p>';
+      }).join('');
+    }
+
     function renderPreview(d) {
       // Keyed on THIS payload (not the cli-based skip decision): a non-empty dry-run
       // must render the two-panel layout even with zero itemised rows (#107).
       var hasDiff = d.device_diff && Object.keys(d.device_diff).length;
-      if (!d.total && !hasDiff && d.diff_available) { return '<p class="text-muted mb-0">No itemised pending changes. No device change for this generation.</p>'; }
-      return refusalNotice(d)
+      if (!d.streams && !d.total && !hasDiff && d.diff_available) { return '<p class="text-muted mb-0">No itemised pending changes. No device change for this generation.</p>'; }
+      return '<p class="text-break">' + esc(d.message || '') + '</p>' + renderStreamVerdicts(d) + refusalNotice(d)
         + '<div class="row g-3">'
         + '  <div class="col-lg-4"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
         +      renderIntentPanel(d)
@@ -1084,12 +1099,27 @@
     }
 
     async function fetchPreview(fmt) {
-      if (previewCache[fmt]) return previewCache[fmt];
-      var r = await fetch(applyForm.dataset.previewUrl + '?outformat=' + fmt,
-                          { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
-      var d = await r.json();
-      previewCache[fmt] = d;
-      return d;
+      if (!previewCache.payload) {
+        var r = await fetch(applyForm.dataset.previewUrl, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken },
+        });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.message || 'Apply preparation failed.');
+        previewCache.payload = d;
+        var field = applyForm.querySelector('[name="apply_preview"]');
+        if (!field) {
+          field = document.createElement('input');
+          field.type = 'hidden'; field.name = 'apply_preview'; applyForm.appendChild(field);
+        }
+        field.value = d.apply_preview || '';
+        if (confirmBtn) confirmBtn.disabled = d.can_apply !== true;
+      }
+      var result = Object.assign({}, previewCache.payload, { outformat: fmt });
+      if (result.device_diffs) {
+        result.device_diff = result.device_diffs[fmt] ? { device_intent: result.device_diffs[fmt] } : {};
+      }
+      return result;
     }
 
     async function rerenderPreview() {
@@ -1111,23 +1141,25 @@
     }
 
     async function openApply() {
-      if (!applyForm) return;
+      if (!applyForm || previewLoading) return;
+      previewLoading = true;
       try {
         previewCache = {};
-        // The skip-modal decision always reads the cli (full-NSO-transaction) preview:
-        // outformat=native is device syntax only, which is legitimately EMPTY for a
-        // byte-exact adoption commit — deciding on it would auto-proceed past the very
-        // transaction the modal exists to confirm (#107). nothing_pending comes from
-        // the server: total==0 AND an empty dry-run diff (row counts alone miss
-        // adoption-only applies, where accepted-as-matching rows sit in_sync).
+        if (confirmBtn) confirmBtn.disabled = true;
         var d = await fetchPreview('cli');
-        if (d.auto_apply || d.nothing_pending) { runAction(applyForm); return; }  // nothing to commit (or auto-apply) → just go
+        if (d.can_apply === true && d.nothing_pending) { runAction(applyForm); return; }
         modalBody.innerHTML = renderPreview(diffMode === 'native' ? await fetchPreview('native') : d);
         showModal();
       } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
+      finally { previewLoading = false; }
     }
 
-    if (confirmBtn) { confirmBtn.addEventListener('click', function () { hideModal(); runAction(applyForm); }); }
+    if (applyForm && new URLSearchParams(window.location.search).get('apply_preview') === '1') openApply();
+
+    if (confirmBtn) { confirmBtn.addEventListener('click', function () {
+      if (confirmBtn.disabled) return;
+      confirmBtn.disabled = true; hideModal(); runAction(applyForm);
+    }); }
 
     document.querySelectorAll('.nso-action-form').forEach(function (form) {
       form.addEventListener('submit', function (e) {
@@ -1393,10 +1425,6 @@
     // re-fetch (q + page, no reconcile) and AJAX Accept (keeps the card open).
     (function () {
       "use strict";
-      function csrf() {
-        var el = document.querySelector('input[name=csrfmiddlewaretoken]');
-        return (el && el.value) || (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
-      }
       function esc(s) { var d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
       function flash(pager, text, type) {
         var m = pager.querySelector('.nso-cat-msg');
@@ -1449,7 +1477,7 @@
         form.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
         fetch(form.action, {
           method: 'POST',
-          headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrf(), 'Content-Type': 'application/x-www-form-urlencoded' },
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': csrfToken, 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams(new FormData(form)),
         }).then(function (r) {
           return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, data: d }; });

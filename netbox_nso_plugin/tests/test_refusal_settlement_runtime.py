@@ -11,6 +11,7 @@ from django.urls import reverse
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._manual_capture_case import post_apply
 from ._settlement_wire import generation_wire, job_wire
 from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
@@ -1314,10 +1315,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             raise requests.ConnectionError("The admission response was lost.")
 
         self.adapter.apply_response = lost_answer
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(answer.status_code, 502, answer.content)
         no_op = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         self.assertNotEqual(no_op.pk, manual.pk)
@@ -1510,10 +1508,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 return 202, response
 
             self.adapter.apply_response = admission
-            answer = self.client.post(
-                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-            )
+            answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
             self.assertEqual(answer.status_code, 200, answer.content)
             self.attempt = NSOApplyAttempt.objects.get(
                 pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"])

@@ -500,20 +500,85 @@ def _write_values(row, values):
         target.save(update_fields=values)
 
 
-def promote_snapshots(attempt):
+def record_preflight(attempt, preflight):
+    """Store admission and blocked causes without promoting any owner."""
+    from .apply_preflight import confirm_selection, verdict_message
     from .apply_state import IntentChangedDuringPreparation
     from .lifecycle_fence import advance_fence
+    from .refusal_display import attributed_projection
+    from .status_machine import ACCEPT, ACCEPTED, APPLY_FAILED, advance
+
+    with _snapshot_transaction(attempt.pk) as (locked, management, snapshots, rows, revisions):
+        if locked.preflight is not None or locked.adapter_apply_attempt_id is not None:
+            raise IntentChangedDuringPreparation
+        if any(
+            not _matches(item, rows.get((item.model_label, item.overlay_pk)), management, revisions, "prior")
+            for item in snapshots
+        ):
+            raise IntentChangedDuringPreparation
+        for item in snapshots:
+            verdicts = [preflight["streams"][entry["stream"]] for entry in item.contributors["rows"]]
+            blocked = [verdict for verdict in verdicts if verdict["status"] == "blocked"]
+            if not blocked:
+                continue
+            row = rows[(item.model_label, item.overlay_pk)]
+            causes = [cause for verdict in blocked for cause in verdict.get("refusals", [])]
+            message = " | ".join(sorted({verdict_message(verdict) for verdict in blocked}))
+            error = message
+            if OVERLAYS[item.model_label].error_type == "JSONField":
+                error = {"message": message}
+                if causes:
+                    error["refusals"] = attributed_projection(causes)["causes"]
+            status = advance(row.status, ACCEPT, to=ACCEPTED) if row.status == APPLY_FAILED else row.status
+            _write_values(row, {"status": status, "last_apply_error": error})
+            item.expected_fence_revision = advance_fence(row).bookkeeping_revision
+            item.prior_status = status
+            item.prior_last_apply_error = error
+            item.save(update_fields=("expected_fence_revision", "prior_status", "prior_last_apply_error"))
+        locked.preflight = {"selected": locked.selected, "result": preflight}
+        locked.selected = confirm_selection(preflight, locked.selected) if preflight["status"] == "ready" else {}
+        locked.save(update_fields=("preflight", "selected"))
+        attempt.preflight, attempt.selected = locked.preflight, locked.selected
+
+
+def _promote_snapshot(item, target, attempt, admitted):
+    from .lifecycle_fence import advance_fence
+
+    streams = {entry["stream"] for entry in item.contributors["rows"]}
+    if not streams <= admitted:
+        for field in _BOOKKEEPING:
+            setattr(item, f"expected_{field}", copy.deepcopy(getattr(item, f"prior_{field}")))
+        item.settlement_disposition = "not_applied"
+        item.save(update_fields=(*("expected_" + field for field in _BOOKKEEPING), "settlement_disposition"))
+        return
+    if item.expected_status == "deploying" and item.expected_apply_attempt_id == attempt.pk:
+        item.expected_last_apply_at = timezone.now()
+        item.save(update_fields=("expected_last_apply_at",))
+    if any(getattr(item, f"prior_{field}") != getattr(item, f"expected_{field}") for field in _BOOKKEEPING):
+        _write_bookkeeping(target, item, "expected")
+        item.expected_fence_revision = advance_fence(target, current_attempt=attempt).bookkeeping_revision
+        item.save(update_fields=("expected_fence_revision",))
+
+
+def promote_snapshots(attempt):
+    """Promote manual snapshots and return whether this is the first submission."""
+    from .apply_state import IntentChangedDuringPreparation
 
     if connection.in_atomic_block:
         raise RuntimeError("manual snapshots must commit before promotion")
     with _snapshot_transaction(attempt.pk) as (locked, management, snapshots, rows, revisions):
-        if locked.trigger_kind != "manual" or locked.adapter_apply_attempt_id is not None:
+        if locked.trigger_kind != "manual" or locked.adapter_apply_attempt_id not in (None, locked.pk):
             raise IntentChangedDuringPreparation
         if (
             locked.adapter_device_id != management.adapter_device_id
             or locked.source_epoch != management.adapter_source_epoch
         ):
             raise IntentChangedDuringPreparation
+        if locked.adapter_apply_attempt_id == locked.pk:
+            if locked.response is not None and locked.http_status not in (200, 202):
+                raise IntentChangedDuringPreparation
+            attempt.adapter_apply_attempt_id = locked.pk
+            return False
         if revisions != locked.scope_revisions or management.source_rekey_pending:
             raise IntentChangedDuringPreparation
         epoch = mapping_epoch(management)
@@ -537,15 +602,15 @@ def promote_snapshots(attempt):
             for item in snapshots
         ):
             raise IntentChangedDuringPreparation
+        if locked.preflight is None or locked.preflight["result"]["status"] != "ready":
+            raise IntentChangedDuringPreparation
+        admitted = set(locked.preflight["result"]["admitted_selection"])
         for item in snapshots:
-            if any(getattr(item, f"prior_{field}") != getattr(item, f"expected_{field}") for field in _BOOKKEEPING):
-                target = rows[(item.model_label, item.overlay_pk)]
-                _write_bookkeeping(target, item, "expected")
-                item.expected_fence_revision = advance_fence(target, current_attempt=locked).bookkeeping_revision
-                item.save(update_fields=("expected_fence_revision",))
+            _promote_snapshot(item, rows[(item.model_label, item.overlay_pk)], locked, admitted)
         locked.adapter_apply_attempt_id = locked.pk
         locked.save(update_fields=("adapter_apply_attempt_id",))
         attempt.adapter_apply_attempt_id = locked.pk
+        return True
 
 
 def restore_attempt(attempt_id, keep_streams=()):

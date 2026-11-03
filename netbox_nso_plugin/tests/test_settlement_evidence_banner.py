@@ -13,7 +13,7 @@ from netbox_nso_plugin.durable_capture import mapping_epoch
 from netbox_nso_plugin.refusal_display import settlement_stall_projection
 from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-from ._adapter_http import make_generation_listing, make_response
+from ._adapter_http import make_generation_listing, make_response, make_stored_preflight
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import mirror_update
 from ._settlement_wire import deployment_wire, generation_wire, job_wire
@@ -348,6 +348,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             management=self.management,
             adapter_device_id=self.management.adapter_device_id,
             selected={"bgp": 7},
+            preflight=make_stored_preflight({"bgp": 7}),
         )
         attempt.adapter_apply_attempt_id = attempt.pk
         attempt.save(update_fields=("adapter_apply_attempt_id",))

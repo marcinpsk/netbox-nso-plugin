@@ -58,7 +58,10 @@ def test_generation_wire_keys_match_the_live_adapter_contract():
         )
         assert prepared["status"] == "prepared"
         attempt_id = uuid4()
-        admitted = client.trigger_apply(device_id, attempt_id, {"lag": prepared["selection_revision"]})
+        selected = {"lag": prepared["selection_revision"]}
+        preflight = client.apply_preflight(device_id, selected)
+        assert preflight["status"] == "ready", preflight
+        admitted = client.trigger_apply(device_id, attempt_id, selected, preflight["preflight_identity"])
         assert admitted["outcome"] == "promoted"
 
         evidence = client.get_deployment_evidence(device_id, [attempt_id])

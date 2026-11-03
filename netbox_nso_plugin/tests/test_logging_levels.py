@@ -766,7 +766,8 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOAcceptedSelection, NSOApplyOverlaySnapshot
         from netbox_nso_plugin.template_content import _reconcile_logging_config
-        from netbox_nso_plugin.views import _prepare_apply
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         adapter = ReceiptAdapter()
         config, session = adapter.patches()
@@ -778,7 +779,7 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             self.assertEqual(
                 len([request for request in adapter.requests if request["url"].endswith("/logging-intent")]), 1
             )
-            prepared, selected = _prepare_apply(self.mgmt)
+            prepared, selected = prepare_and_confirm_apply(self.mgmt)
 
         logging_pushes = [request for request in adapter.requests if request["url"].endswith("/logging-intent")]
         self.assertEqual(len(logging_pushes), 2)

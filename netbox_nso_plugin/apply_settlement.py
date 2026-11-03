@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from functools import cached_property
 from uuid import UUID
 
+from django.db import transaction
 from django.utils import timezone
 
 from .refusal_contract import GENERATION_FIELDS, ContractError
@@ -710,7 +711,7 @@ def deployment_evidence_attempt_ids(management) -> tuple[UUID, ...]:
 
 def _record_replay_answer(attempt, result=None, error=None):
     """Persist verified admission facts and return any later restoration decision."""
-    from .models import NSOApplyAttempt
+    from .apply_submission import record_response
 
     if isinstance(result, dict):
         if result.get("outcome") not in ("promoted", "no_op"):
@@ -723,14 +724,8 @@ def _record_replay_answer(attempt, result=None, error=None):
     else:
         return None
     keep_streams = _admission_keep_streams(attempt, response, rejected=error is not None)
-    updated = NSOApplyAttempt.objects.filter(pk=attempt.pk, response__isnull=True).update(
-        http_status=status,
-        response=response,
-    )
-    if updated != 1:
-        stored = NSOApplyAttempt.objects.get(pk=attempt.pk)
-        if stored.http_status != status or stored.response != response:
-            raise EvidenceInvariantError("An Apply replay changed its stored admission answer")
+    if not record_response(attempt.pk, http_status=status, response=response, send_seq=attempt.send_seq):
+        return None
     if keep_streams is not None:
         return attempt.pk, keep_streams
     return None
@@ -771,14 +766,23 @@ def _validated_unknown_attempt_ids(evidence, attempt_ids) -> set[UUID]:
 def _replay_apply_answer(management, attempt):
     """Validate a replay answer before reconciliation can use its admission facts."""
     from . import adapter_client as client
+    from .apply_preflight import request_identity
+    from .apply_submission import claim_send, record_response
     from .settlement_schemas import validate_settlement_response
 
+    identity = request_identity(attempt)
+    if not claim_send(attempt):
+        return None
     try:
-        result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
+        result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected, identity)
     except client.AdapterError as exc:
         if exc.code == "invalid_response" and exc.status_code is None:
             raise EvidenceInvariantError("invalid_apply_replay_response") from exc
         if exc.status_code != 409 or exc.code != "conflict":
+            if exc.definitely_not_enqueued and not record_response(
+                attempt.pk, http_status=exc.status_code, response=exc.rejection_response, send_seq=attempt.send_seq
+            ):
+                return None
             return attempt, None, exc
         job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
         logger.info(
@@ -1143,7 +1147,34 @@ def validate_carrier_under_lock(management, evidence):
     NSOAcceptedSelection.objects.filter(management=management, binding_state="bound").exclude(
         store_incarnation=read.store_incarnation
     ).update(binding_state="invalidated")
+    _record_journal_rejections(management, evidence)
     _record_replay_answers(evidence.replay_answers)
+
+
+def _record_journal_rejections(management, evidence):
+    """Retain UUID-bound rejections before the adapter can prune its admission journal."""
+    from .models import NSOApplyAttempt
+
+    rejected = [raw for raw in evidence["attempts"] if raw["admission_state"] == "rejected"]
+    if not rejected:
+        return
+    with transaction.atomic():
+        list(
+            NSOApplyAttempt.objects.select_for_update()
+            .filter(management=management, pk__in=[raw["apply_attempt_id"] for raw in rejected])
+            .order_by("pk")
+        )
+        local, validated, _unknown = _load_attempts(
+            management,
+            {**evidence, "attempts": rejected},
+            store_incarnation=evidence.store_incarnation,
+            settlement_sequences=evidence.settlement_sequences,
+        )
+        for attempt_id, raw in validated.items():
+            if local[attempt_id].response is None:
+                NSOApplyAttempt.objects.filter(pk=attempt_id).update(
+                    http_status=raw["http_status"], response=raw["response"]
+                )
 
 
 def _carrier_generations(bound):

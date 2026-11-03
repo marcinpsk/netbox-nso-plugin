@@ -6,11 +6,10 @@ import copy
 from datetime import timedelta
 from uuid import UUID
 
-from django.urls import reverse
-
 from netbox_nso_plugin.models import NSOApplyAttempt
 from netbox_nso_plugin.refusal_registry import OVERLAYS
 
+from ._manual_capture_case import post_apply
 from ._settlement_wire import deployment_wire, generation_wire, job_wire
 from .test_apply_selector import _promoted
 
@@ -45,10 +44,7 @@ class BGPSettlementHelpers:
             (row._meta.label_lower, row.pk): (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id)
             for row in self.owners
         }
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(answer.status_code, 200, answer.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
 
@@ -448,10 +444,7 @@ class BGPSettlementHelpers:
             delivery_keys()[key].section for row in owners for key in OVERLAYS[row._meta.label_lower].delivery_keys
         }
         self.adapter.apply_response = lambda selected: (202, promoted_streams(selected, streams))
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200, response.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
 

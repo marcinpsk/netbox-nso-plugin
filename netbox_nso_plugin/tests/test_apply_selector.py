@@ -15,8 +15,8 @@ from requests.exceptions import ConnectionError
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
-from ._adapter_http import make_response
-from ._manual_capture_case import store_apply_selection
+from ._adapter_http import make_apply_preflight, make_response
+from ._manual_capture_case import promote_preflighted_intent, store_apply_selection
 from ._outbox_case import (
     ReceiptAdapter,
     content_update,
@@ -144,12 +144,14 @@ class _ApplyContractAdapter(ReceiptAdapter):
         self.direct_requests: list[str] = []
 
     def _handle(self, method, url, **kwargs):
+        if method == "POST" and url.endswith("/actions/apply-preflight"):
+            return make_response(200, make_apply_preflight(kwargs["json"]["selected"]))
         if method == "POST" and url.endswith("/actions/apply"):
             body = kwargs.get("json")
             self.apply_requests.append(body)
             if (
                 not isinstance(body, dict)
-                or set(body) != {"apply_attempt_id", "selected"}
+                or set(body) != {"apply_attempt_id", "selected", "preflight_identity"}
                 or not isinstance(body["selected"], dict)
             ):
                 # Copied from ../nso-adapter/tests/api/openapi_snapshot.json,
@@ -286,12 +288,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def _post(self, adapter):
         adapter.preparation_revisions = self.preparation_revisions
         config, session = adapter.patches()
-        url = reverse(
-            "plugins:netbox_nso_plugin:nsodevicemanagement_action",
-            args=[self.mgmt.pk, "apply"],
-        )
         with config, session:
-            return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            from ._manual_capture_case import post_apply
+
+            return post_apply(self.client, self.mgmt, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
     def _promotion_snapshot(self):
         registry, pushed, self.direct_selection = store_apply_selection(self.mgmt)
@@ -636,23 +636,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(isis_receipt["params"], {"store_only": "true"})
 
     def test_a_raised_preparation_push_aborts_apply_after_a_sibling_succeeds(self):
-        from unittest.mock import patch
-
-        from netbox_nso_plugin import drain
-
         adapter = _ApplyContractAdapter(
             lambda selected: (202, _promoted(selected)),
-            accepted_intent_suffixes=("-intent", "/intent"),
+            failed_intent_suffix="/isis-interface-intent",
         )
-        real_push_now = drain.push_now
-
-        def push_now(device_id, scope, **kwargs):
-            if scope == "isis":
-                raise RuntimeError("IS-IS preparation failed")
-            return real_push_now(device_id, scope, **kwargs)
-
-        with patch("netbox_nso_plugin.drain.push_now", side_effect=push_now):
-            response = self._post(adapter)
+        response = self._post(adapter)
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["status"], "error")
@@ -762,12 +750,13 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_a_foreign_rename_after_preparation_repends_on_the_next_audit(self):
         """A foreign rename stays neutral until the next audit repairs its scope."""
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
-        from netbox_nso_plugin.views import _prepare_apply
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
         config, session = adapter.patches()
         with config, session:
-            _prepare_apply(self.mgmt)
+            prepare_and_confirm_apply(self.mgmt)
 
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
@@ -827,12 +816,14 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from uuid import uuid4
 
         from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.views import _prepare_apply, _rollback_prepare_apply
+        from netbox_nso_plugin.views import _rollback_prepare_apply
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
         config, session = adapter.patches()
         with config, session:
-            prepared, _selected = _prepare_apply(self.mgmt)
+            prepared, _selected = prepare_and_confirm_apply(self.mgmt)
         newer_attempt_id = uuid4()
         mirror_update(
             NSOVLANState.objects.get(pk=self.vlan_state.pk),
@@ -846,12 +837,14 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.apply_attempt_id, newer_attempt_id)
 
     def test_the_inline_vlan_editor_repends_the_deploying_scope(self):
-        from netbox_nso_plugin.views import _prepare_apply, _save_vlan_name_edit
+        from netbox_nso_plugin.views import _save_vlan_name_edit
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
         config, session = adapter.patches()
         with config, session:
-            _prepare_apply(self.mgmt)
+            prepare_and_confirm_apply(self.mgmt)
 
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
@@ -886,7 +879,6 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(state.status, "accepted")
 
     def test_a_stale_edit_footprint_repends_only_the_changed_promoted_owner(self):
-        from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
@@ -910,7 +902,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         stale_footprint = footprint_for_instance(first)
         registry, pushed = self._promotion_snapshot()
         next_attempt_id = uuid4()
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             self.mgmt,
             registry,
             pushed,
@@ -2142,8 +2134,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_a_vlan_id_change_repends_every_scope_that_renders_the_vid(self):
 
         from netbox_nso_plugin.models import NSOSVIState, NSOSwitchportState
-        from netbox_nso_plugin.views import _prepare_apply
         from netbox_nso_plugin.vlan_reconciler import save_vlan_content
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         # The SVI overlay links the device VLAN whose VID change repends this scope.
         interface = self._create_interface(device=self.device, name="Vlan1558", type="virtual")
@@ -2177,7 +2170,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
         config, session = adapter.patches()
         with config, session:
-            _prepare_apply(self.mgmt)
+            prepare_and_confirm_apply(self.mgmt)
 
         self.vlan_state.refresh_from_db()
         svi_state.refresh_from_db()
@@ -2228,8 +2221,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             NSOSVIState,
             NSOSwitchportState,
         )
-        from netbox_nso_plugin.views import _prepare_apply
 
+        from ._manual_capture_case import prepare_and_confirm_apply
         from .test_management_control_audit import _probe_lock
 
         with without_commit_drain(), transaction.atomic():
@@ -2381,7 +2374,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
         config, session = adapter.patches()
         with config, session:
-            _prepare_apply(self.mgmt)
+            prepare_and_confirm_apply(self.mgmt)
 
         prepared = [type(state).objects.get(pk=state.pk).status for state in states]
         self.assertEqual(prepared[:4], ["deploying"] * 4)
@@ -2419,7 +2412,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from unittest.mock import patch
 
         from netbox_nso_plugin import renderer_audit, views
-        from netbox_nso_plugin.views import _prepare_apply
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         real_audit = renderer_audit.audit_renderer_scopes
         real_direct = views._push_direct_snapshots
@@ -2443,7 +2437,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             patch.object(renderer_audit, "audit_renderer_scopes", _recording_audit),
             patch.object(views, "_push_direct_snapshots", _recording_direct),
         ):
-            _prepare_apply(self.mgmt)
+            prepare_and_confirm_apply(self.mgmt)
 
         self.assertEqual(order, ["finalize-audit", "switching-preparation"])
 
@@ -2709,11 +2703,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_promotion_does_not_render_under_its_locks(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin import apply_state
-
         registry, pushed = self._promotion_snapshot()
         with patch("netbox_nso_plugin.delivery.render", side_effect=AssertionError("promotion rendered")):
-            attempt = apply_state.promote_current_intent(
+            attempt = promote_preflighted_intent(
                 self.mgmt,
                 registry,
                 pushed,
@@ -2774,7 +2766,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         worker.start()
         try:
             self.assertTrue(row_locked.wait(10), "the reconcile did not lock the intent row")
-            attempt = apply_state.promote_current_intent(
+            attempt = promote_preflighted_intent(
                 self.mgmt,
                 registry,
                 pushed,
@@ -2814,7 +2806,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertGreater(revision.revision, pushed["vlan"].revision)
         attempt_id = uuid4()
         with self.assertRaises(apply_state.IntentChangedDuringPreparation):
-            apply_state.promote_current_intent(
+            promote_preflighted_intent(
                 self.mgmt,
                 registry,
                 pushed,
@@ -2850,7 +2842,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertGreater(revision.revision, pushed["vlan"].revision)
         attempt_id = uuid4()
         with self.assertRaises(apply_state.IntentChangedDuringPreparation):
-            apply_state.promote_current_intent(
+            promote_preflighted_intent(
                 self.mgmt,
                 registry,
                 pushed,
@@ -2866,11 +2858,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_promotion_stamps_the_apply_start_time(self):
         from django.utils import timezone
 
-        from netbox_nso_plugin import apply_state
-
         registry, pushed = self._promotion_snapshot()
         promotion_started_at = timezone.now()
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             self.mgmt,
             registry,
             pushed,
@@ -2963,7 +2953,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(attempt.response, _no_op(attempt.selected))
 
     def test_no_op_with_incomplete_skip_results_rolls_back_prepared_rows(self):
-        from netbox_nso_plugin.views import NSODeviceActionView, _prepare_apply
+        from netbox_nso_plugin.views import NSODeviceActionView
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         def incomplete_no_op(selected):
             result = _no_op(selected)
@@ -2974,7 +2966,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         adapter = _ApplyContractAdapter(lambda selected: (202, incomplete_no_op(selected)))
         config, session = adapter.patches()
         with config, session:
-            prepared, selected = _prepare_apply(self.mgmt)
+            prepared, selected = prepare_and_confirm_apply(self.mgmt)
 
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
@@ -2997,7 +2989,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "accepted")
 
     def test_no_op_with_malformed_skip_results_rolls_back_prepared_rows(self):
-        from netbox_nso_plugin.views import NSODeviceActionView, _prepare_apply
+        from netbox_nso_plugin.views import NSODeviceActionView
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         def malformed_no_op(selected):
             result = _no_op(selected)
@@ -3008,7 +3002,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         adapter = _ApplyContractAdapter(lambda selected: (202, malformed_no_op(selected)))
         config, session = adapter.patches()
         with config, session:
-            prepared, selected = _prepare_apply(self.mgmt)
+            prepared, selected = prepare_and_confirm_apply(self.mgmt)
 
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
@@ -3031,7 +3025,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "accepted")
 
     def test_malformed_no_op_with_a_generation_keeps_prepared_rows_deploying(self):
-        from netbox_nso_plugin.views import NSODeviceActionView, _prepare_apply
+        from netbox_nso_plugin.views import NSODeviceActionView
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         def malformed_no_op(selected):
             result = _no_op(selected)
@@ -3042,7 +3038,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         adapter = _ApplyContractAdapter(lambda selected: (202, malformed_no_op(selected)))
         config, session = adapter.patches()
         with config, session:
-            prepared, selected = _prepare_apply(self.mgmt)
+            prepared, selected = prepare_and_confirm_apply(self.mgmt)
 
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")

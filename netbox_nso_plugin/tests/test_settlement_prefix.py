@@ -11,6 +11,7 @@ from netbox_nso_plugin.settlement import consume_static_route_settlements
 
 from ._adapter_http import make_evidence_envelope, make_generation_envelope, make_response
 from ._bgp_settlement import BGPSettlementHelpers
+from ._manual_capture_case import post_apply
 from .test_coalesced_settlement import CoalescedCarrierHelpers
 from .test_durable_bgp_capture import BGPCaptureCase, _CaptureHandler
 
@@ -362,7 +363,6 @@ class TestCommittedSettlementPrefix(CarrierPageHelpers, CoalescedCarrierHelpers,
         from uuid import UUID
 
         import requests
-        from django.urls import reverse
 
         from netbox_nso_plugin.models import NSOApplyAttempt
 
@@ -379,10 +379,7 @@ class TestCommittedSettlementPrefix(CarrierPageHelpers, CoalescedCarrierHelpers,
             raise requests.ConnectionError("The admission response was lost.")
 
         self.adapter.apply_response = lost_answer
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(answer.status_code, 502)
         attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         self.assertIsNone(attempt.response)
@@ -436,7 +433,6 @@ class TestCommittedSettlementPrefix(CarrierPageHelpers, CoalescedCarrierHelpers,
         from uuid import UUID
 
         import requests
-        from django.urls import reverse
 
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
         from netbox_nso_plugin.models import NSOApplyAttempt
@@ -452,10 +448,7 @@ class TestCommittedSettlementPrefix(CarrierPageHelpers, CoalescedCarrierHelpers,
             raise requests.ConnectionError("The admission response was lost.")
 
         self.adapter.apply_response = lost_answer
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(answer.status_code, 502)
         attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         self.assertIsNone(attempt.response)

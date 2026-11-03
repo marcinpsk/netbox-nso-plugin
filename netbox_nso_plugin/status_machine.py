@@ -192,8 +192,8 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(REVERT, IN_SYNC, IMPORTED, True, "operator un-accepts: intent retracted, row returns to mirror"),
     Transition(REVERT, APPLY_FAILED, IMPORTED, True, "operator un-accepts a failed apply instead of retrying"),
     # -- operator: apply ------------------------------------------------------
-    Transition(APPLY, ACCEPTED, DEPLOYING, True, "_prepare_apply marks owned accepted→deploying"),
-    Transition(APPLY, APPLY_FAILED, DEPLOYING, True, "_prepare_apply retries a failed owned row"),
+    Transition(APPLY, ACCEPTED, DEPLOYING, True, "Apply confirmation promotes an admitted owner"),
+    Transition(APPLY, APPLY_FAILED, DEPLOYING, True, "Apply confirmation retries an admitted owner"),
     Transition(APPLY_OK, DEPLOYING, IN_SYNC, True, "apply worker reported success"),
     Transition(APPLY_ERR, DEPLOYING, APPLY_FAILED, True, "apply worker reported a per-intent failure"),
     # A correlated settlement may settle a row that never passed through ``deploying``:

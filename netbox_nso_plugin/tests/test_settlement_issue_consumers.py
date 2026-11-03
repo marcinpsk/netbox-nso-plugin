@@ -21,6 +21,7 @@ from netbox_nso_plugin.settlement_resolution import instant
 
 from ._adapter_http import make_generation_listing, make_response
 from ._bgp_settlement import BGPSettlementHelpers
+from ._manual_capture_case import post_apply
 from ._outbox_case import content_update, mirror_update
 from ._refusal_display import RefusalDisplayHelpers
 from ._settlement_observation import INCARNATION, failed_item, serve_observation
@@ -241,8 +242,6 @@ class TestAcknowledgedObligationConsumers(
     def assert_outstanding_sibling_keeps_the_attempt_open(self, *, other_store_certificate):
         from uuid import UUID
 
-        from django.urls import reverse
-
         from netbox_nso_plugin.models import NSOApplyAttempt
 
         from ._adapter_http import make_generation_listing
@@ -260,10 +259,7 @@ class TestAcknowledgedObligationConsumers(
         self.adapter.apply_response = admission
         scope = self.scope()
         self.owners = [self.router_owner(), self.peer(scope, "198.18.0.2"), self.peer(scope, "198.18.0.3")]
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(answer.status_code, 200, answer.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         link = self.attempt.response["generations"][1]
@@ -513,8 +509,6 @@ class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, B
     def second_apply(self, generation_id=83, seq=6, job_id=502):
         from uuid import UUID
 
-        from django.urls import reverse
-
         from netbox_nso_plugin.models import NSOApplyAttempt
 
         from ._bgp_settlement import promoted_streams
@@ -526,10 +520,7 @@ class TestLaterManualCertificate(SettlementIssueHelpers, BGPSettlementHelpers, B
             return 202, response
 
         self.adapter.apply_response = admission
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(answer.status_code, 200, answer.content)
         return NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
 

@@ -15,7 +15,6 @@ from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import connections, transaction
 from django.test import TransactionTestCase
-from django.urls import reverse
 from ipam.models import ASN, RIR, VRF, IPAddress
 from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPPeerAddressFamily, BGPRouter, BGPScope, Redistribution
 
@@ -29,6 +28,7 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.refusal_registry import owner_spec
 
+from ._manual_capture_case import post_apply
 from ._outbox_case import content_update, make_managed, mirror_update, without_commit_drain
 from ._ownership_case import acquire_bgp_router, acquire_overlay
 from ._settlement_adapter import LoopbackOnlySession
@@ -346,10 +346,7 @@ class TestDurableBGPCapture(BGPCaptureCase):
         self.scope()
         router = self.router_owner(status="in_sync")
 
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["status"], "ok")

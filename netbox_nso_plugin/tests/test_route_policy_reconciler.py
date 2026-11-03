@@ -17,7 +17,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
-from ._manual_capture_case import store_apply_selection
+from ._manual_capture_case import promote_preflighted_intent, store_apply_selection
 from ._outbox_case import ReceiptAdapter, make_managed
 from ._ownership_case import save_overlay_fixture
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -1565,7 +1565,6 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         """Apply must not bind an omitted LOCAL row to the MASTER carrier evidence."""
         from uuid import uuid4
 
-        from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
@@ -1598,7 +1597,7 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         registry, pushed, direct_selection = store_apply_selection(management)
         attempt_id = uuid4()
 
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             management,
             registry,
             pushed,
@@ -1657,17 +1656,15 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         )
 
     def _promotion_queries(self, prepared):
-        """Run promote_current_intent for one prepared device and return the SQL it issued."""
+        """Capture and confirm one device and return the SQL it issued."""
         from uuid import uuid4
 
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
 
-        from netbox_nso_plugin import apply_state
-
         direct_selection = prepared.direct_selection
         with CaptureQueriesContext(connection) as captured:
-            apply_state.promote_current_intent(
+            promote_preflighted_intent(
                 prepared.management,
                 prepared.registry,
                 prepared.pushed,
@@ -1743,8 +1740,6 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         """A LOCAL row with both GFK ids set but no target row stays excluded, as it does today."""
         from uuid import uuid4
 
-        from netbox_nso_plugin import apply_state
-
         from ._outbox_case import content_bulk_update
 
         prepared = self._accepted_local_candidates(self.device, ["CL-DANGLING"], materialized=True)
@@ -1752,7 +1747,7 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         content_bulk_update(row, object_id=row.object_id + 10_000)
         self._refresh_pushed_snapshot(prepared, self.device)
 
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             prepared.management,
             prepared.registry,
             prepared.pushed,
@@ -1772,7 +1767,6 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         from types import SimpleNamespace
         from uuid import uuid4
 
-        from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
 
@@ -1788,7 +1782,7 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         prepared = SimpleNamespace(management=management, rows=[row])
         self._refresh_pushed_snapshot(prepared, self.device)
 
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             prepared.management,
             prepared.registry,
             prepared.pushed,

@@ -226,6 +226,23 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
 
 
 class TestDeploymentProbe(DeploymentCase):
+    def test_late_probe_rejection_preserves_the_recorded_admission(self):
+        from netbox_nso_plugin.deployment_probe import _finish_rejected
+
+        self.probe()
+        self.assertEqual(self.attempt.send_seq, 1)
+        before = NSOApplyAttempt.objects.values().get(pk=self.attempt.pk)
+        snapshots = list(self.attempt.overlay_snapshots.values())
+        self.assertFalse(
+            _finish_rejected(
+                self.attempt,
+                status=401,
+                response={"error": {"code": "unauthorized", "message": "Placeholder rejection"}},
+            )
+        )
+        self.assertEqual(NSOApplyAttempt.objects.values().get(pk=self.attempt.pk), before)
+        self.assertEqual(list(self.attempt.overlay_snapshots.values()), snapshots)
+
     def acknowledged_failed_item(self):
         """Return a failed adapter row for an obligation that an acknowledged issue released."""
         from django.utils import timezone

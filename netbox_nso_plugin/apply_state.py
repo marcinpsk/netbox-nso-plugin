@@ -199,7 +199,7 @@ def lock_intent_revisions(device_id: int, scopes) -> dict[str, int]:
     return current
 
 
-def promote_current_intent(
+def capture_current_intent(
     management,
     registry,
     pushed,
@@ -209,8 +209,8 @@ def promote_current_intent(
     apply_attempt_id,
     static_route_stored: bool,
 ):
-    """Commit selected snapshots before a separately fenced promotion."""
-    from .durable_capture import capture_manual, promote_snapshots
+    """Capture selected snapshots before preflight and a separately fenced promotion."""
+    from .durable_capture import capture_manual
     from .models import NSOApplyAttempt, NSODeviceManagement
 
     expected_scopes = {entry.key for entry in registry.values() if entry.in_protocol}
@@ -260,5 +260,4 @@ def promote_current_intent(
             direct_source_revisions,
             static_route_stored,
         )
-    promote_snapshots(attempt)
     return attempt

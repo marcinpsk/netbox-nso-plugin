@@ -3193,6 +3193,8 @@ class NSOApplyAttempt(models.Model):
     adapter_device_id = models.BigIntegerField(null=True, blank=True)
     scope_revisions = models.JSONField(default=dict, blank=True)
     selected = models.JSONField(default=dict, blank=True)
+    preflight = models.JSONField(null=True, blank=True)
+    send_seq = models.PositiveBigIntegerField(default=0)
     http_status = models.PositiveSmallIntegerField(null=True, blank=True)
     response = models.JSONField(null=True, blank=True)
     trigger_kind = models.CharField(

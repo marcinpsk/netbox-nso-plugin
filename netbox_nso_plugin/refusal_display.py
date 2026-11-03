@@ -157,11 +157,79 @@ def project_rows(rows):
                 if current is not None:
                     row._refusal_current = current
     _load_previous_refusals(owners)
+    _load_preflight_blocks(owners)
     from .settlement_resolution import acknowledged_unknown_jobs
 
     for key, jobs in acknowledged_unknown_jobs(owners.values()).items():
         owners[key]._acknowledged_jobs = jobs
     return rows
+
+
+def _load_preflight_blocks(owners):
+    """Project the latest preflight only while its captured owner still matches."""
+    from .apply_preflight import verdict_message
+    from .lifecycle_fence import current_owner_fences
+    from .models import NSOApplyOverlaySnapshot, NSOOverlaySettlementFence
+    from .selection_manifest import current_content_digest
+
+    for row in owners.values():
+        row._refusal_preflight = None
+    pending = {key: row for key, row in owners.items() if row.status == "accepted" and row.last_apply_error}
+    if not pending:
+        return
+    fences = current_owner_fences(pending, NSOOverlaySettlementFence.objects.select_related("management"))
+    snapshots = (
+        NSOApplyOverlaySnapshot.objects.filter(
+            model_label__in={label for label, _pk in pending},
+            overlay_pk__in={pk for _label, pk in pending},
+            attempt__trigger_kind="manual",
+            attempt__preflight__isnull=False,
+        )
+        .select_related("attempt")
+        .order_by("model_label", "overlay_pk", "-attempt__created_at", "-pk")
+        .distinct("model_label", "overlay_pk")
+    )
+    for snapshot in snapshots:
+        key = (snapshot.model_label, snapshot.overlay_pk)
+        row, fence = pending.get(key), fences.get(key)
+        if (
+            row is None
+            or fence is None
+            or snapshot.mapping_epoch != fence.mapping_epoch
+            or snapshot.attempt.management_id != fence.management_id
+            or snapshot.expected_owner_revision != fence.owner_revision
+            or snapshot.accepted_at != row.accepted_at
+            or snapshot.content_digest != current_content_digest(row)
+            or any(
+                getattr(snapshot, "prior_" + field) != getattr(row, field)
+                for field in ("status", "last_apply_at", "last_apply_error", "apply_attempt_id")
+            )
+        ):
+            continue
+        streams = snapshot.attempt.preflight["result"]["streams"]
+        blocked = [
+            streams[item["stream"]]
+            for item in snapshot.contributors["rows"]
+            if streams[item["stream"]]["status"] == "blocked"
+        ]
+        if blocked:
+            causes = [cause for verdict in blocked for cause in verdict.get("refusals", [])]
+            refusal = attributed_projection(causes) if causes else None
+            row._refusal_preflight = {
+                "refusal": refusal,
+                "refusal_text": refusal["text"] if refusal else "",
+                "message": " | ".join(sorted({verdict_message(verdict) for verdict in blocked})),
+            }
+
+
+def _preflight_block(row):
+    from .refusal_registry import OVERLAYS
+
+    if not hasattr(row, "_meta") or row._meta.label_lower not in OVERLAYS or row.pk is None:
+        return None
+    if not hasattr(row, "_refusal_preflight"):
+        _load_preflight_blocks({(row._meta.label_lower, row.pk): row})
+    return row._refusal_preflight
 
 
 def _acknowledged_jobs(row):
@@ -282,6 +350,14 @@ def _previous_refusal(row):
     return _snapshot_refusal(snapshot, snapshot.executions.filter(consumption_state="consumed"))
 
 
+def _project_preflight(row, projection, historical_refusal):
+    block = _preflight_block(row)
+    if block is None:
+        return historical_refusal
+    projection.update(refusal=block["refusal"], refusal_text=block["refusal_text"], error=block["message"])
+    return None
+
+
 def row_projection(row, interface=None):
     """Decide owner state, pending membership and safe execution evidence together."""
     from .refusal_registry import OVERLAYS
@@ -323,6 +399,7 @@ def row_projection(row, interface=None):
         projection["error"] = None if isinstance(message, str) and message in advisories else message
     if not projection["advisory"]:
         projection["advisory"] = getattr(row, "last_result_advisory", "") or ""
+    historical_refusal = _project_preflight(row, projection, historical_refusal)
     spec = OVERLAYS.get(row._meta.label_lower) if hasattr(row, "_meta") else None
     if spec is not None and spec.error_type == "JSONField":
         error_refusal = projection["refusal"] if projection["refusal"] is not None else historical_refusal
@@ -373,6 +450,8 @@ def _row_classification(row, projected, interface, acknowledged=()):
     owned = row.status in OWNED_STATES
     if projected["refusal"] is not None and not projected["refusal"]["valid"]:
         return "apply_failed", "apply failed", owned
+    if _preflight_block(row) and not acknowledged and projected["advisory"] != UNAVAILABLE:
+        return "pending", "pending apply", owned
     if projected["execution_disposition"] == "refused":
         return "apply_failed", "apply failed", owned
     if projected["advisory"] == UNAVAILABLE:

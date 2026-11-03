@@ -16,7 +16,7 @@ from django.conf import settings
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from ._adapter_http import make_generation_listing, make_response
+from ._adapter_http import make_generation_listing, make_response, make_stored_preflight
 from ._outbox_case import make_managed, mirror_update, own_vlan
 from ._ownership_case import acquire_overlay
 from ._settlement_wire import deployment_wire, generation_wire
@@ -214,6 +214,7 @@ class TestAttemptSettlement(TestCase):
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,
+            preflight=make_stored_preflight(selected),
             scope_revisions={"vlan": 1},
             http_status=202 if answered else None,
             response=response if answered else None,
@@ -263,7 +264,9 @@ class TestAttemptSettlement(TestCase):
         local = self._local_attempt(attempt_id, 61, selected, answered=False)
         local.refresh_from_db(fields=["selected"])
         known = _attempt(attempt_id, self.adapter_device_id, 61, selected, "pending")
-        persisted_wire = json.dumps({"apply_attempt_id": str(attempt_id), "selected": local.selected})
+        persisted_wire = json.dumps(
+            {"apply_attempt_id": str(attempt_id), "selected": local.selected, "preflight_identity": "a" * 64}
+        )
         requests = []
         admitted = False
 
@@ -279,7 +282,7 @@ class TestAttemptSettlement(TestCase):
                 self.assertTrue(url.endswith("/actions/apply"))
                 self.assertEqual(
                     body,
-                    {"apply_attempt_id": str(attempt_id), "selected": selected},
+                    {"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": "a" * 64},
                 )
                 self.assertEqual(json.dumps(body), persisted_wire)
                 admitted = True
@@ -520,6 +523,7 @@ class TestAttemptSettlement(TestCase):
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,
+            preflight=make_stored_preflight(selected),
             scope_revisions={"interface_mtu": 1},
         )
         unknown = _payload(self.adapter_device_id, [])
@@ -585,7 +589,9 @@ class TestAttemptSettlement(TestCase):
         local.refresh_from_db()
         self.assertEqual(local.http_status, 202)
         self.assertEqual(local.response, admitted["response"])
-        self.assertEqual(applies, [{"apply_attempt_id": str(attempt_id), "selected": selected}] * 2)
+        self.assertEqual(
+            applies, [{"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": "a" * 64}] * 2
+        )
 
         self.assertEqual(evidence["attempts"][0]["generations"][0]["status"], "pending")
         row.refresh_from_db()
@@ -795,7 +801,11 @@ class TestAttemptSettlement(TestCase):
                         self.assertTrue(url.endswith("/actions/apply"))
                         self.assertEqual(
                             kwargs["json"],
-                            {"apply_attempt_id": str(attempt_id), "selected": {"vlan": 427}},
+                            {
+                                "apply_attempt_id": str(attempt_id),
+                                "selected": {"vlan": 427},
+                                "preflight_identity": "a" * 64,
+                            },
                         )
                         return make_response(202, answer["response"])
 
@@ -857,7 +867,7 @@ class TestAttemptSettlement(TestCase):
                 self.assertTrue(url.endswith("/actions/apply"))
                 self.assertEqual(
                     body,
-                    {"apply_attempt_id": str(attempt_id), "selected": selected},
+                    {"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": "a" * 64},
                 )
                 admitted = True
                 return make_response(200, no_op)

@@ -14,7 +14,6 @@ from django.contrib.auth import get_user_model
 from django.db import connection, transaction
 from django.db.models.signals import post_save, pre_save
 from django.test import TransactionTestCase
-from django.urls import reverse
 from django.utils import timezone
 
 from netbox_nso_plugin import delivery
@@ -32,6 +31,7 @@ from netbox_nso_plugin.models import (
 from netbox_nso_plugin.refusal_registry import OVERLAYS
 
 from ._adapter_http import make_evidence_envelope, make_response
+from ._manual_capture_case import post_apply
 from ._outbox_case import (
     ReceiptAdapter,
     content_update,
@@ -56,6 +56,10 @@ class ManualAdmissionAdapter(ReceiptAdapter):
         self.rejected = False
 
     def _handle(self, method, url, **kwargs):
+        if method == "POST" and url.endswith("/actions/apply-preflight"):
+            from ._adapter_http import make_apply_preflight
+
+            return make_response(200, make_apply_preflight(kwargs["json"]["selected"]))
         if method == "GET" and url.endswith(("/jobs", "/generations")):
             response = make_response(200, [])
             response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000010"
@@ -199,10 +203,9 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
             }
 
     def _apply(self, adapter):
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"])
         config, session = adapter.patches()
         with config, session:
-            return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            return post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
     def _assert_prior_bookkeeping(self, row):
         row.refresh_from_db()
@@ -358,6 +361,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         with config, session:
             load_deployment_evidence(NSODeviceManagement.objects.get(pk=self.management.pk))
             attempt = NSOApplyAttempt.objects.get(pk=original_request["apply_attempt_id"])
+            self.assertEqual(attempt.send_seq, 2)
             self.assertEqual(attempt.http_status, 409)
             self.assertTrue(attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists())
             adapter.rejected = False
@@ -370,6 +374,53 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         self.assertEqual(adapter.apply_requests, [original_request, original_request])
         for _, row in self.rows:
             self._assert_prior_bookkeeping(row)
+
+    def test_replay_rejection_without_a_remote_journal_keeps_the_admission_unresolved(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        adapter = ManualAdmissionAdapter(lambda _body: requests.ConnectionError("Apply admission answer was lost."))
+        self.assertEqual(self._apply(adapter).status_code, 502)
+        attempt_id = adapter.apply_requests[0]["apply_attempt_id"]
+        adapter.answer = lambda _body: (409, adapter.rejection())
+        original = adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                body = response.json()
+                body["attempts"] = []
+                body["unknown_apply_attempt_ids"] = [attempt_id]
+                return make_response(200, body)
+            return response
+
+        adapter._handle = handle
+        config, session = adapter.patches()
+        with config, session:
+            load_deployment_evidence(NSODeviceManagement.objects.get(pk=self.management.pk))
+        attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+        self.assertEqual(attempt.send_seq, 2)
+        self.assertIsNone(attempt.http_status)
+        self.assertIsNone(attempt.response)
+        self.assertFalse(attempt.overlay_snapshots.exclude(settlement_disposition="unresolved").exists())
+        for _, row in self.rows:
+            row.refresh_from_db()
+            self.assertEqual(row.status, "deploying")
+            self.assertEqual(row.apply_attempt_id, attempt.pk)
+
+    def test_replay_refused_before_http_does_not_claim_a_send(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        adapter = ManualAdmissionAdapter(lambda _body: requests.ConnectionError("Apply admission answer was lost."))
+        self.assertEqual(self._apply(adapter).status_code, 502)
+        attempt_id = adapter.apply_requests[0]["apply_attempt_id"]
+        NSOApplyAttempt.objects.filter(pk=attempt_id).update(preflight=None)
+        before = NSOApplyAttempt.objects.values().get(pk=attempt_id)
+        config, session = adapter.patches()
+        with config, session, self.assertRaises(AdapterError):
+            load_deployment_evidence(NSODeviceManagement.objects.get(pk=self.management.pk))
+        self.assertEqual(NSOApplyAttempt.objects.values().get(pk=attempt_id), before)
+        self.assertEqual(len(adapter.apply_requests), 1)
 
     def test_manual_no_op_restores_after_read_watermark_advances(self):
         self.mtu = mirror_update(self.mtu, status="accepted")
