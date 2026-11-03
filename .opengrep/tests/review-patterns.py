@@ -3461,6 +3461,16 @@ def generation_listing_lookup_after_bare_evidence_check(adapter_client, generati
     return {row["seq"] for row in listing if row["generation_id"] == generation_id}
 
 
+def generation_listing_direct_filter_after_unrelated_checks(client, adapter_client, evidence, rows, wanted):
+    raise_evidence_errors(evidence)
+    adapter_client.raise_evidence_errors(evidence)
+    for row in rows:
+        if isinstance(row, client.ListingTruncation):
+            raise client.ListingTruncationError(row)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    return [row for row in client.list_device_generations(7) if row["generation_id"] in wanted]
+
+
 def carrier_generation_bypass(bound):
     # ruleid: nso-carrier-generations-bypass-helper
     rows = (generation for attempt in bound["attempts"] for generation in attempt["generations"])
