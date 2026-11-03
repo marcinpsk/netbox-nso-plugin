@@ -11,6 +11,7 @@ from django.urls import reverse
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire, job_wire
 from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
 
@@ -40,9 +41,36 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             ],
             unknown_apply_attempt_ids=[],
         )
-        evidence.store_incarnation = "placeholder-store"
+        evidence.store_incarnation = "00000000-0000-4000-8000-000000000004"
         evidence.settlement_sequences = {501: 1}
         settle_apply_attempts(self.management, evidence)
+
+    def test_foreign_current_cause_adds_no_frozen_owner(self):
+        from netbox_nso_plugin.outcome_settlement import _join
+
+        self.prepare()
+        generation = self.terminal(refused=None)
+        original = self.terminal()["refusals"][0]
+        foreign = copy.deepcopy(original)
+        foreign["logical_rows"][0]["row"]["key"] = "f" * 64
+        generation["refusals"] = [foreign]
+        generation["carrier_job_result"]["refusals"] = [foreign]
+        joined = _join(self.management, generation, "00000000-0000-4000-8000-000000000004", self.attempt)
+        self.assertEqual(len(joined[-1]), len(self.owners))
+
+    def test_intersecting_historical_cause_requires_a_frozen_emitted_ref(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.outcome_settlement import _join
+
+        self.prepare()
+        generation = self.terminal()
+        cause = generation["refusals"][0]
+        cause["provenance"] = "retained"
+        cause["row"]["key"] = "f" * 64
+        failed = next(row for row in generation["row_outcomes"] if row["disposition"] == "refused")
+        failed["refusals"][0]["row"]["key"] = "f" * 64
+        with self.assertRaisesRegex(EvidenceInvariantError, "cause_not_in_frozen_contribution"):
+            _join(self.management, generation, "00000000-0000-4000-8000-000000000004", self.attempt)
 
     def test_child_refusal_restores_unnamed_peer(self):
         self.prepare()
@@ -166,7 +194,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         generation = self.terminal()
-        execution = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        execution = settle_terminal_generation(
+            self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1
+        )
         self.assertEqual(execution.attempt.trigger_kind, "cadence")
         self.assertIsNone(execution.attempt.adapter_apply_attempt_id)
         self.assertEqual(self.adapter.apply_requests, [])
@@ -178,10 +208,14 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         success = self.terminal(refused=None)
-        first = settle_terminal_generation(self.management, success, "placeholder-store", settle_seq=1)
+        first = settle_terminal_generation(
+            self.management, success, "00000000-0000-4000-8000-000000000004", settle_seq=1
+        )
         refusal = self.terminal()
         refusal["carrier_job_id"] = 502
-        second = settle_terminal_generation(self.management, refusal, "placeholder-store", settle_seq=2)
+        second = settle_terminal_generation(
+            self.management, refusal, "00000000-0000-4000-8000-000000000004", settle_seq=2
+        )
         self.assertEqual(second.attempt.trigger_kind, "explicit_retry")
         self.assertNotEqual(first.attempt_id, second.attempt_id)
         for snapshot in second.overlay_snapshots.all():
@@ -202,8 +236,12 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             outcome["generation_id"] = outcome["carrier"]["generation_id"] = 82
         for carrier in success["carrier_job_result"]["settlement_owners"]:
             carrier["generation_id"] = 82
-        newest = settle_terminal_generation(self.management, success, "placeholder-store", settle_seq=2)
-        delayed = settle_terminal_generation(self.management, late, "placeholder-store", settle_seq=1)
+        newest = settle_terminal_generation(
+            self.management, success, "00000000-0000-4000-8000-000000000004", settle_seq=2
+        )
+        delayed = settle_terminal_generation(
+            self.management, late, "00000000-0000-4000-8000-000000000004", settle_seq=1
+        )
         self.assertEqual(delayed.consumption_state, "superseded")
         self.assertFalse(delayed.overlay_snapshots.exists())
         for row in self.owners:
@@ -217,9 +255,11 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         generation = self.terminal(refused=None)
-        settle_terminal_generation(self.management, generation, "placeholder-old-store", settle_seq=1)
+        settle_terminal_generation(self.management, generation, "00000000-0000-4000-8000-000000000006", settle_seq=1)
         with self.assertRaises(EvidenceInvariantError):
-            settle_terminal_generation(self.management, generation, "placeholder-new-store", settle_seq=1)
+            settle_terminal_generation(
+                self.management, generation, "00000000-0000-4000-8000-000000000007", settle_seq=1
+            )
         for row in self.owners:
             row.refresh_from_db()
             self.assertEqual(row.status, "in_sync")
@@ -242,7 +282,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         from netbox_nso_plugin.settlement import sweep_static_route_settlements
 
         self.prepare_automatic()
-        settle_terminal_generation(self.management, self.terminal(refused=None), "placeholder-store", settle_seq=1)
+        settle_terminal_generation(
+            self.management, self.terminal(refused=None), "00000000-0000-4000-8000-000000000004", settle_seq=1
+        )
         for row in self.owners:
             row.refresh_from_db()
             self.assertEqual(row.status, "in_sync")
@@ -259,10 +301,11 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(NSOApplyExecution.objects.get(carrier_job_id=502).consumption_state, "consumed")
 
     def test_malformed_feed_identity_cannot_settle_or_advance_the_cursor(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.durable_capture import mapping_epoch
         from netbox_nso_plugin.settlement import settle_static_routes
 
         from ._adapter_http import make_response
+        from ._outbox_case import mirror_update
 
         self.prepare_automatic()
         self.serve_terminal_evidence(self.terminal())
@@ -274,11 +317,17 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/jobs"):
                 jobs = response.json()
+                if not jobs:
+                    return response
                 for field, value in invalid.items():
-                    if value is absent:
-                        jobs[0].pop(field)
-                    else:
-                        jobs[0][field] = value
+                    targets = [jobs[0]["projection"]]
+                    if field in jobs[0]["identity"]:
+                        targets.append(jobs[0]["identity"])
+                    for target in targets:
+                        if value is absent:
+                            target.pop(field)
+                        else:
+                            target[field] = value
                 return make_response(200, jobs)
             return response
 
@@ -294,15 +343,41 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             ("type", ""),
             ("type", True),
         ):
-            with self.subTest(field=field, value=value):
-                invalid.clear()
-                invalid[field] = value
-                with self.assertRaises(AdapterError) as raised:
-                    settle_static_routes(self.management)
-                self.assertEqual(raised.exception.code, "invalid_response")
-                self.management.refresh_from_db()
-                self.assertIsNone(self.management.settle_cursor_seq)
-                self.assertFalse(NSOApplyExecution.objects.exists())
+            sequences = (1, absent, None, True, "1", 0, -1) if field == "id" else (1,)
+            for sequence in sequences:
+                with self.subTest(field=field, value=value, settle_seq=sequence):
+                    invalid.clear()
+                    invalid[field] = value
+                    invalid["settle_seq"] = sequence
+                    mirror_update(self.management, settle_evidence_error={})
+                    result = settle_static_routes(self.management)
+                    self.assertTrue(result.stalled)
+                    self.assertEqual(result.consumed, 0)
+                    self.management.refresh_from_db()
+                    self.assertIsNone(self.management.settle_cursor_seq)
+                    self.assertFalse(NSOApplyExecution.objects.exists())
+                    if field == "type":
+                        self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+                        self.assertEqual(self.management.settle_evidence_error["job_id"], 501)
+                    else:
+                        issue = self.management.settle_evidence_error
+                        self.assertEqual(issue["reason"], "invalid job envelope")
+                        self.assertEqual(issue["store_incarnation"], "00000000-0000-4000-8000-000000000004")
+                        self.assertEqual(
+                            issue["request_fence"],
+                            {
+                                "mapping_epoch": mapping_epoch(self.management),
+                                "cursor_device_id": self.management.settle_cursor_device_id,
+                                "cursor_incarnation": self.management.settle_cursor_incarnation,
+                                "cursor_seq": self.management.settle_cursor_seq,
+                            },
+                        )
+                        self.assertNotIn("job_id", issue)
+                        self.assertNotIn("settle_seq", issue)
+                        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+                        self.assertContains(response, "Settlement is paused", count=1)
+                        self.assertNotContains(response, "Adapter job")
+                        self.assertNotContains(response, "settle_seq")
 
     def test_persisted_cursor_skips_large_retained_feed_and_keeps_execution_order(self):
         from netbox_nso_plugin.settlement import settle_static_routes
@@ -318,7 +393,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.management.refresh_from_db()
         mirror_update(self.management, settle_cursor_seq=10001)
         original = self.adapter._handle
-        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0][
+            "projection"
+        ]
         starts = []
 
         def retained_history(method, url, **kwargs):
@@ -334,7 +411,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                         job.update(id=100000 + sequence, type="import", result=None, row_outcomes=None, refusals=None)
                     job["settle_seq"] = sequence
                     jobs.append(job)
-                return make_response(200, jobs)
+                return make_response(200, [job_wire(job) for job in jobs])
             return response
 
         self.adapter._handle = retained_history
@@ -435,7 +512,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.serve_terminal_evidence(retry)
         original = self.adapter._handle
-        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0][
+            "projection"
+        ]
         jobs = []
         for sequence, generation in enumerate((first, retry), start=1):
             job = copy.deepcopy(template)
@@ -455,7 +534,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             if method == "GET" and url.endswith("/jobs"):
                 params = kwargs["params"]
                 after, limit = int(params["after_settle_seq"]), int(params["limit"])
-                return make_response(200, [job for job in jobs if job["settle_seq"] > after][:limit])
+                return make_response(200, [job_wire(job) for job in jobs if job["settle_seq"] > after][:limit])
             return original(method, url, **kwargs)
 
         self.adapter._handle = retry_feed
@@ -467,6 +546,15 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         from ._adapter_http import make_response
 
         self.prepare_automatic()
+        before = {}
+        for row in self.owners:
+            row.refresh_from_db()
+            before[row.pk, row._meta.label_lower] = (
+                row.status,
+                row.last_apply_at,
+                row.last_apply_error,
+                row.apply_attempt_id,
+            )
         first = self.terminal(refused=None)
         self.serve_terminal_evidence(first)
         original = self.adapter._handle
@@ -485,12 +573,15 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.adapter._handle = interrupted_poll
         with self.assertRaises(AdapterError):
             settle_static_routes(self.management)
-        self.assertIsNone(NSOApplyExecution.objects.get().settle_seq)
+        self.assertFalse(NSOApplyExecution.objects.exists())
         self.management.refresh_from_db()
         self.assertIsNone(self.management.settle_cursor_seq)
         for row in self.owners:
             row.refresh_from_db()
-            self.assertEqual(row.status, "in_sync")
+            self.assertEqual(
+                (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
+                before[row.pk, row._meta.label_lower],
+            )
 
         retry = self.terminal()
         retry["carrier_job_id"] = 502
@@ -510,13 +601,127 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(NSOApplyExecution.objects.count(), 2)
         self.assertEqual(self.adapter.apply_requests, [])
 
+    def test_noncanonical_attempt_identity_cannot_bypass_missing_generation_validation(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_evidence_envelope, make_response
+
+        self.prepare()
+        response = copy.deepcopy(self.attempt.response)
+        NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=None)
+        self.attempt.response = None
+        self.serve_terminal_evidence(self.terminal(refused=None), head=True)
+        original = self.adapter._handle
+        attempt_id = str(self.attempt.pk)
+        self.assertNotEqual(attempt_id, attempt_id.upper())
+        before = {}
+        for row in self.owners:
+            row.refresh_from_db()
+            before[row._meta.label_lower, row.pk] = (
+                row.status,
+                row.last_apply_at,
+                row.last_apply_error,
+                row.apply_attempt_id,
+            )
+
+        def missing_generation(method, url, **kwargs):
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                body = original(method, url, **kwargs).json()
+                body["head"]["identity"]["apply_attempt_id"] = attempt_id
+                body["head"]["projection"]["apply_attempt_id"] = attempt_id
+                body["attempts"] = [
+                    make_evidence_envelope(
+                        {
+                            "apply_attempt_id": attempt_id.upper(),
+                            "admission_state": "admitted",
+                            "http_status": 202,
+                            "response": response,
+                            "selected": self.attempt.selected,
+                            "generation_ids": [row["generation_id"] for row in response["generations"]],
+                        },
+                        identity={
+                            "device_id": self.management.adapter_device_id,
+                            "apply_attempt_id": attempt_id.upper(),
+                        },
+                        generations=[],
+                    )
+                ]
+                return make_response(200, body)
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = missing_generation
+        result = consume_static_route_settlements(self.management)
+
+        self.assertEqual(result.consumed, 0)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertIsNone(result.cursor)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertFalse(NSOApplyExecution.objects.exists())
+        self.assertEqual(self.management.settle_evidence_error["reason"], "invalid settlement evidence")
+        self.attempt.refresh_from_db()
+        self.assertIsNone(self.attempt.response)
+        for row in self.owners:
+            row.refresh_from_db()
+            self.assertEqual(
+                (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
+                before[row._meta.label_lower, row.pk],
+            )
+
+    def test_failed_retry_metadata_records_an_identified_stall_before_older_carrier_reconstruction(self):
+        from netbox_nso_plugin.refusal_display import settlement_stall_projection
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_evidence_envelope, make_response
+
+        self.prepare_automatic()
+        first = self.terminal(refused=None)
+        retry = self.terminal()
+        retry["carrier_job_id"] = 502
+        self._serve_retry_evidence(first, retry)
+        original = self.adapter._handle
+
+        def fail_retry(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            body = response.json()
+            if method == "GET" and url.endswith(("/jobs", "/generations")):
+                for index, item in enumerate(body):
+                    identity = item["identity"]
+                    if identity.get("id", identity.get("carrier_job_id")) == 502:
+                        body[index] = make_evidence_envelope(
+                            None, identity=identity, error="execution_contract", digest="b" * 64
+                        )
+            elif method == "POST" and url.endswith("/deployment-evidence"):
+                body["head"] = make_evidence_envelope(
+                    None, identity=body["head"]["identity"], error="execution_contract", digest="b" * 64
+                )
+            return make_response(response.status_code, body)
+
+        self.adapter._handle = fail_retry
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertFalse(result.drained)
+        self.assertEqual(result.consumed, 0)
+        self.assertIsNone(result.cursor)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        self.assertFalse(NSOApplyExecution.objects.exists())
+        issue = settlement_stall_projection(self.management)
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["job_id"], 502)
+        self.assertEqual(issue["settle_seq"], 2)
+        self.assertEqual(issue["store_incarnation"], "00000000-0000-4000-8000-000000000004")
+        self.assertEqual(issue["reason"], "invalid settlement evidence")
+        self.assertEqual(issue["digest"], "b" * 64)
+
     def test_changed_historical_carrier_stalls_before_retry_owner_writes(self):
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
         from netbox_nso_plugin.settlement import settle_static_routes
 
         self.prepare_automatic()
         first = self.terminal(refused=None)
-        settle_terminal_generation(self.management, first, "placeholder-store", settle_seq=1)
+        settle_terminal_generation(self.management, first, "00000000-0000-4000-8000-000000000004", settle_seq=1)
         prior = []
         for row in self.owners:
             row.refresh_from_db()
@@ -542,9 +747,11 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         generation = self.terminal(refused=None)
-        settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        settle_terminal_generation(self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1)
         with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
-            settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=2)
+            settle_terminal_generation(
+                self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=2
+            )
         self.assertEqual(NSOApplyExecution.objects.get().settle_seq, 1)
 
     def test_evidence_fetch_rejects_incarnation_change(self):
@@ -593,6 +800,31 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             self.assertEqual((row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id), expected)
         self.assertEqual(NSOApplyExecution.objects.get().consumption_state, "unconsumed")
 
+    def test_foreign_owner_delete_settles_after_the_planner_pass_proves_it(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        from ._outbox_case import without_commit_drain
+
+        self.prepare()
+        generation = self.terminal(refused=2)
+        owner = self.owners[1]
+        owner_key = owner._meta.label_lower, owner.pk
+        type(owner).objects.filter(pk=owner.pk).delete()
+        with self.assertRaises(EvidenceInvariantError):
+            self.settle(generation)
+
+        with without_commit_drain():
+            reconcile_scope_ownership(self.management.device_id, ["bgp"])
+        self.settle(generation)
+
+        execution = NSOApplyExecution.objects.get()
+        self.assertEqual(execution.consumption_state, "consumed")
+        self.assertEqual(
+            execution.overlay_snapshots.get(model_label=owner_key[0], overlay_pk=owner_key[1]).settlement_disposition,
+            "superseded",
+        )
+
     def _delete_owner(self, owner):
         from netbox_nso_plugin.ownership_grants import OwnershipGrant
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
@@ -630,7 +862,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         owner = self.owners[1]
         owner_key = owner._meta.label_lower, owner.pk
         self._delete_owner(owner)
-        execution = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        execution = settle_terminal_generation(
+            self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1
+        )
         self.assertEqual(execution.consumption_state, "consumed")
         self.assertEqual(
             execution.overlay_snapshots.get(model_label=owner_key[0], overlay_pk=owner_key[1]).settlement_disposition,
@@ -711,12 +945,12 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare()
         first = settle_terminal_generation(
-            self.management, self.terminal(), "placeholder-store", attempt=self.attempt, settle_seq=1
+            self.management, self.terminal(), "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=1
         )
         refusal = self.terminal(refused=2)
         refusal["carrier_job_id"] = 502
         second = settle_terminal_generation(
-            self.management, refusal, "placeholder-store", attempt=self.attempt, settle_seq=2
+            self.management, refusal, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=2
         )
         self.owners[1].refresh_from_db()
         self.owners[2].refresh_from_db()
@@ -765,8 +999,8 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         original = self.terminal(refused=None)
         retry = self.terminal()
         retry["carrier_job_id"] = 502
-        settle_terminal_generation(self.management, original, "placeholder-store", settle_seq=1)
-        settle_terminal_generation(self.management, retry, "placeholder-store", settle_seq=2)
+        settle_terminal_generation(self.management, original, "00000000-0000-4000-8000-000000000004", settle_seq=1)
+        settle_terminal_generation(self.management, retry, "00000000-0000-4000-8000-000000000004", settle_seq=2)
         mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
         self.serve_terminal_evidence(retry, head=False, settle_seq=2)
         serve = self.adapter._handle
@@ -775,7 +1009,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             response = serve(method, url, **kwargs)
             if method == "GET" and url.endswith("/jobs") and int(kwargs["params"]["after_settle_seq"]) < 1:
                 job = {
-                    **response.json()[0],
+                    **response.json()[0]["projection"],
                     "id": 501,
                     "status": original["carrier_job_status"],
                     "result": original["carrier_job_result"],
@@ -783,7 +1017,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                     "refusals": original["refusals"],
                     "settle_seq": 1,
                 }
-                response = make_response(200, [job, *response.json()])
+                response = make_response(200, [job_wire(job), *response.json()])
             return response
 
         self.adapter._handle = with_original_job
@@ -844,13 +1078,17 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         generation = self.terminal()
-        consumed = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        consumed = settle_terminal_generation(
+            self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1
+        )
         mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
         self.management.refresh_from_db()
 
         # The epoch's selections no longer hold this generation's push sequences.
         with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
-            settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+            settle_terminal_generation(
+                self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1
+            )
         self._assert_one_certificate(generation, consumed)
 
         self.serve_terminal_evidence(generation, head=False, pruned=True)
@@ -876,7 +1114,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         # The deployment probe consumes through this writer with its manual attempt.
         with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
             settle_terminal_generation(
-                self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=1
+                self.management, generation, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=1
             )
         self._assert_one_certificate(generation, consumed)
 
@@ -884,7 +1122,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         from netbox_nso_plugin.apply_settlement import generation_certificate_candidates
 
         identity = generation["generation_id"], generation["carrier_job_id"]
-        candidates = generation_certificate_candidates(self.management, "placeholder-store", [generation])
+        candidates = generation_certificate_candidates(
+            self.management, "00000000-0000-4000-8000-000000000004", [generation]
+        )
         self.assertEqual([row.pk for row in candidates[identity]], [consumed.pk])
         self.assertEqual(
             list(
@@ -992,7 +1232,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
         self.prepare_automatic()
         generation = self.terminal()
-        original = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        original = settle_terminal_generation(
+            self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1
+        )
         self.serve_terminal_evidence(generation, head=False, pruned=True)
         evidence = load_deployment_evidence(self.management)
         self.assertEqual(evidence.settlement_sequences, {501: 1})
@@ -1165,7 +1407,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             _payload(self.management.adapter_device_id, [], head=head),
             [],
             metadata,
-            "placeholder-store",
+            "00000000-0000-4000-8000-000000000004",
             management=self.management,
         )
         bound.settlement_sequences = {501: 1}
@@ -1288,7 +1530,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             self.settle(generation)
             execution = NSOApplyExecution.objects.get()
         else:
-            execution = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+            execution = settle_terminal_generation(
+                self.management, generation, "00000000-0000-4000-8000-000000000004", settle_seq=1
+            )
         self.assertEqual(execution.consumption_state, "consumed")
         self.assertEqual(len(self.adapter.capture_reads), puts)
         self.assertEqual(len(self.adapter.apply_requests), int(manual))
@@ -1461,7 +1705,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 pending = make_generation_listing(
                     **link, status="pending", carrier_job_id=None, carrier_job_status=None
                 )
-                return make_response(200, [*response.json(), pending])
+                return make_response(
+                    200, [*response.json(), generation_wire(pending, self.management.adapter_device_id)]
+                )
             return response
 
         self.adapter._handle = handle
@@ -1483,7 +1729,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.prepare_automatic()
         self.attempt.overlay_snapshots.update(expected_owner_revision=None)
         with self.assertRaises(EvidenceInvariantError):
-            settle_terminal_generation(self.management, self.terminal(), "placeholder-store", settle_seq=1)
+            settle_terminal_generation(
+                self.management, self.terminal(), "00000000-0000-4000-8000-000000000004", settle_seq=1
+            )
         execution = NSOApplyExecution.objects.get()
         self.assertEqual(execution.consumption_state, "unconsumed")
         self.assertTrue(execution.invariant_code)
@@ -1506,7 +1754,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.attempt.overlay_snapshots.update(expected_owner_revision=None)
         table = NSOApplyExecution._meta.db_table
         with CaptureQueriesContext(connection) as queries, self.assertRaises(EvidenceInvariantError):
-            settle_terminal_generation(self.management, self.terminal(), "placeholder-store", settle_seq=1)
+            settle_terminal_generation(
+                self.management, self.terminal(), "00000000-0000-4000-8000-000000000004", settle_seq=1
+            )
         writes = [
             query["sql"].split(None, 1)[0].upper()
             for query in queries
@@ -1523,7 +1773,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         snapshot = self.attempt.overlay_snapshots.get(model_label=row._meta.label_lower, overlay_pk=row.pk)
         self.assertEqual(snapshot.expected_owner_revision, 0)
         execution = settle_terminal_generation(
-            self.management, self.terminal(refused=None), "placeholder-store", settle_seq=1
+            self.management, self.terminal(refused=None), "00000000-0000-4000-8000-000000000004", settle_seq=1
         )
         self.assertEqual(execution.consumption_state, "consumed")
         row.refresh_from_db()

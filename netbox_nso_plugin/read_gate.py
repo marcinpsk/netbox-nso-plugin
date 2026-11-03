@@ -45,6 +45,7 @@ from django.db import IntegrityError, transaction
 from django.utils.dateparse import parse_datetime
 
 from .lifecycle_fence import read_refresh
+from .settlement_schemas import canonical_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -469,6 +470,15 @@ def _parse_dt(value) -> datetime | None:
     return parse_datetime(value)
 
 
+def _incarnation_pair(rs: dict) -> tuple[str, datetime | None]:
+    """Return the read-state incarnation pair, or ``("", None)`` when either half is invalid."""
+    inc = rs.get("incarnation")
+    born = _parse_dt(rs.get("incarnation_born"))
+    if not canonical_uuid(inc) or born is None:
+        return "", None
+    return inc, born
+
+
 def _is_authoritative(rs: dict) -> bool:
     """Apply D3's binary gate tuple.
 
@@ -766,9 +776,8 @@ def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _D
             row.save()
             return _Decision(LEGACY, True, sequence=row.publication_sequence)
 
-        inc = read_state.get("incarnation") or ""
-        born = _parse_dt(read_state.get("incarnation_born"))
-        if not inc or born is None:
+        inc, born = _incarnation_pair(read_state)
+        if born is None:
             # a block without the incarnation pair cannot participate in ordering —
             # inconsistent per D3 → fail closed, write nothing
             return _Decision(SKIPPED_UNAVAILABLE, False)
@@ -1106,9 +1115,8 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
             rs = read_states[family]
             if rs is None:
                 continue
-            inc = rs.get("incarnation") or ""
-            born = _parse_dt(rs.get("incarnation_born"))
-            if not inc or born is None:
+            inc, born = _incarnation_pair(rs)
+            if born is None:
                 continue
             source_epoch = rs.get("source_epoch")
             source_current, changed = _observe_source_epoch(m, source_epoch)

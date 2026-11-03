@@ -23,6 +23,8 @@ from uuid import uuid4
 
 import requests
 
+from ._settlement_wire import deployment_wire, generation_wire, job_wire
+
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 GENERATION_RESPONSE_FIELDS = frozenset(
     {
@@ -62,7 +64,7 @@ class SettlementStore:
     """One adapter store: its incarnation, its jobs and its static-route intent echo."""
 
     def __init__(self):
-        self.incarnation = uuid4().hex
+        self.incarnation = str(uuid4())
         self.jobs: list[dict] = []
         self.routes: dict[int, list[dict]] = {}
         #: adapter device rows, keyed by adapter device id
@@ -282,9 +284,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _drain(self) -> bytes:
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
     def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(length) or b"{}")
+        return json.loads(self._drain() or b"{}")
 
     def _device_id_from_path(self, parsed) -> int:
         return int(parsed.path.split("/")[4])
@@ -296,7 +300,7 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path.endswith("/deployment-evidence"):
             device_id = self._device_id_from_path(parsed)
             requested = self._body()["apply_attempt_ids"]
-            self._send(200, store.deployment_evidence(device_id, requested))
+            self._send(200, deployment_wire(store.deployment_evidence(device_id, requested)))
             return
 
         if parsed.path == "/api/v1/devices":
@@ -313,12 +317,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"job_id": "notify-1"})
             return
 
+        # Drain the body so an unexpected POST cannot corrupt the next request on this connection.
+        self._drain()
         self._send(404, {"error": {"code": "not_found", "message": f"unexpected request {self.path}"}})
 
     def do_PUT(self):  # noqa: N802 — BaseHTTPRequestHandler's dispatch name
         parsed = urlparse(self.path)
         store = self._store
-        body = self._body()
+        raw = self._drain()
 
         if parsed.path.endswith("/scope"):
             device_id = self._device_id_from_path(parsed)
@@ -338,7 +344,7 @@ class _Handler(BaseHTTPRequestHandler):
                 200,
                 store.put_static_route_intent(
                     device_id,
-                    body["routes"],
+                    json.loads(raw)["routes"],
                     source_push_seq=int(selector) if selector is not None else None,
                 ),
             )
@@ -377,7 +383,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(503, {"error": {"code": "nso_error", "message": "the jobs list is unavailable"}})
                     return
                 rows = store.recent(int(device_id), limit)
-            self._send(200, rows, headers={STORE_INCARNATION_HEADER: store.incarnation})
+            self._send(200, [job_wire(row) for row in rows], headers={STORE_INCARNATION_HEADER: store.incarnation})
             return
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/generations"):
@@ -389,7 +395,7 @@ class _Handler(BaseHTTPRequestHandler):
             cursor = int(query.get("since_seq") or 0)
             limit = int(query.get("limit") or 100)
             rows = [row for row in store.generations.get(device_id, []) if row["seq"] > cursor]
-            self._send(200, rows[:limit])
+            self._send(200, [generation_wire(row, device_id) for row in rows[:limit]])
             return
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/static-route-intent"):

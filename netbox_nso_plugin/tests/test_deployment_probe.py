@@ -21,6 +21,7 @@ from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution, NSOInte
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import make_managed
 from ._settlement_adapter import FakeAdapter, LoopbackOnlySession
+from ._settlement_wire import deployment_wire, generation_wire, job_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
@@ -73,11 +74,14 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
                 params = kwargs.get("params") or {}
                 return make_response(
                     200,
-                    self.socket_adapter.store.feed(
-                        self.management.adapter_device_id,
-                        int(params.get("after_settle_seq", 0)),
-                        int(params.get("limit", 100)),
-                    ),
+                    [
+                        job_wire(job)
+                        for job in self.socket_adapter.store.feed(
+                            self.management.adapter_device_id,
+                            int(params.get("after_settle_seq", 0)),
+                            int(params.get("limit", 100)),
+                        )
+                    ],
                 )
             if method == "GET" and url.endswith("/intent-receipts"):
                 response = original(method, url, **kwargs)
@@ -222,6 +226,143 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
 
 
 class TestDeploymentProbe(DeploymentCase):
+    def acknowledged_failed_item(self):
+        """Return a failed adapter row for an obligation that an acknowledged issue released."""
+        from django.utils import timezone
+
+        from netbox_nso_plugin.durable_capture import mapping_epoch
+        from netbox_nso_plugin.models import NSOSettlementIssue
+
+        from ._adapter_http import make_generation_listing
+        from ._settlement_observation import failed_item
+
+        incarnation = self.socket_adapter.store.incarnation
+        now = timezone.now()
+        issue = NSOSettlementIssue.objects.create(
+            management=self.management,
+            mapping_epoch=mapping_epoch(self.management),
+            adapter_device_id=self.management.adapter_device_id,
+            store_incarnation=incarnation,
+            job_id=499,
+            settle_seq=1,
+            request_fence={},
+            stall_class="invalid_evidence",
+            stall_reason="invalid job envelope",
+            position="historical",
+            cursor_before=1,
+            cursor_after=1,
+            evidence_digest="b" * 64,
+            impact_digest="c" * 64,
+            contract_fingerprint="d" * 64,
+            revision_digest="e" * 64,
+            proposal={"obligations": []},
+            state="acknowledged",
+            closed_at=now,
+            actor_id=1,
+            actor_label="placeholder-operator",
+            acknowledgement_reason="placeholder reason",
+            acknowledged_at=now,
+            committed_effects=[],
+        )
+        prior = NSOApplyAttempt.objects.create(management=self.management, trigger_kind="cadence")
+        NSOApplyExecution.objects.create(
+            attempt=prior,
+            management=self.management,
+            mapping_epoch=mapping_epoch(self.management),
+            adapter_device_id=self.management.adapter_device_id,
+            store_incarnation=incarnation,
+            generation_id=80,
+            generation_seq=3,
+            carrier_job_id=499,
+            settle_seq=1,
+            consumption_state="acknowledged",
+            settlement_issue=issue,
+        )
+        return failed_item(
+            generation_wire(
+                make_generation_listing(generation_id=80, seq=3, job_id=499, carrier_job_id=499),
+                self.management.adapter_device_id,
+            )
+        )
+
+    def test_probe_registration_ignores_an_acknowledged_failed_listing_row(self):
+        from ._adapter_http import make_response
+
+        self.probe()
+        failed = self.acknowledged_failed_item()
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                return make_response(200, [failed, *response.json()])
+            return response
+
+        self.adapter._handle = handle
+        self.command(register_probe=str(self.attempt.pk))
+        self.assertEqual(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id, self.attempt.pk)
+        self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")
+
+    def test_probe_registration_ignores_an_acknowledged_failed_evidence_head(self):
+        from ._adapter_http import make_response
+
+        self.probe()
+        head = self.acknowledged_failed_item()
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                return make_response(200, {**response.json(), "head": head})
+            return response
+
+        self.adapter._handle = handle
+        self.command(register_probe=str(self.attempt.pk))
+        self.assertEqual(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id, self.attempt.pk)
+        self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")
+
+    def test_probe_registration_blocks_when_its_own_generation_was_acknowledged(self):
+        from django.core.management.base import CommandError
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOSettlementIssue
+
+        self.probe()
+        execution = NSOApplyExecution.objects.get(attempt=self.attempt)
+        now = timezone.now()
+        issue = NSOSettlementIssue.objects.create(
+            management=self.management,
+            mapping_epoch=execution.mapping_epoch,
+            adapter_device_id=self.management.adapter_device_id,
+            store_incarnation=execution.store_incarnation,
+            job_id=execution.carrier_job_id,
+            settle_seq=execution.settle_seq,
+            request_fence={},
+            stall_class="invalid_evidence",
+            stall_reason="invalid job envelope",
+            position="historical",
+            cursor_before=1,
+            cursor_after=1,
+            evidence_digest="b" * 64,
+            impact_digest="c" * 64,
+            contract_fingerprint="d" * 64,
+            revision_digest="e" * 64,
+            proposal={"obligations": []},
+            state="acknowledged",
+            closed_at=now,
+            actor_id=1,
+            actor_label="placeholder-operator",
+            acknowledgement_reason="placeholder reason",
+            acknowledged_at=now,
+            committed_effects=[],
+        )
+        NSOApplyExecution.objects.filter(pk=execution.pk).update(
+            consumption_state="acknowledged", settlement_issue=issue
+        )
+        with self.assertRaisesRegex(CommandError, "Probe generation is released or missing from the listing"):
+            self.command(register_probe=str(self.attempt.pk))
+        self.assertIsNone(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id)
+
     def test_pruning_preserves_nonhead_certificate_when_remote_carrier_is_unavailable(self):
         from datetime import timedelta
 
@@ -810,14 +951,16 @@ class TestDeploymentProbe(DeploymentCase):
             if method == "GET" and url.endswith("/generations"):
                 generations = response.json()
                 historical = {
-                    **generations[0],
+                    **generations[0]["projection"],
                     "generation_id": 79,
                     "seq": 2,
                     "job_id": 499,
                     "carrier_job_id": 499,
                     "status": "failed",
                 }
-                return make_response(200, [historical, *generations])
+                return make_response(
+                    200, [generation_wire(historical, self.management.adapter_device_id), *generations]
+                )
             return response
 
         self.adapter._handle = gap
@@ -867,7 +1010,7 @@ class TestDeploymentProbe(DeploymentCase):
             document = response.json()
             if method == "GET" and url.endswith("/generations"):
                 historical = {
-                    **document[0],
+                    **document[0]["projection"],
                     **{
                         key: execution.terminal_projection[key]
                         for key in ("generation_id", "seq", "stream_revisions", "source_push_seq")
@@ -877,17 +1020,25 @@ class TestDeploymentProbe(DeploymentCase):
                     "carrier_job_id": retained["carrier_job_id"],
                     "carrier_job_status": retained["carrier_job_status"],
                 }
-                return make_response(200, [historical, *document])
+                return make_response(200, [generation_wire(historical, self.management.adapter_device_id), *document])
             if method == "POST" and url.endswith("/deployment-evidence"):
                 if str(execution.attempt_id) in kwargs["json"]["apply_attempt_ids"]:
-                    document["attempts"].append(
-                        {
-                            "apply_attempt_id": str(execution.attempt_id),
-                            "admission_state": "admitted",
-                            "http_status": execution.attempt.http_status,
-                            "response": execution.attempt.response,
-                            "generations": [retained],
-                        }
+                    document["attempts"].extend(
+                        deployment_wire(
+                            {
+                                **document,
+                                "head": None,
+                                "attempts": [
+                                    {
+                                        "apply_attempt_id": str(execution.attempt_id),
+                                        "admission_state": "admitted",
+                                        "http_status": execution.attempt.http_status,
+                                        "response": execution.attempt.response,
+                                        "generations": [retained],
+                                    }
+                                ],
+                            }
+                        )["attempts"]
                     )
                 return make_response(200, document)
             return response

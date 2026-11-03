@@ -42,6 +42,7 @@ class TestExecutionConsumption(_SettlementCase):
         assert state.last_apply_error == ""
         assert result.stalled
         assert self._cursor(management).settle_cursor_seq == 0
+        assert self._cursor(management).settle_evidence_error == {}
         assert self.adapter.store.readback_requests == []
 
     def test_legacy_route_failure_cannot_change_overlay_lifecycle(self):
@@ -70,6 +71,7 @@ class TestExecutionConsumption(_SettlementCase):
         assert state.status == "deploying"
         assert result.stalled
         assert result.cursor == 0
+        assert self._cursor(management).settle_evidence_error == {}
 
     def test_a_consumed_execution_advances_without_rewriting_overlay_state(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
@@ -129,4 +131,8 @@ class TestExecutionConsumption(_SettlementCase):
         result = consume_static_route_settlements(management)
 
         assert result.stalled
-        assert result.cursor == 0
+        assert result.consumed == 0
+        assert result.cursor is None
+        assert self._cursor(management).settle_cursor_seq is None
+        execution.refresh_from_db()
+        assert execution.terminal_projection == projection

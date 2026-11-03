@@ -9,6 +9,11 @@ from .refusal_registry import OVERLAYS
 
 _LABELS = tuple(OVERLAYS)
 _LABEL_CHOICES = tuple((label, label) for label in _LABELS)
+_DIGEST = r"^[0-9a-f]{64}$"
+ISSUE_STATES = ("open", "resolved", "superseded", "acknowledged")
+STALL_CLASSES = ("invalid_evidence", "evidence_invariant")
+ISSUE_POSITIONS = ("next_feed", "historical")
+OWNER_EFFECTS = ("unavailable", "superseded", "missing_owner")
 
 
 class NSOAcceptedSelection(models.Model):
@@ -108,10 +113,18 @@ class NSOApplyExecution(models.Model):
             ("consumed", "Consumed"),
             ("superseded", "Superseded"),
             ("unresolved", "Unresolved"),
+            ("acknowledged", "Acknowledged"),
         ),
     )
     invariant_code = models.CharField(max_length=64, blank=True, default="")
     consumed_at = models.DateTimeField(null=True, blank=True)
+    settlement_issue = models.ForeignKey(
+        "NSOSettlementIssue",
+        on_delete=models.RESTRICT,
+        null=True,
+        blank=True,
+        related_name="acknowledged_executions",
+    )
     created_at = models.DateTimeField(db_default=Now())
 
     class Meta:
@@ -138,9 +151,27 @@ class NSOApplyExecution(models.Model):
                 name="nso_execution_terminal_bound",
             ),
             models.CheckConstraint(
-                condition=models.Q(consumption_state__in=("unconsumed", "unresolved"))
+                condition=models.Q(consumption_state__in=("unconsumed", "unresolved", "acknowledged"))
                 | models.Q(terminal_projection__isnull=False, consumed_at__isnull=False),
                 name="nso_execution_consumed_terminal",
+            ),
+            # An acknowledgement resolves one exact obligation and is never a certificate.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        consumption_state="acknowledged",
+                        settlement_issue__isnull=False,
+                        consumed_at__isnull=True,
+                        store_incarnation__isnull=False,
+                        generation_id__isnull=False,
+                        carrier_job_id__isnull=False,
+                        settle_seq__isnull=False,
+                        settle_seq__gt=0,
+                    )
+                    & (models.Q(terminal_projection__isnull=False) | models.Q(commit_acknowledged__isnull=True))
+                )
+                | (~models.Q(consumption_state="acknowledged") & models.Q(settlement_issue__isnull=True)),
+                name="nso_execution_acknowledged",
             ),
         ]
 
@@ -196,6 +227,13 @@ class NSOApplyOverlaySnapshot(models.Model):
             models.UniqueConstraint(fields=["attempt", "model_label", "overlay_pk"], name="nso_snapshot_owner"),
             models.CheckConstraint(condition=models.Q(model_label__in=_LABELS), name="nso_snapshot_closed_model"),
         ]
+        # The absent-owner proof reads an owner's snapshots across attempts.
+        indexes = [
+            models.Index(
+                fields=["model_label", "overlay_pk", "mapping_epoch", "expected_fence_revision"],
+                name="nso_snapshot_owner_epoch",
+            )
+        ]
 
 
 class NSOOverlaySettlementFence(models.Model):
@@ -222,4 +260,141 @@ class NSOOverlaySettlementFence(models.Model):
                 fields=["management", "mapping_epoch", "model_label", "overlay_pk"], name="nso_fence_owner"
             ),
             models.CheckConstraint(condition=models.Q(model_label__in=_LABELS), name="nso_fence_closed_model"),
+        ]
+
+
+class NSOSettlementIssue(models.Model):
+    """One immutable revision of an identified settlement stall and its proposed resolution."""
+
+    management = models.ForeignKey("NSODeviceManagement", on_delete=models.CASCADE, related_name="settlement_issues")
+    mapping_epoch = models.CharField(max_length=64)
+    adapter_device_id = models.PositiveBigIntegerField()
+    store_incarnation = models.CharField(max_length=64)
+    job_id = models.PositiveBigIntegerField()
+    settle_seq = models.PositiveBigIntegerField()
+    request_fence = models.JSONField()
+    stall_class = models.CharField(max_length=32, choices=tuple((value, value) for value in STALL_CLASSES))
+    stall_reason = models.CharField(max_length=128)
+    position = models.CharField(max_length=16, choices=tuple((value, value) for value in ISSUE_POSITIONS))
+    cursor_before = models.PositiveBigIntegerField()
+    cursor_after = models.PositiveBigIntegerField()
+    evidence_digest = models.CharField(max_length=64)
+    impact_digest = models.CharField(max_length=64)
+    contract_fingerprint = models.CharField(max_length=64)
+    revision_digest = models.CharField(max_length=64)
+    proposal = models.JSONField()
+    state = models.CharField(
+        max_length=16, default="open", choices=tuple((value, value.capitalize()) for value in ISSUE_STATES)
+    )
+    closed_at = models.DateTimeField(null=True, blank=True)
+    # A plain user reference and label keep the audit identity after the user is deleted.
+    actor_id = models.PositiveBigIntegerField(null=True, blank=True)
+    actor_label = models.CharField(max_length=150, blank=True, default="")
+    acknowledgement_reason = models.TextField(blank=True, default="")
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+    committed_effects = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(db_default=Now())
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "management",
+                    "mapping_epoch",
+                    "adapter_device_id",
+                    "store_incarnation",
+                    "job_id",
+                    "revision_digest",
+                ],
+                name="nso_issue_revision",
+            ),
+            # A walk stops at one position, so one revision at most is open.
+            models.UniqueConstraint(fields=["management"], condition=models.Q(state="open"), name="nso_issue_open"),
+            models.CheckConstraint(condition=models.Q(state__in=ISSUE_STATES), name="nso_issue_state"),
+            models.CheckConstraint(condition=models.Q(stall_class__in=STALL_CLASSES), name="nso_issue_stall_class"),
+            models.CheckConstraint(
+                condition=models.Q(
+                    position="next_feed",
+                    cursor_after=models.F("settle_seq"),
+                    settle_seq__gt=models.F("cursor_before"),
+                )
+                | models.Q(
+                    position="historical",
+                    cursor_after=models.F("cursor_before"),
+                    settle_seq__lte=models.F("cursor_before"),
+                ),
+                name="nso_issue_cursor_rule",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(
+                    job_id__gt=0,
+                    settle_seq__gt=0,
+                    evidence_digest__regex=_DIGEST,
+                    impact_digest__regex=_DIGEST,
+                    contract_fingerprint__regex=_DIGEST,
+                    revision_digest__regex=_DIGEST,
+                )
+                & ~models.Q(store_incarnation="")
+                & ~models.Q(stall_reason=""),
+                name="nso_issue_identity",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(state="open", closed_at__isnull=True)
+                    | (~models.Q(state="open") & models.Q(closed_at__isnull=False))
+                )
+                & (
+                    (
+                        models.Q(
+                            state="acknowledged",
+                            acknowledged_at__isnull=False,
+                            committed_effects__isnull=False,
+                        )
+                        & models.Q(actor_id__isnull=False)
+                        & ~models.Q(actor_label="")
+                        & ~models.Q(acknowledgement_reason="")
+                    )
+                    | models.Q(
+                        ~models.Q(state="acknowledged"),
+                        actor_id__isnull=True,
+                        actor_label="",
+                        acknowledgement_reason="",
+                        acknowledged_at__isnull=True,
+                        committed_effects__isnull=True,
+                    )
+                ),
+                name="nso_issue_audit",
+            ),
+        ]
+
+
+class NSOSettlementIssueOwner(models.Model):
+    """One owner's frozen contribution subset and its proposed and committed effect."""
+
+    issue = models.ForeignKey(NSOSettlementIssue, on_delete=models.CASCADE, related_name="owners")
+    model_label = models.CharField(max_length=100, choices=_LABEL_CHOICES)
+    overlay_pk = models.PositiveBigIntegerField()
+    # Plain identities keep the audit record when retention prunes the attempt.
+    snapshot_ids = models.JSONField(default=list)
+    attempt_id = models.UUIDField(null=True, blank=True)
+    selection_ids = models.JSONField(default=list)
+    contributors = models.JSONField(default=list)
+    unknown = models.JSONField(default=list)
+    covered = models.JSONField(default=list)
+    authority = models.JSONField()
+    order_bound = models.PositiveBigIntegerField()
+    proposed_effect = models.CharField(max_length=16, choices=tuple((value, value) for value in OWNER_EFFECTS))
+    committed_effect = models.CharField(
+        max_length=16, null=True, blank=True, choices=tuple((value, value) for value in OWNER_EFFECTS)
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["issue", "model_label", "overlay_pk"], name="nso_issue_owner"),
+            models.CheckConstraint(condition=models.Q(model_label__in=_LABELS), name="nso_issue_owner_model"),
+            models.CheckConstraint(
+                condition=models.Q(proposed_effect__in=OWNER_EFFECTS)
+                & (models.Q(committed_effect__isnull=True) | models.Q(committed_effect=models.F("proposed_effect"))),
+                name="nso_issue_owner_effect",
+            ),
         ]

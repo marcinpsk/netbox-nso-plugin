@@ -9,6 +9,7 @@ import pytest
 from netbox_nso_plugin import adapter_client
 
 from ._adapter_http import make_response, make_transport_session
+from ._settlement_wire import job_wire
 from .test_refusal_result import refused_bgp_result
 
 CONFIG = {
@@ -18,6 +19,22 @@ CONFIG = {
     "ca_cert_path": None,
     "timeout": 5,
 }
+
+
+def _job_wire(job):
+    return job_wire(
+        {
+            "device_id": 7,
+            "settle_seq": 1,
+            "error": None,
+            "context": None,
+            "created_at": "2026-01-02T03:04:05+00:00",
+            "updated_at": "2026-01-02T03:04:05+00:00",
+            "started_at": None,
+            "heartbeat_at": None,
+            **job,
+        }
+    )
 
 
 def _response(payload):
@@ -59,9 +76,11 @@ def test_interface_document_rejects_non_objects_before_reading_errors(payload):
 def test_job_rejects_typed_projection_drift_before_it_reaches_a_view():
     result = refused_bgp_result()
     job = {"id": 23, "type": "apply", "status": "failed", "result": result, "row_outcomes": [], "refusals": []}
-    config, transport = _response(job)
-    with config, transport, pytest.raises(adapter_client.AdapterError, match="execution evidence"):
+    config, transport = _response(_job_wire(job))
+    with config, transport, pytest.raises(adapter_client.InvalidJobEvidence) as raised:
         adapter_client.get_job(23)
+    assert raised.value.reason == "invalid job envelope"
+    assert raised.value.job_id == 23
 
 
 def test_job_rejects_the_old_two_count_keys():
@@ -75,9 +94,11 @@ def test_job_rejects_the_old_two_count_keys():
         "row_outcomes": result["row_outcomes"],
         "refusals": result["refusals"],
     }
-    config, transport = _response(job)
-    with config, transport, pytest.raises(adapter_client.AdapterError, match="execution evidence"):
+    config, transport = _response(_job_wire(job))
+    with config, transport, pytest.raises(adapter_client.InvalidJobEvidence) as raised:
         adapter_client.get_job(23)
+    assert raised.value.reason == "invalid job envelope"
+    assert raised.value.job_id == 23
 
 
 def test_job_projection_reports_all_four_validated_counts():
@@ -93,7 +114,7 @@ def test_job_projection_reports_all_four_validated_counts():
         "row_outcomes": result["row_outcomes"],
         "refusals": result["refusals"],
     }
-    config, transport = _response(job)
+    config, transport = _response(_job_wire(job))
     with config, transport:
         projected = _job_with_outcome_counts(job_projection(adapter_client.get_job(23)))
     assert projected["outcome_counts"] == [

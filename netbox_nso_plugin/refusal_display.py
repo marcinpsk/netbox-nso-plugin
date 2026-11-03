@@ -85,6 +85,7 @@ def _project_snapshot_interface(interface):
 
 
 def _current_snapshot(row):
+    from .lifecycle_fence import current_owner_fences
     from .models import NSOOverlaySettlementFence
     from .refusal_registry import OVERLAYS
 
@@ -92,19 +93,18 @@ def _current_snapshot(row):
         return None
     if hasattr(row, "_refusal_current"):
         return row._refusal_current
-    # Fences at other mapping epochs share the owner key; only the current epoch's fence counts.
-    fences = (
+    key = (row._meta.label_lower, row.pk)
+    fence = current_owner_fences(
+        {key},
         NSOOverlaySettlementFence.objects.filter(
-            model_label=row._meta.label_lower,
-            overlay_pk=row.pk,
             accepted_at=row.accepted_at,
             current_attempt__isnull=False,
             last_execution__consumption_state="consumed",
         )
         .select_related("management", "last_execution")
-        .prefetch_related("last_execution__overlay_snapshots")
-    )
-    return next((current for fence in fences if (current := _snapshot_for_fence(row, fence)) is not None), None)
+        .prefetch_related("last_execution__overlay_snapshots"),
+    ).get(key)
+    return None if fence is None else _snapshot_for_fence(row, fence)
 
 
 def _snapshot_for_fence(row, fence):
@@ -126,6 +126,7 @@ def _snapshot_for_fence(row, fence):
 
 def project_rows(rows):
     """Load current execution links and previous refusals once for a display collection."""
+    from .lifecycle_fence import current_owner_fences
     from .models import NSOOverlaySettlementFence
     from .refusal_registry import OVERLAYS
 
@@ -138,16 +139,15 @@ def project_rows(rows):
     for row in owners.values():
         row._refusal_current = None
     if owners:
-        fences = (
+        fences = current_owner_fences(
+            owners,
             NSOOverlaySettlementFence.objects.filter(
-                model_label__in={label for label, _pk in owners},
-                overlay_pk__in={pk for _label, pk in owners},
                 current_attempt__isnull=False,
                 last_execution__consumption_state="consumed",
             )
             .select_related("management", "last_execution")
-            .prefetch_related("last_execution__overlay_snapshots")
-        )
+            .prefetch_related("last_execution__overlay_snapshots"),
+        ).values()
         executions = {}
         for fence in fences:
             fence.last_execution = executions.setdefault(fence.last_execution_id, fence.last_execution)
@@ -167,7 +167,10 @@ def settled_interface_owners(queryset):
     from .models import NSOInterfaceState, NSOOverlaySettlementFence
 
     current = NSOOverlaySettlementFence.objects.filter(
-        model_label=NSOInterfaceState._meta.label_lower, overlay_pk=OuterRef("pk"), current_attempt__isnull=False
+        management__device_id=OuterRef("interface__device_id"),
+        model_label=NSOInterfaceState._meta.label_lower,
+        overlay_pk=OuterRef("pk"),
+        current_attempt__isnull=False,
     )
     # Exact stored values imply matches_device_value; any looser match stays a projection candidate.
     equal = (
@@ -395,16 +398,34 @@ def document_projection(result):
         summary = UNAVAILABLE if unavailable else UNAPPLIED if unapplied else ""
         return {"refusal": None, "refusal_text": "", "summary": summary}
     projected = attributed_projection(attributed)
-    rollback = (
-        result["commit_acknowledged"] is False
-        and all(row["disposition"] in {"refused", "not_applied"} for row in result["row_outcomes"])
-        and any(row["disposition"] == "refused" for row in result["row_outcomes"])
-        and all(
-            cause["provenance"] == "current" and cause["sender_phase"] in {"pre_commit_dry_run", "commit"}
-            for cause in attributed
-        )
+    identities = {refusal_contract.logical_key(row) for row in result["row_outcomes"]}
+    phrases = set()
+    for cause, catalog in zip(attributed, projected["causes"], strict=True):
+        logical_rows = cause["logical_rows"]
+        foreign = [
+            logical["row"] for logical in logical_rows if refusal_contract.logical_key(logical) not in identities
+        ]
+        if len(foreign) < len(logical_rows):
+            phrases.add(f"{catalog['reason']}: {catalog['message']}")
+        else:
+            foreign = [catalog["row"]]
+        # A mixed cause also names each linked row outside this Apply.
+        for row in foreign:
+            phrases.add(
+                f"Blocked by {catalog['family']} {row['subject']} {row['key']} "
+                f"(not part of this Apply): {catalog['message']}"
+            )
+    projected["text"] = " | ".join(sorted(phrases))
+    rollback = result["commit_acknowledged"] is False and all(
+        cause["sender_phase"] in {"pre_commit_dry_run", "commit"} for cause in attributed
     )
-    summary = "Refused; nothing committed. " if rollback else "Execution evidence. "
+    summary = "Execution evidence. "
+    if rollback:
+        summary = (
+            "Refused; commit not attempted. "
+            if all(cause["sender_phase"] == "pre_commit_dry_run" for cause in attributed)
+            else "Refused; nothing committed. "
+        )
     return {"refusal": projected, "refusal_text": projected["text"], "summary": summary + projected["text"]}
 
 
@@ -427,7 +448,8 @@ def job_projection(job):
 
 
 def device_execution_summaries(management):
-    """Summarize only executions named by current projected owners."""
+    """Summarize current owners and executions with no local owner snapshots."""
+    from .durable_capture import mapping_epoch
     from .refusal_registry import OVERLAYS
 
     if management is None:
@@ -443,7 +465,16 @@ def device_execution_summaries(management):
                 related
             )
         )
-    executions = {}
+    executions = {
+        execution.pk: (execution, False)
+        for execution in management.apply_executions.filter(
+            mapping_epoch=mapping_epoch(management),
+            adapter_device_id=management.adapter_device_id,
+            store_incarnation=management.settle_cursor_incarnation,
+            overlay_snapshots__isnull=True,
+            consumption_state="consumed",
+        )
+    }
     for row in project_rows(rows):
         current = _current_snapshot(row)
         if current is not None:
@@ -462,6 +493,18 @@ def device_execution_summaries(management):
         if projected["summary"]:
             summaries.append(projected)
     return summaries
+
+
+def settlement_stall_projection(management):
+    """Show a diagnostic only while its complete request fence is current."""
+    from .settlement_evidence import matches_request_fence
+
+    if management is None:
+        return None
+    issue = management.settle_evidence_error
+    if issue and matches_request_fence(management, issue.get("request_fence")):
+        return issue
+    return None
 
 
 def validate_interface_errors(interfaces):

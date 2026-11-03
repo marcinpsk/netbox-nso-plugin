@@ -269,6 +269,44 @@ class TestCursorEpoch(_SettlementCase):
                 assert after.settle_stall_seq is None, f"{arm}: the stall triple survived the reset"
                 assert after.settle_stall_attempts == 0
 
+    def test_an_epoch_reset_persists_a_cleared_stall_triple(self):
+        """A dead store's stall at the same sequence is not continued by the new store's stall."""
+        from datetime import timedelta
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        for arm, adapter_device_id in (("stalls", 43), ("empty", 44)):
+            with self.subTest(arm=arm):
+                device = _make_device(f"stallreset{arm}")
+                mgmt = _make_mgmt(device, f"stallreset{arm}", adapter_device_id, adapter=self.adapter)
+                sr = _route(f"198.19.{adapter_device_id}.0/24", "198.19.0.1", devices=[device])
+                _own(sr, mgmt, generation=80, expected=False, orphan=True)
+                if arm == "stalls":
+                    self.adapter.store.terminal_job(adapter_device_id, extra=_execution_result())
+                old_first_seen = timezone.now() - timedelta(days=1)
+                NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+                    settle_cursor_seq=0,
+                    settle_cursor_incarnation="a-dead-store",
+                    settle_cursor_device_id=adapter_device_id,
+                    settle_stall_seq=1,
+                    settle_stall_attempts=5,
+                    settle_stall_first_seen_at=old_first_seen,
+                )
+
+                result = consume_static_route_settlements(mgmt)
+
+                assert result.epoch_reset is True
+                row = self._cursor(mgmt)
+                assert row.settle_cursor_incarnation == self.adapter.store.incarnation
+                if arm == "stalls":
+                    assert result.stalled
+                    assert (row.settle_stall_seq, row.settle_stall_attempts) == (1, 1)
+                    assert row.settle_stall_first_seen_at > old_first_seen
+                else:
+                    assert (row.settle_stall_seq, row.settle_stall_attempts) == (None, 0)
+                    assert row.settle_stall_first_seen_at is None
+
     def test_a_store_rebuild_is_caught_from_the_feed_not_the_cached_mirror(self):
         """S4.2c — a new adapter lifespan under the same device id and the same cached mirrors."""
         from netbox_nso_plugin.models import NSODeviceManagement
@@ -396,7 +434,10 @@ class TestUnresolvedExecution(_SettlementCase):
         execution.save(update_fields=("terminal_projection",))
         result = consume_static_route_settlements(mgmt)
         assert result.stalled
-        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert result.consumed == 0
+        assert self._cursor(mgmt).settle_cursor_seq is None
+        execution.refresh_from_db()
+        assert execution.terminal_projection == projection
 
     def test_a_queued_sibling_never_blocks_the_cursor(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
@@ -456,6 +497,35 @@ class TestUnresolvedExecution(_SettlementCase):
         assert (result.stalled, result.drained, result.consumed) == (True, False, 0)
         row = self._cursor(mgmt)
         assert (row.settle_cursor_seq, row.settle_stall_seq, row.settle_stall_attempts) == (None, None, 0)
+
+    def test_consumer_invariant_keeps_the_committed_prefix(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("backloginvariant")
+        mgmt = _make_mgmt(device, "backloginvariant", 84, adapter=self.adapter)
+        store = self.adapter.store
+        jobs = [store.terminal_job(84, job_type="sync") for _ in range(10_001)]
+        serve = store.feed
+        heads = 0
+
+        def feed(device_id, after, limit):
+            nonlocal heads
+            heads += after == 0
+            page = serve(device_id, after, limit)
+            if after == 0 and heads == 2:
+                page[1] = {**page[1], "settle_seq": page[0]["settle_seq"]}
+            return page
+
+        store.feed = feed
+        result = consume_static_route_settlements(mgmt)
+        assert result.stalled
+        row = self._cursor(mgmt)
+        assert row.settle_cursor_seq == 1
+        assert result.consumed == 1
+        assert not result.drained
+        assert row.settle_evidence_error.get("job_id") == jobs[1]["id"]
+        assert row.settle_evidence_error.get("settle_seq") == 1
+        assert row.settle_evidence_error.get("reason") == "invalid settlement evidence"
 
 
 class TestMalformedFeedPreservesCursor(_SettlementCase):

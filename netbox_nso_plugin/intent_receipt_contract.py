@@ -6,6 +6,7 @@ import re
 
 from .delivery import delivery_keys
 from .refusal_contract import _positive, _require, _shape, _timestamp
+from .settlement_schemas import within_wire_bounds
 
 RECEIPT_FIELDS = frozenset(
     {
@@ -48,6 +49,7 @@ def _receipt(raw):
 
 def validate_intent_receipts(raw):
     """Return the complete receipt document after its exact wire shape is proved."""
+    _require(within_wire_bounds(raw), "invalid receipt bounds")
     _shape(raw, {"receipts", "global_max_push_seq", "global_max_route_id"})
     _require(isinstance(raw["receipts"], list), "invalid receipt collection")
     for name in ("global_max_push_seq", "global_max_route_id"):
