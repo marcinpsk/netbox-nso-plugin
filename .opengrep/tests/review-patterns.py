@@ -3386,6 +3386,22 @@ def generation_listing_filters(client, adapter_client, wanted, released):
     return listing, kept
 
 
+def generation_listing_projected_filters(client, adapter_client, wanted):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    jobs = [row["carrier_job_id"] for row in listing if row["generation_id"] in wanted]
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    seqs = {row["seq"] for row in listing if row["generation_id"] in wanted}
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    by_id = {row["generation_id"]: row for row in listing if row["generation_id"] in wanted}
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    direct = {row["seq"] for row in adapter_client.list_device_generations(7) if row["generation_id"] in wanted}
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    keyed = {row["generation_id"]: row for row in adapter_client.list_device_generations(7) if row["seq"] > 0}
+    # ok: nso-generation-listing-filter-drops-truncation
+    return jobs, seqs, by_id, direct, keyed, {row["generation_id"]: row for row in listing}
+
+
 def generation_listing_filter_after_truncation_check(client, wanted):
     listing = client.list_device_generations(7)
     for row in listing:
@@ -3542,6 +3558,15 @@ def unscoped_owner_fence(row):
     NSOOverlaySettlementFence.objects.filter(model_label=row._meta.label_lower, overlay_pk=row.pk).first()
     # ruleid: nso-owner-fence-unscoped-lookup
     return NSOOverlaySettlementFence.objects.filter(model_label__in={"a"}, overlay_pk__in={row.pk})
+
+
+def qualified_owner_fence(row, management):
+    # ruleid: nso-owner-fence-unscoped-lookup
+    models.NSOOverlaySettlementFence.objects.filter(model_label=row._meta.label_lower, overlay_pk=row.pk).first()
+    # ruleid: nso-owner-fence-unscoped-lookup
+    models.NSOOverlaySettlementFence.objects.filter(overlay_pk__in={row.pk})
+    # ok: nso-owner-fence-unscoped-lookup
+    return models.NSOOverlaySettlementFence.objects.filter(management=management, overlay_pk=row.pk)
 
 
 def scoped_owner_fence(row, management):
