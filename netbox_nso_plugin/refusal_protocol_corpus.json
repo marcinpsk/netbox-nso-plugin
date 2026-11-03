@@ -673,6 +673,42 @@
       ]
     },
     {
+      "name": "catalog-bgp.peer-family-undeclared",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp\",\"key\":\"7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"bgp.peer-family-undeclared\",\"message\":\"On this NED a peer address family is written only inside an address family that its scope declares. The scope declares no address family for this row.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bgp",
+          "row": {
+            "subject": "bgp",
+            "key": "7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a"
+          },
+          "field": null,
+          "reason": "target-not-found",
+          "message_id": "bgp.peer-family-undeclared",
+          "message": "On this NED a peer address family is written only inside an address family that its scope declares. The scope declares no address family for this row.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-bgp.vrf-peer-family-undeclared",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp\",\"key\":\"7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"bgp.vrf-peer-family-undeclared\",\"message\":\"On this NED a VRF peer exists only inside an address family that its scope declares. The scope declares no address family for this row.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bgp",
+          "row": {
+            "subject": "bgp",
+            "key": "7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a"
+          },
+          "field": null,
+          "reason": "target-not-found",
+          "message_id": "bgp.vrf-peer-family-undeclared",
+          "message": "On this NED a VRF peer exists only inside an address family that its scope declares. The scope declares no address family for this row.",
+          "related": null
+        }
+      ]
+    },
+    {
       "name": "catalog-isis.arcos-frr-per-interface",
       "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"isis.arcos-frr-per-interface\",\"message\":\"ArcOS sets IS-IS fast reroute per interface. State it on the interface rows, not on the process.\",\"related\":null}]}",
       "refusals": [
@@ -956,6 +992,24 @@
           "reason": "inexpressible-on-ned",
           "message_id": "lag.timer-needs-members",
           "message": "This NED sets the LACP timer on each member port, and the bundle has no member rows to carry it.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-lag.bundle-number-range-ios",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"lag\",\"row\":{\"subject\":\"lag\",\"key\":\"414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"lag.bundle-number-range-ios\",\"message\":\"The Port-channel number is outside the range that this NED accepts.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "lag",
+          "row": {
+            "subject": "lag",
+            "key": "414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "lag.bundle-number-range-ios",
+          "message": "The Port-channel number is outside the range that this NED accepts.",
           "related": null
         }
       ]

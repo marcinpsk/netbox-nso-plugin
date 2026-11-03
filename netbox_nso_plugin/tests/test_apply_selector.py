@@ -28,6 +28,7 @@ from ._outbox_case import (
     without_commit_drain,
 )
 from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
+from ._settlement_wire import job_wire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_STREAMS = {
@@ -195,20 +196,24 @@ class _ApplyContractAdapter(ReceiptAdapter):
             # Copied from JobOut in ../nso-adapter/tests/api/openapi_snapshot.json.
             return make_response(
                 200,
-                {
-                    "id": 900,
-                    "type": "apply",
-                    "device_id": 1558,
-                    "status": "running",
-                    "result": None,
-                    "error": None,
-                    "context": None,
-                    "created_at": "2026-08-13T10:00:00Z",
-                    "updated_at": "2026-08-13T10:00:00Z",
-                    "started_at": "2026-08-13T10:00:00Z",
-                    "heartbeat_at": "2026-08-13T10:00:00Z",
-                    "settle_seq": None,
-                },
+                job_wire(
+                    {
+                        "id": 900,
+                        "type": "apply",
+                        "device_id": 1558,
+                        "status": "running",
+                        "result": None,
+                        "row_outcomes": None,
+                        "refusals": None,
+                        "error": None,
+                        "context": None,
+                        "created_at": "2026-08-13T10:00:00Z",
+                        "updated_at": "2026-08-13T10:00:00Z",
+                        "started_at": "2026-08-13T10:00:00Z",
+                        "heartbeat_at": "2026-08-13T10:00:00Z",
+                        "settle_seq": None,
+                    }
+                ),
             )
         if method == "PUT" and self.failed_intent_suffix and url.endswith(self.failed_intent_suffix):
             # Copied from ErrorEnvelope in ../nso-adapter/tests/api/openapi_snapshot.json.

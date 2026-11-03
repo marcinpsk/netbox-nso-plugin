@@ -3293,3 +3293,306 @@ def observation_collection_defaults(document, snapshot, intent):
     # ok: nso-observation-collection-empty-default
     observed = observed_collection(document, "routers")
     return routers, policies, routes, hosts, vlans, users, communities, desired, observed
+
+
+def subtest_diagnostic_reads(
+    self, rows, mirror_update, settlement_stall_projection, consume, refusal_display, _outbox_case
+):
+    for row in rows:
+        with self.subTest(row=row):
+            consume(row)
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(settlement_stall_projection(self.management))
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(refusal_display.settlement_stall_projection(self.management))
+    for row in rows:
+        with self.subTest(row=row):
+            _outbox_case.mirror_update(self.management, settle_evidence_error={})
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(refusal_display.settlement_stall_projection(self.management))
+    for row in rows:
+        with self.subTest(row=row):
+            mirror_update(self.management, settle_evidence_error={})
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+    for row in rows:
+        mirror_update(self.management, settle_evidence_error={})
+        with self.subTest(row=row):
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(settlement_stall_projection(self.management))
+    for row in rows:
+        with self.subTest(row=row):
+            consume(row)
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+            mirror_update(self.management, settle_evidence_error={})
+            consume(row)
+    for row in rows:
+        with self.subTest(row=row):
+            consume(row)
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(settlement_stall_projection(self.management))
+        _outbox_case.mirror_update(self.management, settle_evidence_error={})
+    for row in rows:
+        mirror_update(self.management, settle_evidence_error={})
+        with self.subTest(row=row):
+            _outbox_case.mirror_update(self.management, settle_evidence_error={})
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(refusal_display.settlement_stall_projection(self.management))
+    consume(rows[0])
+    # ok: nso-test-subtest-stale-diagnostic
+    self.assertEqual(self.management.settle_evidence_error, {})
+
+
+def subtest_diagnostic_reads_after_one_reset(
+    self, rows, mirror_update, settlement_stall_projection, consume, refusal_display, _outbox_case
+):
+    _outbox_case.mirror_update(self.management, settle_evidence_error={})
+    for row in rows:
+        with self.subTest(row=row):
+            consume(row)
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(settlement_stall_projection(self.management))
+            # ruleid: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(refusal_display.settlement_stall_projection(self.management))
+    for row in rows:
+        _outbox_case.mirror_update(self.management, settle_evidence_error={})
+        with self.subTest(row=row):
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertIsNotNone(settlement_stall_projection(self.management))
+    for row in rows:
+        with self.subTest(row=row):
+            mirror_update(self.management, settle_evidence_error={})
+            consume(row)
+            # ok: nso-test-subtest-stale-diagnostic
+            self.assertEqual(self.management.settle_evidence_error["reason"], "invalid job envelope")
+
+
+def generation_listing_filters(client, adapter_client, wanted, released):
+    listing = client.list_device_generations(7) if wanted else []
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    listing = [row for row in listing if row.get("generation_id") in wanted]
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    kept = [row for row in adapter_client.list_device_generations(7) if not released(row)]
+    return listing, kept
+
+
+def generation_listing_projected_filters(client, adapter_client, wanted):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    jobs = [row["carrier_job_id"] for row in listing if row["generation_id"] in wanted]
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    seqs = {row["seq"] for row in listing if row["generation_id"] in wanted}
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    by_id = {row["generation_id"]: row for row in listing if row["generation_id"] in wanted}
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    direct = {row["seq"] for row in adapter_client.list_device_generations(7) if row["generation_id"] in wanted}
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    keyed = {row["generation_id"]: row for row in adapter_client.list_device_generations(7) if row["seq"] > 0}
+    # ok: nso-generation-listing-filter-drops-truncation
+    return jobs, seqs, by_id, direct, keyed, {row["generation_id"]: row for row in listing}
+
+
+def generation_listing_filter_after_truncation_check(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            client.raise_item_error(row)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return [row for row in listing if row.get("generation_id") in wanted]
+
+
+def generation_listing_generator_filters(client, adapter_client, wanted):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    found = next(row for row in listing if row["generation_id"] == wanted)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    return found, any(row for row in adapter_client.list_device_generations(7) if row["generation_id"] == wanted)
+
+
+def generation_listing_filter_after_noop_truncation_check(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            pass
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    return [row for row in listing if row.get("generation_id") in wanted]
+
+
+def generation_listing_generator_after_truncation_check(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            raise client.ListingTruncationError(row)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return next(row for row in listing if row["generation_id"] == wanted)
+
+
+def generation_listing_filter_keeps_truncation(adapter_client, acknowledged):
+    def released(row):
+        return not isinstance(row, adapter_client.ListingTruncation) and row["generation_id"] in acknowledged
+
+    # ok: nso-generation-listing-filter-drops-truncation
+    return [row for row in adapter_client.list_device_generations(7) if not released(row)]
+
+
+def generation_listing_lookup_after_evidence_check(adapter_client, generation_id):
+    listing = adapter_client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    adapter_client.raise_evidence_errors(listing)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return next(row for row in listing if row["generation_id"] == generation_id)
+
+
+def generation_listing_lookup_after_bare_evidence_check(adapter_client, generation_id):
+    listing = adapter_client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    raise_evidence_errors(listing)
+    # ok: nso-generation-listing-filter-drops-truncation
+    return {row["seq"] for row in listing if row["generation_id"] == generation_id}
+
+
+def generation_listing_direct_filter_after_unrelated_checks(client, adapter_client, evidence, rows, wanted):
+    raise_evidence_errors(evidence)
+    adapter_client.raise_evidence_errors(evidence)
+    for row in rows:
+        if isinstance(row, client.ListingTruncation):
+            raise client.ListingTruncationError(row)
+    # ruleid: nso-generation-listing-filter-drops-truncation
+    return [row for row in client.list_device_generations(7) if row["generation_id"] in wanted]
+
+
+def carrier_generation_bypass(bound):
+    # ruleid: nso-carrier-generations-bypass-helper
+    rows = (generation for attempt in bound["attempts"] for generation in attempt["generations"])
+    # ruleid: nso-carrier-generations-bypass-helper
+    filtered = [
+        generation
+        for attempt in bound["attempts"]
+        for generation in attempt["generations"]
+        if generation["carrier_job_id"] == bound.carrier_id
+    ]
+    # ruleid: nso-carrier-generations-bypass-helper
+    collected = [generation for attempt in bound["attempts"] for generation in attempt["generations"]]
+    # ruleid: nso-carrier-generations-bypass-helper
+    terminal = (
+        generation
+        for attempt in bound["attempts"]
+        for generation in attempt["generations"]
+        if generation["row_outcomes"] is not None
+    )
+    return rows, filtered, collected, terminal
+
+
+def _carrier_generations(bound):
+    # ok: nso-carrier-generations-bypass-helper
+    return [generation for attempt in bound["attempts"] for generation in attempt["generations"]]
+
+
+def carrier_generations_from_helper(bound):
+    # ok: nso-carrier-generations-bypass-helper
+    return [row for row in _carrier_generations(bound) if row["row_outcomes"] is not None]
+
+
+def unchecked_generation_listing(client):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(listing)
+
+
+def unchecked_generation_listing_imported(client):
+    listing = client.list_device_generations(7)
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    raise_evidence_errors(listing)
+
+
+def unchecked_generation_listing_direct(client):
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(client.list_device_generations(7))
+    # ruleid: nso-unreleased-generation-listing-evidence-check
+    raise_evidence_errors(client.list_device_generations(7))
+
+
+def released_generation_listing(client, management, incarnation):
+    listing = client.list_device_generations(7)
+    rows, released = unreleased_generations(management, incarnation, listing)
+    # ok: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(rows)
+
+
+def requested_generation_listing(client, wanted):
+    listing = client.list_device_generations(7)
+    for row in listing:
+        if isinstance(row, client.ListingTruncation):
+            client.raise_item_error(row)
+    listing = [row for row in listing if row["generation_id"] in wanted]
+    # ok: nso-unreleased-generation-listing-evidence-check
+    client.raise_evidence_errors(listing)
+
+
+def unreleased_deployment_evidence_head(client):
+    evidence = client.get_deployment_evidence(7, [])
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(evidence)
+
+
+def unreleased_deployment_evidence_head_imported(client):
+    evidence = client.get_deployment_evidence(7, [])
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    raise_evidence_errors(evidence)
+
+
+def unreleased_deployment_evidence_head_direct(client):
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(client.get_deployment_evidence(7, []))
+    # ruleid: nso-deployment-evidence-head-release-bypass
+    raise_evidence_errors(client.get_deployment_evidence(7, []))
+
+
+def released_deployment_evidence_head(client, management, incarnation):
+    evidence = released_head_evidence(management, incarnation, client.get_deployment_evidence(7, []))
+    # ok: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(evidence)
+
+
+def reassigned_deployment_evidence_head(client, management, incarnation):
+    evidence = client.get_deployment_evidence(7, [])
+    evidence = released_head_evidence(management, incarnation, evidence)
+    # ok: nso-deployment-evidence-head-release-bypass
+    client.raise_evidence_errors(evidence)
+
+
+def unscoped_owner_fence(row):
+    # ruleid: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(model_label=row._meta.label_lower, overlay_pk=row.pk).first()
+    # ruleid: nso-owner-fence-unscoped-lookup
+    return NSOOverlaySettlementFence.objects.filter(model_label__in={"a"}, overlay_pk__in={row.pk})
+
+
+def qualified_owner_fence(row, management):
+    # ruleid: nso-owner-fence-unscoped-lookup
+    models.NSOOverlaySettlementFence.objects.filter(model_label=row._meta.label_lower, overlay_pk=row.pk).first()
+    # ruleid: nso-owner-fence-unscoped-lookup
+    models.NSOOverlaySettlementFence.objects.filter(overlay_pk__in={row.pk})
+    # ok: nso-owner-fence-unscoped-lookup
+    return models.NSOOverlaySettlementFence.objects.filter(management=management, overlay_pk=row.pk)
+
+
+def scoped_owner_fence(row, management):
+    # ok: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(management=management, overlay_pk=row.pk).first()
+    # ok: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(management_id__in={management.pk}, overlay_pk__in={row.pk})
+    # ok: nso-owner-fence-unscoped-lookup
+    NSOOverlaySettlementFence.objects.filter(management__device_id=OuterRef("device_id"), overlay_pk=OuterRef("pk"))
+    # ok: nso-owner-fence-unscoped-lookup
+    return NSOOverlaySettlementFence.objects.filter(management_id=management.pk, overlay_pk=row.pk)

@@ -74,7 +74,8 @@
   /* The apply verdict's own words. `error` is the route's OWN failure message, not the
    * scope's; `advisory` is why an `unproven` verdict did not go green — the apply landed
    * and nothing proves it, which is a statement about evidence, not about ownership, so
-   * it qualifies the state rather than replacing it. */
+   * it qualifies the state rather than replacing it. An acknowledged unknown outcome is
+   * apply_failed with no error, so it keeps its own state label. */
   function fmtResult(cell) {
     var row = cell.getRow().getData();
     var wrap = document.createElement("div");
@@ -83,9 +84,13 @@
       wrap.innerHTML = G.MUTED;
       return wrap;
     }
-    if (failure || row.advisory) {
+    if (failure) {
+      wrap.appendChild(badge("apply failed", "text-bg-danger"));
+    } else if (row.advisory) {
       wrap.appendChild(
-        failure ? badge("apply failed", "text-bg-danger") : badge("unproven", "text-bg-warning text-dark"),
+        row.state === "apply_failed"
+          ? badge(row.label, "text-bg-danger")
+          : badge("unproven", "text-bg-warning text-dark"),
       );
     }
     G.appendEvidence(wrap, row);

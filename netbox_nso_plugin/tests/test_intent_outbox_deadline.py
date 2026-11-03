@@ -349,9 +349,11 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
         from netbox_nso_plugin import delivery
 
         answered = threading.Event()
+        verdict = threading.Event()
 
         def slow(body):
-            time.sleep(1.5)
+            # Answer only after the waiter returns, so CPU load cannot reorder the two.
+            verdict.wait(10)
             answered.set()
             return {"count": 1}
 
@@ -362,6 +364,8 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
             pass
         else:
             raise AssertionError("the deadline let a late answer through")
+        finally:
+            verdict.set()
 
         assert answered.wait(10), "the late worker ran to completion, as this pin needs"
 

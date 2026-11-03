@@ -26,6 +26,7 @@ from ._outbox_case import mirror_update, without_commit_drain
 from ._ownership_case import acquire_overlay
 from ._refusal_display import RefusalDisplayHelpers
 from ._settlement_case import _route
+from ._settlement_wire import job_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 
 CANARY = "placeholder-parity-secret-canary"
@@ -543,6 +544,13 @@ class TestOwnerDisplayParity(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCap
             self.scenario(owners, "unavailable_in_sync")
         generation = self.attempt.executions.get().terminal_projection
         job = {
+            "device_id": self.management.adapter_device_id,
+            "settle_seq": 1,
+            "context": None,
+            "created_at": self.stamp.isoformat(),
+            "updated_at": self.stamp.isoformat(),
+            "started_at": None,
+            "heartbeat_at": None,
             "id": 501,
             "type": "apply",
             "status": "succeeded",
@@ -555,7 +563,7 @@ class TestOwnerDisplayParity(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCap
 
         def handle(method, url, **kwargs):
             if method == "GET" and url.endswith("/jobs"):
-                return make_response(200, [job])
+                return make_response(200, [job_wire(job)])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle

@@ -6,9 +6,204 @@ from netbox_nso_plugin.models import NSOApplyExecution
 
 from . import test_durable_bgp_capture as bgp_case
 from ._bgp_settlement import BGPSettlementHelpers
+from ._settlement_wire import generation_wire, job_wire
+from .test_carrier_isolation import CarrierIsolationHelpers
+from .test_coalesced_settlement import CoalescedCarrierHelpers
+
+
+class TestCarrierReceiptIsolation(
+    CarrierIsolationHelpers, CoalescedCarrierHelpers, BGPSettlementHelpers, bgp_case.BGPCaptureCase
+):
+    def test_invalid_receipt_records_only_the_current_carrier(self):
+        from netbox_nso_plugin.models import NSOAcceptedSelection, NSOApplyAttempt
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_response
+
+        first, sibling = self.prepare_carrier()
+        sibling["carrier_job_id"] = 502
+        for generation in (first, sibling):
+            result = generation["carrier_job_result"]
+            counters = {key for section in generation["sections"] for key in SECTION_COUNTER_KEYS[section]}
+            result = {
+                key: value for key, value in result.items() if not key.endswith("count_by_outcome") or key in counters
+            }
+            for key in ("row_outcomes", "settlement_owners"):
+                result[key] = [row for row in result[key] if row["generation_id"] == generation["generation_id"]]
+            generation.update(carrier_job_result=result, row_outcomes=result["row_outcomes"])
+        selection = self.attempt.overlay_snapshots.get(model_label=self.owners[0]._meta.label_lower).selection
+        NSOAcceptedSelection.objects.filter(pk=selection.pk).update(acknowledged_at=None)
+        self.serve_terminal_evidence(first, manual=True)
+        original = self.adapter._handle
+        jobs = [self.job(first, 1), self.job(sibling, 2)]
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs"):
+                after = int(kwargs["params"]["after_settle_seq"])
+                return make_response(200, [job_wire(job) for job in jobs if job["settle_seq"] > after])
+            if method == "GET" and url.endswith("/intent-receipts"):
+                return make_response(200, {"receipts": [], "global_max_push_seq": None, "global_max_route_id": None})
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                template = response.json()[0]["projection"]
+                return make_response(
+                    200,
+                    [
+                        generation_wire(
+                            {
+                                **template,
+                                **{key: generation[key] for key in template.keys() & generation.keys()},
+                                "job_id": generation["carrier_job_id"],
+                                "digest": link["digest"],
+                                "settlement_cohort": 9 + index,
+                            },
+                            self.management.adapter_device_id,
+                        )
+                        for index, (generation, link) in enumerate(
+                            zip((first, sibling), self.attempt.response["generations"], strict=True)
+                        )
+                    ],
+                )
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                document = response.json()
+                document["attempts"][0]["generations"] = [
+                    generation_wire(generation, self.management.adapter_device_id) for generation in (first, sibling)
+                ]
+                return make_response(200, document)
+            return response
+
+        self.adapter._handle = handle
+        cadence = set(NSOApplyAttempt.objects.filter(trigger_kind="cadence").values_list("pk", flat=True))
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.stalled)
+        self.assertEqual(result.consumed, 0)
+        execution = NSOApplyExecution.objects.get(
+            generation_id=first["generation_id"], carrier_job_id=501, invariant_code="invalid_selection_receipt"
+        )
+        self.assertFalse(
+            NSOApplyExecution.objects.filter(generation_id=sibling["generation_id"], carrier_job_id=502)
+            .exclude(invariant_code="")
+            .exists()
+        )
+        self.assertEqual(
+            set(
+                NSOApplyAttempt.objects.filter(trigger_kind="cadence")
+                .exclude(pk__in=cadence)
+                .values_list("pk", flat=True)
+            ),
+            {execution.attempt_id},
+        )
 
 
 class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
+    def assert_receipt_body_stalls_with_rendered_banner(self, response):
+        from django.urls import reverse
+
+        from netbox_nso_plugin.refusal_display import settlement_stall_projection
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+        from netbox_nso_plugin.settlement_evidence import request_fence
+
+        from ._outbox_case import mirror_update
+
+        original = self.adapter._handle
+        reads = []
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/intent-receipts"):
+                reads.append(url)
+                return response
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        try:
+            mirror_update(self.management, settle_evidence_error={})
+            result = consume_static_route_settlements(self.management)
+            self.assertTrue(result.stalled)
+            self.assertFalse(result.drained)
+            self.assertEqual(result.consumed, 0)
+            self.management.refresh_from_db()
+            self.assertIsNone(self.management.settle_cursor_seq)
+            issue = settlement_stall_projection(self.management)
+            self.assertIsNotNone(issue)
+            self.assertEqual(issue["reason"], "invalid settlement evidence")
+            self.assertEqual(issue["job_id"], 501)
+            self.assertEqual(issue["settle_seq"], 1)
+            self.assertEqual(issue["request_fence"], request_fence(self.management))
+            tab = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+            self.assertContains(tab, "Settlement is paused", count=1)
+            self.assertContains(tab, "invalid settlement evidence")
+            self.assertGreaterEqual(len(reads), 1)
+            self.selection.refresh_from_db()
+            self.assertIsNone(self.selection.acknowledged_at)
+            self.assertEqual(NSOApplyExecution.objects.count(), 0)
+        finally:
+            self.adapter._handle = original
+
+    def test_empty_receipt_document_stalls_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, {}))
+
+    def test_all_null_receipt_document_stalls_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        self.assert_receipt_body_stalls_with_rendered_banner(
+            make_response(200, {"receipts": None, "global_max_push_seq": None, "global_max_route_id": None})
+        )
+
+    def test_required_receipt_keys_and_collection_reject_invalid_bodies(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        valid = {"receipts": [self.receipt], "global_max_push_seq": None, "global_max_route_id": None}
+        for name in valid:
+            with self.subTest(missing=name):
+                body = dict(valid)
+                del body[name]
+                self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, body))
+        self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, {**valid, "receipts": None}))
+
+    def test_null_receipt_watermarks_allow_exact_recovery(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/intent-receipts"):
+                return make_response(
+                    200, {"receipts": [self.receipt], "global_max_push_seq": None, "global_max_route_id": None}
+                )
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        result = consume_static_route_settlements(self.management)
+        self.assertTrue(result.drained)
+        self.selection.refresh_from_db()
+        self.assertIsNotNone(self.selection.acknowledged_at)
+
+    def test_undecodable_receipt_bodies_stall_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+
+        self.capture_lost_publication()
+        for content in (b"{", b""):
+            with self.subTest(content=content):
+                self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, content=content))
+
+    def test_deep_receipt_response_stalls_with_a_rendered_banner(self):
+        from ._adapter_http import make_response
+        from .test_settlement_reader_contract import _nested
+
+        self.capture_lost_publication()
+        receipt = {**self.receipt, "response": _nested(600)}
+        document = {"receipts": [receipt], "global_max_push_seq": None, "global_max_route_id": None}
+        self.assert_receipt_body_stalls_with_rendered_banner(make_response(200, document))
+
     def test_corrected_automatic_receipt_retains_the_original_manual_attempt(self):
         import copy
 
@@ -41,7 +236,9 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         self.attempt = manual
         self.serve_terminal_evidence(bgp, manual=True)
         original = self.adapter._handle
-        base_job = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        base_job = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0][
+            "projection"
+        ]
         invalid_receipt = True
 
         def mixed_evidence(method, url, **kwargs):
@@ -63,27 +260,30 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
                 )
                 params = kwargs["params"]
                 after, limit = int(params["after_settle_seq"]), int(params["limit"])
-                return make_response(200, [job for job in jobs if job["settle_seq"] > after][:limit])
+                return make_response(200, [job_wire(job) for job in jobs if job["settle_seq"] > after][:limit])
             if url.endswith("/generations"):
                 generations = response.json()
                 generations.append(
-                    {
-                        **generations[0],
-                        **{
-                            key: automatic[key]
-                            for key in (
-                                "generation_id",
-                                "seq",
-                                "status",
-                                "stream_revisions",
-                                "source_push_seq",
-                                "updated_at",
-                            )
+                    generation_wire(
+                        {
+                            **generations[0]["projection"],
+                            **{
+                                key: automatic[key]
+                                for key in (
+                                    "generation_id",
+                                    "seq",
+                                    "status",
+                                    "stream_revisions",
+                                    "source_push_seq",
+                                    "updated_at",
+                                )
+                            },
+                            "job_id": automatic["carrier_job_id"],
+                            "carrier_job_id": automatic["carrier_job_id"],
+                            "carrier_job_status": automatic["carrier_job_status"],
                         },
-                        "job_id": automatic["carrier_job_id"],
-                        "carrier_job_id": automatic["carrier_job_id"],
-                        "carrier_job_status": automatic["carrier_job_status"],
-                    }
+                        self.management.adapter_device_id,
+                    )
                 )
                 return make_response(200, generations)
             if url.endswith("/intent-receipts") and invalid_receipt:
@@ -201,16 +401,18 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         def handle(method, url, **kwargs):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/generations"):
-                return make_response(200, [reissue, *response.json()])
+                return make_response(
+                    200, [generation_wire(reissue, self.management.adapter_device_id), *response.json()]
+                )
             if method == "GET" and url.endswith("/jobs"):
-                template = original(method, url, params={"after_settle_seq": 0}).json()[0]
+                template = original(method, url, params={"after_settle_seq": 0}).json()[0]["projection"]
                 jobs = [
                     {**template, "id": 500, "result": result, "row_outcomes": [], "refusals": [], "settle_seq": 1},
                     {**template, "settle_seq": 2},
                 ]
                 after = int(kwargs["params"]["after_settle_seq"])
                 return make_response(
-                    200, [job for job in jobs if job["settle_seq"] > after][: int(kwargs["params"]["limit"])]
+                    200, [job_wire(job) for job in jobs if job["settle_seq"] > after][: int(kwargs["params"]["limit"])]
                 )
             return response
 
@@ -377,9 +579,9 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
             if method == "GET" and url.endswith("/generations"):
                 rows = response.json()
                 if invalid is missing:
-                    rows[0].pop("source_push_seq")
+                    rows[0]["projection"].pop("source_push_seq")
                 else:
-                    rows[0]["source_push_seq"] = invalid
+                    rows[0]["projection"]["source_push_seq"] = invalid
                 return make_response(200, rows)
             return response
 

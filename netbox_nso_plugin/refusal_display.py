@@ -85,6 +85,7 @@ def _project_snapshot_interface(interface):
 
 
 def _current_snapshot(row):
+    from .lifecycle_fence import current_owner_fences
     from .models import NSOOverlaySettlementFence
     from .refusal_registry import OVERLAYS
 
@@ -92,19 +93,18 @@ def _current_snapshot(row):
         return None
     if hasattr(row, "_refusal_current"):
         return row._refusal_current
-    # Fences at other mapping epochs share the owner key; only the current epoch's fence counts.
-    fences = (
+    key = (row._meta.label_lower, row.pk)
+    fence = current_owner_fences(
+        {key},
         NSOOverlaySettlementFence.objects.filter(
-            model_label=row._meta.label_lower,
-            overlay_pk=row.pk,
             accepted_at=row.accepted_at,
             current_attempt__isnull=False,
             last_execution__consumption_state="consumed",
         )
         .select_related("management", "last_execution")
-        .prefetch_related("last_execution__overlay_snapshots")
-    )
-    return next((current for fence in fences if (current := _snapshot_for_fence(row, fence)) is not None), None)
+        .prefetch_related("last_execution__overlay_snapshots"),
+    ).get(key)
+    return None if fence is None else _snapshot_for_fence(row, fence)
 
 
 def _snapshot_for_fence(row, fence):
@@ -126,6 +126,7 @@ def _snapshot_for_fence(row, fence):
 
 def project_rows(rows):
     """Load current execution links and previous refusals once for a display collection."""
+    from .lifecycle_fence import current_owner_fences
     from .models import NSOOverlaySettlementFence
     from .refusal_registry import OVERLAYS
 
@@ -138,16 +139,15 @@ def project_rows(rows):
     for row in owners.values():
         row._refusal_current = None
     if owners:
-        fences = (
+        fences = current_owner_fences(
+            owners,
             NSOOverlaySettlementFence.objects.filter(
-                model_label__in={label for label, _pk in owners},
-                overlay_pk__in={pk for _label, pk in owners},
                 current_attempt__isnull=False,
                 last_execution__consumption_state="consumed",
             )
             .select_related("management", "last_execution")
-            .prefetch_related("last_execution__overlay_snapshots")
-        )
+            .prefetch_related("last_execution__overlay_snapshots"),
+        ).values()
         executions = {}
         for fence in fences:
             fence.last_execution = executions.setdefault(fence.last_execution_id, fence.last_execution)
@@ -157,7 +157,23 @@ def project_rows(rows):
                 if current is not None:
                     row._refusal_current = current
     _load_previous_refusals(owners)
+    from .settlement_resolution import acknowledged_unknown_jobs
+
+    for key, jobs in acknowledged_unknown_jobs(owners.values()).items():
+        owners[key]._acknowledged_jobs = jobs
     return rows
+
+
+def _acknowledged_jobs(row):
+    """Return the acknowledged jobs whose unknown contributions still bind this owner."""
+    from .refusal_registry import OVERLAYS
+    from .settlement_resolution import acknowledged_unknown_jobs
+
+    if not hasattr(row, "_meta") or row._meta.label_lower not in OVERLAYS or row.pk is None:
+        return ()
+    if not hasattr(row, "_acknowledged_jobs"):
+        row._acknowledged_jobs = acknowledged_unknown_jobs([row])[(row._meta.label_lower, row.pk)]
+    return row._acknowledged_jobs
 
 
 def settled_interface_owners(queryset):
@@ -167,7 +183,10 @@ def settled_interface_owners(queryset):
     from .models import NSOInterfaceState, NSOOverlaySettlementFence
 
     current = NSOOverlaySettlementFence.objects.filter(
-        model_label=NSOInterfaceState._meta.label_lower, overlay_pk=OuterRef("pk"), current_attempt__isnull=False
+        management__device_id=OuterRef("interface__device_id"),
+        model_label=NSOInterfaceState._meta.label_lower,
+        overlay_pk=OuterRef("pk"),
+        current_attempt__isnull=False,
     )
     # Exact stored values imply matches_device_value; any looser match stays a projection candidate.
     equal = (
@@ -266,15 +285,21 @@ def _previous_refusal(row):
 def row_projection(row, interface=None):
     """Decide owner state, pending membership and safe execution evidence together."""
     from .refusal_registry import OVERLAYS
+    from .settlement_resolution import unknown_advisory
 
     error = getattr(row, "last_apply_error", None)
+    acknowledged = _acknowledged_jobs(row)
     historical_refusal = None
     projection = {"refusal": None, "refusal_text": "", "advisory": "", "error": None, "error_history": False}
     if isinstance(error, dict) and "refusals" in error:
         projection["refusal"] = safe_projection(error["refusals"])
     current = _current_snapshot(row)
     projection["execution_disposition"] = current[0].settlement_disposition if current else None
-    projection["advisory"] = UNAVAILABLE if projection["execution_disposition"] == "unavailable" else ""
+    # An acknowledged unknown outcome outranks a later unavailable settlement of the same acceptance.
+    if acknowledged:
+        projection["advisory"] = unknown_advisory(acknowledged)
+    elif projection["execution_disposition"] == "unavailable":
+        projection["advisory"] = UNAVAILABLE
     if isinstance(error, str) and error and projection["execution_disposition"] != "refused":
         projection["refusal"] = _previous_refusal(row)
     if current is not None and (projection["refusal"] is None or projection["refusal"]["valid"]):
@@ -286,11 +311,16 @@ def row_projection(row, interface=None):
                 historical_refusal = projection["refusal"]
                 projection["error"] = projection["refusal"]["text"]
             projection["refusal"] = None
+    # The acknowledgement stores its advisory as the error text; it shows as the advisory only.
+    advisories = (
+        {unknown_advisory(acknowledged), *(unknown_advisory([job]) for job in acknowledged)} if acknowledged else set()
+    )
     if projection["refusal"] is not None:
         projection["refusal_text"] = projection["refusal"]["text"]
         projection["error"] = projection["refusal_text"]
     elif error and projection["error"] is None:
-        projection["error"] = (error.get("message") or str(error)) if isinstance(error, dict) else error
+        message = (error.get("message") or str(error)) if isinstance(error, dict) else error
+        projection["error"] = None if isinstance(message, str) and message in advisories else message
     if not projection["advisory"]:
         projection["advisory"] = getattr(row, "last_result_advisory", "") or ""
     spec = OVERLAYS.get(row._meta.label_lower) if hasattr(row, "_meta") else None
@@ -303,7 +333,7 @@ def row_projection(row, interface=None):
         )
     else:
         projection["error_value"] = projection["error"] if projection["error"] is not None else error
-    kind, label, owned = _row_classification(row, projection, interface)
+    kind, label, owned = _row_classification(row, projection, interface, acknowledged)
     if kind == "in_sync":
         # A current not_applied restoration keeps its prior error as history; older failure text is not shown.
         restored = projection["execution_disposition"] == "not_applied" and projection["error"] is not None
@@ -335,7 +365,7 @@ def _stored_state(status, owned):
     return "unknown", status or "unknown"
 
 
-def _row_classification(row, projected, interface):
+def _row_classification(row, projected, interface, acknowledged=()):
     """Give current execution evidence precedence over stored status and value equality."""
     from .status_machine import OWNED_STATES
     from .summary import _COMPARABLE_IFACE_ATTRS, _netbox_value_for, matches_device_value
@@ -347,6 +377,9 @@ def _row_classification(row, projected, interface):
         return "apply_failed", "apply failed", owned
     if projected["advisory"] == UNAVAILABLE:
         return "unavailable", "previous " + _stored_state(row.status, owned)[1], owned
+    if acknowledged and row.status == "apply_failed":
+        # An acknowledged unknown outcome never reads as success, also when the values match.
+        return "apply_failed", "outcome unknown", owned
     if interface is None and hasattr(row, "attribute"):
         interface = getattr(row, "interface", None)
     # A current restoration or an ordinary error outranks value equality; an uncorrelated refusal does not.
@@ -395,16 +428,34 @@ def document_projection(result):
         summary = UNAVAILABLE if unavailable else UNAPPLIED if unapplied else ""
         return {"refusal": None, "refusal_text": "", "summary": summary}
     projected = attributed_projection(attributed)
-    rollback = (
-        result["commit_acknowledged"] is False
-        and all(row["disposition"] in {"refused", "not_applied"} for row in result["row_outcomes"])
-        and any(row["disposition"] == "refused" for row in result["row_outcomes"])
-        and all(
-            cause["provenance"] == "current" and cause["sender_phase"] in {"pre_commit_dry_run", "commit"}
-            for cause in attributed
-        )
+    identities = {refusal_contract.logical_key(row) for row in result["row_outcomes"]}
+    phrases = set()
+    for cause, catalog in zip(attributed, projected["causes"], strict=True):
+        logical_rows = cause["logical_rows"]
+        foreign = [
+            logical["row"] for logical in logical_rows if refusal_contract.logical_key(logical) not in identities
+        ]
+        if len(foreign) < len(logical_rows):
+            phrases.add(f"{catalog['reason']}: {catalog['message']}")
+        else:
+            foreign = [catalog["row"]]
+        # A mixed cause also names each linked row outside this Apply.
+        for row in foreign:
+            phrases.add(
+                f"Blocked by {catalog['family']} {row['subject']} {row['key']} "
+                f"(not part of this Apply): {catalog['message']}"
+            )
+    projected["text"] = " | ".join(sorted(phrases))
+    rollback = result["commit_acknowledged"] is False and all(
+        cause["sender_phase"] in {"pre_commit_dry_run", "commit"} for cause in attributed
     )
-    summary = "Refused; nothing committed. " if rollback else "Execution evidence. "
+    summary = "Execution evidence. "
+    if rollback:
+        summary = (
+            "Refused; commit not attempted. "
+            if all(cause["sender_phase"] == "pre_commit_dry_run" for cause in attributed)
+            else "Refused; nothing committed. "
+        )
     return {"refusal": projected, "refusal_text": projected["text"], "summary": summary + projected["text"]}
 
 
@@ -427,7 +478,8 @@ def job_projection(job):
 
 
 def device_execution_summaries(management):
-    """Summarize only executions named by current projected owners."""
+    """Summarize current owners and executions with no local owner snapshots."""
+    from .durable_capture import mapping_epoch
     from .refusal_registry import OVERLAYS
 
     if management is None:
@@ -443,12 +495,21 @@ def device_execution_summaries(management):
                 related
             )
         )
-    executions = {}
+    executions = {
+        execution.pk: (execution, False)
+        for execution in management.apply_executions.filter(
+            mapping_epoch=mapping_epoch(management),
+            adapter_device_id=management.adapter_device_id,
+            store_incarnation=management.settle_cursor_incarnation,
+            overlay_snapshots__isnull=True,
+            consumption_state="consumed",
+        )
+    }
     for row in project_rows(rows):
         current = _current_snapshot(row)
         if current is not None:
             execution = current[1]
-            unavailable = row_projection(row)["advisory"] == UNAVAILABLE
+            unavailable = row_projection(row)["execution_disposition"] == "unavailable"
             previous = executions.get(execution.pk)
             executions[execution.pk] = (execution, unavailable or bool(previous and previous[1]))
     summaries = []
@@ -462,6 +523,18 @@ def device_execution_summaries(management):
         if projected["summary"]:
             summaries.append(projected)
     return summaries
+
+
+def settlement_stall_projection(management):
+    """Show a diagnostic only while its complete request fence is current."""
+    from .settlement_evidence import matches_request_fence
+
+    if management is None:
+        return None
+    issue = management.settle_evidence_error
+    if issue and matches_request_fence(management, issue.get("request_fence")):
+        return issue
+    return None
 
 
 def validate_interface_errors(interfaces):

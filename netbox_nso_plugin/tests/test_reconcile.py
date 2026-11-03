@@ -136,7 +136,7 @@ class _CallbackEvidenceAdapter(ReceiptAdapter):
             if self.evidence_error is not None:
                 raise self.evidence_error
             response = make_response(200, [])
-            response.headers["X-Store-Incarnation"] = "callback-evidence-store"
+            response.headers["X-Store-Incarnation"] = "00000000-0000-4000-8000-000000000009"
             return response
         if method == "GET" and url.endswith(f"/devices/{self.adapter_device_id}/generations"):
             return make_response(200, [])
@@ -308,14 +308,16 @@ class TestRunDeviceReconcile(APITestCase):
         )
         adapter = _CallbackEvidenceAdapter(management.adapter_device_id, unknown_attempt_id=extra_id)
         config, session = adapter.patches()
-        with config, session, self.assertLogs("netbox_nso_plugin.reconcile", level="WARNING") as logs:
+        with config, session:
             result = run_device_reconcile(device.pk)
 
         self.assertEqual(result, {"device_id": device.pk, "interface_states": 0})
         self.assertTrue(adapter.evidence_requests)
         self.assertTrue(all(row == {"apply_attempt_ids": [str(requested_id)]} for row in adapter.evidence_requests))
         self.assertEqual(adapter.apply_requests, [])
-        self.assertTrue(any("settle skipped" in line for line in logs.output))
+        management.refresh_from_db()
+        self.assertEqual(management.settle_evidence_error["reason"], "invalid settlement evidence")
+        self.assertIsNone(management.settle_cursor_seq)
         self.assertEqual(len(adapter.policy_reads), 1)
         self.assertTrue(
             NSORoutePolicyState.objects.filter(management=management, object_name="CALLBACK-PREFIX").exists()
