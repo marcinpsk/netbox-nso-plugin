@@ -2,6 +2,110 @@
 
 <!-- version list -->
 
+## v1.16.0 (2026-11-03)
+
+### Bug Fixes
+
+- Drop acknowledged obligations before readiness raises evidence errors
+  ([`a347f07`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a347f07df9a06226c918453591d71410e9a0fa48))
+
+- **display**: Read only the fence under an owner's current management
+  ([`de74782`](https://github.com/marcinpsk/netbox-nso-plugin/commit/de74782b38cb93a15cf057f89e451b930c110adb))
+
+- **opengrep**: Exempt only the bound listing from the truncation rule
+  ([`22607b7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/22607b779150bfb5016ae8ffda2b3138dcb10e21))
+
+- **opengrep**: Match generator filters and require a raising truncation check
+  ([`04fa870`](https://github.com/marcinpsk/netbox-nso-plugin/commit/04fa87057bf00350c44379bbae8e34b24b3b60ab))
+
+- **probe**: Block registration when the probe generation was released
+  ([`87b0d5f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/87b0d5f6ecb953116bca825a53188b674ff5bd66))
+
+- **probe**: Release an acknowledged deployment-evidence head
+  ([`45d148d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/45d148d31cee320c4d0377f155471a01540e627b))
+
+- **refusal-display**: Bound ownerless execution summaries to the cursor store
+  ([`4bbf97b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4bbf97bae50ea34badec8ee16771af7d162c7729))
+
+- **settlement**: Bind a cadence-held obligation to its execution's attempt
+  ([`8432f06`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8432f06feb97456bb87e43f3cf25ed15d8f292fb))
+
+- **settlement**: Keep a truncated generation listing blocking after an acknowledgement
+  ([`7126a55`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7126a555ea2dfd472d9ae6e7235962b4a6944d87))
+
+- **settlement**: Persist the cleared stall record after an epoch reset
+  ([`3834ce1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3834ce1c40905621db7acaca9c6be48157e8a016))
+
+- **settlement**: Refresh the request fence after the walk persists its cursor
+  ([`ff809c8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ff809c8440c40e6b098f7eef44cd0cd333374ed7))
+
+- **settlement**: Scope receipt invariants to their carrier and release acknowledged listing rows
+  ([`3ef1408`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3ef1408e90ff1d41284249f9e3dc6ffda6c2d16a))
+
+- **settlement**: Stall on a truncated generation listing before any carrier commits
+  ([`42d8027`](https://github.com/marcinpsk/netbox-nso-plugin/commit/42d8027fd6e5b704dd5056befa10d6188292e98e))
+
+- **settlement**: Take the obligation attempt from the exact execution identity
+  ([`98743b8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/98743b8b0f4b2157c586ea5bb7fc9243482f719b))
+
+- **views**: Reject a truncated generation listing before the jobs poll filters it
+  ([`0f7e9c8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0f7e9c84e150ea4fddc49ac0fa9242006ff32b47))
+
+### Chores
+
+- **deps**: Bump filelock from 3.29.0 to 4.2.1
+  ([`27aa2b0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/27aa2b016b44db1ab3186c8eb750ddd0cf8414d1))
+
+- **deps**: Bump undici from 8.12.1 to 8.12.3
+  ([`1e035f6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1e035f6ee507d6867e34c510737c7d158a9d9fd6))
+
+- **deps**: Bump virtualenv from 21.14.9 to 21.14.13
+  ([`6f157fa`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6f157fa2b7087287d55afe45dcd94d9f2c2c6162))
+
+- **opengrep**: Accept the bare raise_evidence_errors call in the truncation exemption
+  ([`2ce082d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2ce082dfda3f681ebea170656bce5f1b25fb659a))
+
+- **opengrep**: Cover qualified fence lookups and projected listing filters
+  ([`d733dfa`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d733dfaa2a25c1ff82109366227c737bb86ab8a6))
+
+### Continuous Integration
+
+- **test**: Pin the joined adapter at the refusal-contract commit
+  ([`c6280fd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c6280fd764868247265f39c59f576eaf52f9d69e))
+
+### Testing
+
+- Drain unexpected adapter double request bodies as raw bytes
+  ([`3eee1af`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3eee1affa7d35608e6ef465ef7a27d3f07408ac6))
+
+- Readiness skips evidence errors of acknowledged obligations
+  ([`d30a382`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d30a3825649a7009e93667edfd2769071a2ad110))
+
+- Settlement adapter double answers a non-JSON unexpected request
+  ([`6244aed`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6244aed6131a88660eb64abd71264416cce2d103))
+
+- **display**: Project an uncatalogued attributed cause as invalid evidence
+  ([`37b9174`](https://github.com/marcinpsk/netbox-nso-plugin/commit/37b9174152e635aa21971fab5d0bcbd9de007645))
+
+- **jobs**: Keep view exceptions for polls that expect success
+  ([`2e914e9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2e914e9f0846026b7d434011d78a790d033f16fd))
+
+- **opengrep**: Accept isinstance as a builtin rule root
+  ([`48c44ac`](https://github.com/marcinpsk/netbox-nso-plugin/commit/48c44ac41b626b1988df9bbe46ff7e3406cc10c1))
+
+- **refusal-display**: Check both rollback phrases in the negative summary cases
+  ([`d706244`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d7062443e680e7a5f1a3a65d1d46339607545627))
+
+- **settlement**: A truncated generation listing stalls before an earlier carrier commits
+  ([`229efd4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/229efd4b55bc5785f5b8fff9ee6c907eeaae9d8c))
+
+- **settlement**: Acknowledged obligations never release a truncated generation listing
+  ([`7c85567`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7c85567a148c1913652adce74200d420de64b38e))
+
+- **settlement**: Prove the obligation attempt comes from the exact execution identity
+  ([`6f07076`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6f070762a187731e0c12870b8cdecdc88ac5bf5c))
+
+
 ## v1.15.0 (2026-10-28)
 
 ### Testing
