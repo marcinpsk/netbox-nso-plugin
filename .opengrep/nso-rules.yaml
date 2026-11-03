@@ -62,6 +62,21 @@ rules:
       # load_deployment_evidence releases acknowledged rows per carrier in prepare_carrier_evidence.
       exclude: ["netbox_nso_plugin/tests/**", "netbox_nso_plugin/apply_settlement.py"]
 
+  - id: nso-owner-fence-unscoped-lookup
+    languages: [python]
+    severity: ERROR
+    message: Read owner fences through lifecycle_fence.current_owner_fences or name the owner's management; a moved owner keeps its earlier device's fences.
+    patterns:
+      - pattern-either:
+          - pattern: NSOOverlaySettlementFence.objects.filter(..., overlay_pk=$PK, ...)
+          - pattern: NSOOverlaySettlementFence.objects.filter(..., overlay_pk__in=$PK, ...)
+      - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management=$M, ...)
+      - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management_id=$M, ...)
+      - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management_id__in=$M, ...)
+      - pattern-not: NSOOverlaySettlementFence.objects.filter(..., management__device_id=$M, ...)
+    paths:
+      exclude: ["netbox_nso_plugin/tests/**"]
+
   - id: nso-observation-collection-empty-default
     languages: [python]
     severity: ERROR

@@ -1198,6 +1198,21 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertEqual(expected["execution_disposition"], "refused")
         self.assertEqual(row_projection(NSOInterfaceState.objects.get(pk=row.pk)), expected)
 
+    def test_a_moved_interface_owner_ignores_the_fence_of_its_earlier_device(self):
+        from netbox_nso_plugin.refusal_display import project_rows, row_projection, settled_interface_owners
+
+        from ._outbox_case import make_device, mirror_update
+
+        iface, row, _generation = self.interface_execution(matching=True)
+        self.assertEqual(row_projection(NSOInterfaceState.objects.get(pk=row.pk))["execution_disposition"], "refused")
+        Interface.objects.filter(pk=iface.pk).update(device=make_device("moved"))
+        mirror_update(row, status="in_sync", last_apply_error={})
+        (batched,) = project_rows([NSOInterfaceState.objects.get(pk=row.pk)])
+        self.assertIsNone(row_projection(batched)["execution_disposition"])
+        self.assertIsNone(row_projection(NSOInterfaceState.objects.get(pk=row.pk))["execution_disposition"])
+        settled = settled_interface_owners(NSOInterfaceState.objects.filter(pk=row.pk))
+        self.assertEqual(list(settled.values_list("pk", flat=True)), [row.pk])
+
     def test_project_rows_shares_previous_refusal_executions(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext

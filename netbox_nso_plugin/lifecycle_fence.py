@@ -599,6 +599,42 @@ def read_refresh():
         _READ_REFRESH.reset(token)
 
 
+def _owner_devices(keys):
+    """Map each owner key to the device that the owner belongs to now."""
+    from .refusal_registry import OVERLAYS
+
+    return {
+        (label, pk): device_id
+        for label in {label for label, _pk in keys}
+        for pk, device_id in OVERLAYS[label]
+        .model.objects.filter(pk__in=[pk for key_label, pk in keys if key_label == label])
+        .values_list("pk", OVERLAYS[label].device_lookup)
+    }
+
+
+def current_owner_fences(keys, fences):
+    """Map each owner key to its fence under the owner's current management and mapping epoch."""
+    from .durable_capture import mapping_epoch
+    from .models import NSODeviceManagement
+
+    devices = _owner_devices(keys)
+    current = {
+        management.device_id: (management.pk, mapping_epoch(management))
+        for management in NSODeviceManagement.objects.filter(device_id__in=set(devices.values()))
+    }
+    wanted = {key: current[device_id] for key, device_id in devices.items() if device_id in current}
+    # A moved owner keeps the fences of its earlier device under the same owner key.
+    return {
+        (fence.model_label, fence.overlay_pk): fence
+        for fence in fences.filter(
+            management_id__in={management_id for management_id, _epoch in wanted.values()},
+            model_label__in={label for label, _pk in wanted},
+            overlay_pk__in={pk for _label, pk in wanted},
+        )
+        if wanted.get((fence.model_label, fence.overlay_pk)) == (fence.management_id, fence.mapping_epoch)
+    }
+
+
 def capture_read_tokens(rows):
     from .durable_capture import mapping_epoch
     from .models import NSODeviceManagement, NSOOverlaySettlementFence
@@ -614,13 +650,7 @@ def capture_read_tokens(rows):
     }
     if not refs:
         return
-    devices = {
-        (label, pk): device_id
-        for label in {ref.model_label for ref in refs}
-        for pk, device_id in OVERLAYS[label]
-        .model.objects.filter(pk__in=[ref.pk for ref in refs if ref.model_label == label])
-        .values_list("pk", OVERLAYS[label].device_lookup)
-    }
+    devices = _owner_devices({(ref.model_label, ref.pk) for ref in refs})
     managements = {
         management.device_id: management
         for management in NSODeviceManagement.objects.filter(device_id__in=set(devices.values()))

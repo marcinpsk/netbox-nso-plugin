@@ -85,6 +85,7 @@ def _project_snapshot_interface(interface):
 
 
 def _current_snapshot(row):
+    from .lifecycle_fence import current_owner_fences
     from .models import NSOOverlaySettlementFence
     from .refusal_registry import OVERLAYS
 
@@ -92,19 +93,18 @@ def _current_snapshot(row):
         return None
     if hasattr(row, "_refusal_current"):
         return row._refusal_current
-    # Fences at other mapping epochs share the owner key; only the current epoch's fence counts.
-    fences = (
+    key = (row._meta.label_lower, row.pk)
+    fence = current_owner_fences(
+        {key},
         NSOOverlaySettlementFence.objects.filter(
-            model_label=row._meta.label_lower,
-            overlay_pk=row.pk,
             accepted_at=row.accepted_at,
             current_attempt__isnull=False,
             last_execution__consumption_state="consumed",
         )
         .select_related("management", "last_execution")
-        .prefetch_related("last_execution__overlay_snapshots")
-    )
-    return next((current for fence in fences if (current := _snapshot_for_fence(row, fence)) is not None), None)
+        .prefetch_related("last_execution__overlay_snapshots"),
+    ).get(key)
+    return None if fence is None else _snapshot_for_fence(row, fence)
 
 
 def _snapshot_for_fence(row, fence):
@@ -126,6 +126,7 @@ def _snapshot_for_fence(row, fence):
 
 def project_rows(rows):
     """Load current execution links and previous refusals once for a display collection."""
+    from .lifecycle_fence import current_owner_fences
     from .models import NSOOverlaySettlementFence
     from .refusal_registry import OVERLAYS
 
@@ -138,16 +139,15 @@ def project_rows(rows):
     for row in owners.values():
         row._refusal_current = None
     if owners:
-        fences = (
+        fences = current_owner_fences(
+            owners,
             NSOOverlaySettlementFence.objects.filter(
-                model_label__in={label for label, _pk in owners},
-                overlay_pk__in={pk for _label, pk in owners},
                 current_attempt__isnull=False,
                 last_execution__consumption_state="consumed",
             )
             .select_related("management", "last_execution")
-            .prefetch_related("last_execution__overlay_snapshots")
-        )
+            .prefetch_related("last_execution__overlay_snapshots"),
+        ).values()
         executions = {}
         for fence in fences:
             fence.last_execution = executions.setdefault(fence.last_execution_id, fence.last_execution)
@@ -167,7 +167,10 @@ def settled_interface_owners(queryset):
     from .models import NSOInterfaceState, NSOOverlaySettlementFence
 
     current = NSOOverlaySettlementFence.objects.filter(
-        model_label=NSOInterfaceState._meta.label_lower, overlay_pk=OuterRef("pk"), current_attempt__isnull=False
+        management__device_id=OuterRef("interface__device_id"),
+        model_label=NSOInterfaceState._meta.label_lower,
+        overlay_pk=OuterRef("pk"),
+        current_attempt__isnull=False,
     )
     # Exact stored values imply matches_device_value; any looser match stays a projection candidate.
     equal = (
