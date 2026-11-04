@@ -239,6 +239,18 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(adapter.applies[0]["selected"], adapter.preflights[0])
 
+    def test_preview_labels_each_stream_and_names_its_skip_reason(self):
+        def verdict(selected):
+            result = preflight_wire(selected)
+            result["streams"]["snmp"] = {"status": "not_evaluated"}
+            del result["admitted_selection"]["snmp"]
+            result["skips"] = {"snmp": "already_applied"}
+            return result
+
+        streams = self.preview(PreflightAdapter(verdict))["streams"]
+        self.assertEqual((streams["vlan"]["label"], streams["vlan"]["skip"]), ("VLAN", ""))
+        self.assertEqual((streams["snmp"]["label"], streams["snmp"]["skip"]), ("SNMP", "already applied"))
+
     def test_a_native_edit_after_preview_requires_new_admission(self):
         from ._outbox_case import rename_vlan
 

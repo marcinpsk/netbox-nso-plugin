@@ -113,7 +113,7 @@ it('lets the staged badge wrap and uses a readable advisory color in the preview
 
 it('prepares one preview with POST and carries its reference through confirm', async () => {
   await open({ total: 1, preview_status: 'ready', can_apply: true, apply_preview: 'signed-placeholder',
-    streams: { vlan: { status: 'admitted' } },
+    streams: { vlan: { status: 'admitted', label: 'VLAN' } },
     device_diffs: { native: '+ placeholder native', cli: '+ placeholder tree' },
     device_diff: { device_intent: '+ placeholder' }, diff_available: true });
   expect(fetch.mock.calls).toHaveLength(1);
@@ -124,7 +124,7 @@ it('prepares one preview with POST and carries its reference through confirm', a
 it('uses the rendered form token for preview and confirm when the cookie is HttpOnly', async () => {
   expect(document.cookie).not.toContain('csrftoken=');
   await open({ total: 1, preview_status: 'ready', can_apply: true, apply_preview: 'signed-placeholder',
-    streams: { vlan: { status: 'admitted' } }, diff_available: true }, 'rendered-placeholder-token');
+    streams: { vlan: { status: 'admitted', label: 'VLAN' } }, diff_available: true }, 'rendered-placeholder-token');
   expect(fetch.mock.calls[0][1].headers['X-CSRFToken']).toBe('rendered-placeholder-token');
   fetch.mockImplementationOnce(async () => ({ ok: true, json: async () => ({ status: 'no_op' }) }));
   document.getElementById('nso-apply-confirm').click();
@@ -132,20 +132,28 @@ it('uses the rendered form token for preview and confirm when the cookie is Http
   expect(fetch.mock.calls[1][1].headers['X-CSRFToken']).toBe('rendered-placeholder-token');
 });
 
-it('renders each stream verdict and its safe cause', async () => {
+it('renders each stream verdict as a labelled badge and lists only the safe causes', async () => {
   const body = await open({ total: 0, preview_status: 'ready', can_apply: true, diff_available: true,
-    streams: { ip: { status: 'blocked', message: 'inexpressible-on-ned: placeholder <cause>' },
-      interface_config: { status: 'admitted', message: '' } } });
-  expect(body.textContent).toContain('ip: blocked');
-  expect(body.textContent).toContain('interface_config: admitted');
-  expect(body.textContent).toContain('inexpressible-on-ned: placeholder <cause>');
+    streams: { ip: { status: 'blocked', label: 'Interface IP', skip: '', message: 'inexpressible-on-ned: placeholder <cause>' },
+      interface_config: { status: 'admitted', label: 'Interface', skip: '', message: '' },
+      lag: { status: 'not_evaluated', label: 'LACP', skip: 'already applied', message: '' },
+      vlan: { status: 'not_evaluated', label: 'VLAN', skip: '', message: '' } } });
+  const badges = [...body.querySelectorAll('.badge')].map(node => [node.textContent, node.className]);
+  expect(badges).toEqual(expect.arrayContaining([
+    ['Interface', 'badge text-bg-success'],
+    ['Interface IP: blocked', 'badge text-bg-danger'],
+    ['LACP: already applied', 'badge text-bg-info'],
+    ['VLAN: not evaluated', 'badge text-bg-warning text-dark'],
+  ]));
+  const causes = [...body.querySelectorAll('li')].map(node => node.textContent);
+  expect(causes).toEqual(['Interface IP: inexpressible-on-ned: placeholder <cause>']);
   expect(body.querySelector('cause')).toBeNull();
 });
 
 
 it('changes diff formats without preparing another selection', async () => {
   const body = await open({ total: 1, preview_status: 'ready', can_apply: true, apply_preview: 'signed-placeholder',
-    streams: { vlan: { status: 'admitted' } }, device_diffs: { native: '+ native placeholder', cli: '+ tree placeholder' },
+    streams: { vlan: { status: 'admitted', label: 'VLAN' } }, device_diffs: { native: '+ native placeholder', cli: '+ tree placeholder' },
     diff_available: true });
   body.querySelector('[data-diffmode="native"]').click();
   await vi.waitFor(() => expect(body.textContent).toContain('+ native placeholder'));
@@ -154,7 +162,7 @@ it('changes diff formats without preparing another selection', async () => {
 
 it.each(['refused', 'unavailable', 'error'])('disables confirm for %s admission', async (status) => {
   await open({ total: 1, preview_status: status, can_apply: false, apply_preview: null,
-    streams: { vlan: { status: 'not_evaluated' } }, diff_available: false });
+    streams: { vlan: { status: 'not_evaluated', label: 'VLAN' } }, diff_available: false });
   const confirm = document.getElementById('nso-apply-confirm');
   expect(confirm.disabled).toBe(true);
   confirm.click();
@@ -163,7 +171,7 @@ it.each(['refused', 'unavailable', 'error'])('disables confirm for %s admission'
 
 it('opens a fresh preview after stale admission and submits its new reference', async () => {
   const ready = { total: 1, preview_status: 'ready', can_apply: true, apply_preview: 'original-reference',
-    streams: { vlan: { status: 'admitted' } }, diff_available: true };
+    streams: { vlan: { status: 'admitted', label: 'VLAN' } }, diff_available: true };
   await open(ready);
   fetch.mockImplementationOnce(async () => ({ok: false,
     json: async () => ({status: 'preflight_stale', message: 'Apply needs a fresh preview.'})}));

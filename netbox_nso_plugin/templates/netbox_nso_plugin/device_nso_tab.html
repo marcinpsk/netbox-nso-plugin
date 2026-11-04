@@ -1072,12 +1072,23 @@
       }).join('');
     }
 
+    var VERDICT_BADGE = { admitted: 'text-bg-success', blocked: 'text-bg-danger' };
+
     function renderStreamVerdicts(d) {
-      return Object.keys(d.streams || {}).sort().map(function (stream) {
-        var verdict = d.streams[stream];
-        return '<p class="text-break"><strong>' + esc(stream) + ': ' + esc(verdict.status)
-          + '</strong> ' + esc(verdict.message || '') + '</p>';
+      var streams = d.streams || {};
+      var names = Object.keys(streams).sort(function (a, b) { return streams[a].label.localeCompare(streams[b].label); });
+      if (!names.length) return '';
+      var badges = names.map(function (stream) {
+        var verdict = streams[stream];
+        var note = verdict.status === 'admitted' ? '' : (verdict.skip || verdict.status.replace('_', ' '));
+        var tone = VERDICT_BADGE[verdict.status] || (verdict.skip ? 'text-bg-info' : 'text-bg-warning text-dark');
+        return '<span class="badge ' + tone + '">' + esc(verdict.label) + (note ? ': ' + esc(note) : '') + '</span>';
       }).join('');
+      var causes = names.filter(function (stream) { return streams[stream].message; }).map(function (stream) {
+        return '<li class="text-break"><strong>' + esc(streams[stream].label) + ':</strong> ' + esc(streams[stream].message) + '</li>';
+      }).join('');
+      return '<div class="d-flex flex-wrap gap-1 mb-2">' + badges + '</div>'
+        + (causes ? '<ul class="small ps-3 mb-2">' + causes + '</ul>' : '');
     }
 
     function renderPreview(d) {

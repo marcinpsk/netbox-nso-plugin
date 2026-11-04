@@ -144,6 +144,34 @@ def validate_preflight(body, selected) -> ApplyPreflight:
     return body
 
 
+_SKIP_TEXT = {
+    "already_applied": "already applied",
+    "already_authorized": "already authorized",
+    "superseded": "superseded by a newer revision",
+    "backfill_only": "backfill only",
+    "no_receipt": "not delivered yet",
+    "no_prepared_revision": "nothing prepared",
+    "revision_mismatch": "revision changed",
+}
+
+
+def stream_verdicts(preflight):
+    """Label each stream verdict with its display name, cause and skip reason."""
+    from .delivery import delivery_keys
+
+    labels = {entry.section: entry.label for entry in delivery_keys().values()}
+    skips = preflight["skips"]
+    return {
+        stream: {
+            **verdict,
+            "label": labels[stream],
+            "message": verdict_message(verdict),
+            "skip": _SKIP_TEXT.get(skips[stream], skips[stream]) if stream in skips else "",
+        }
+        for stream, verdict in preflight["streams"].items()
+    }
+
+
 def confirm_selection(preflight, selected):
     """Keep skipped entries because Apply binds their exact reasons in the identity."""
     return {**preflight["admitted_selection"], **{key: selected[key] for key in preflight["skips"]}}

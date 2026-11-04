@@ -6597,7 +6597,7 @@ class NSOApplyPreviewView(AuthorizedView):
     def post(self, request, device_pk):
         """Prepare receipts once and return the adapter's complete admission verdict."""
         from . import adapter_client as client
-        from .apply_preflight import preflight_message, verdict_message
+        from .apply_preflight import preflight_message, stream_verdicts
         from .apply_state import IntentChangedDuringPreparation
         from .durable_capture import record_preflight
         from .models import NSOApplyAttempt
@@ -6634,9 +6634,7 @@ class NSOApplyPreviewView(AuthorizedView):
         changes = _apply_preview_interface_changes(device_pk)
         routing_changes = _apply_preview_owner_changes(device_pk)
         projection = attributed_projection(preflight["refusals"]) if preflight["refusals"] else None
-        streams = {
-            stream: {**verdict, "message": verdict_message(verdict)} for stream, verdict in preflight["streams"].items()
-        }
+        streams = stream_verdicts(preflight)
         total = len(changes) + len(routing_changes)
         response = JsonResponse(
             {
