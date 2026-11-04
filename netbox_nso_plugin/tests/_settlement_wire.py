@@ -26,7 +26,11 @@ def deployment_wire(evidence):
     attempts = []
     for attempt in evidence["attempts"]:
         projection = {key: value for key, value in attempt.items() if key != "generations"}
-        projection["selected"] = attempt["response"].get("selected", {})
+        if "selected" not in attempt:
+            # A rejection response has no selector echo, so a rejected row must name its selection.
+            if attempt["admission_state"] == "rejected":
+                raise ValueError("a rejected evidence row must name its selection")
+            projection["selected"] = attempt["response"].get("selected", {})
         projection["generation_ids"] = [row["generation_id"] for row in attempt["response"].get("generations", [])]
         generations = attempt["generations"]
         attempts.append(
