@@ -1703,10 +1703,10 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 self.assertIsNone(row.apply_attempt_id)
 
     def test_promotion_resolves_linked_route_policy_targets_without_per_row_queries(self):
-        """Linked LOCAL rows are promoted, and their target check stays one query per content type."""
+        """Linked LOCAL rows are promoted, and their class and target locks stay one query per content type."""
         from netbox_routing.models import CommunityList
 
-        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyObjectClass
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
 
         one = self._accepted_local_candidates(self.device, ["CL-LINKED-SOLO"], materialized=True)
         many = self._accepted_local_candidates(
@@ -1716,20 +1716,13 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         one_sql = self._promotion_queries(one)
         many_sql = self._promotion_queries(many)
 
-        attempt_table = NSOApplyAttempt._meta.db_table
-        class_table = NSORoutePolicyObjectClass._meta.db_table
-        target_table = CommunityList._meta.db_table
-        counts = []
-        for sqls in (one_sql, many_sql):
-            insert_at = next(index for index, sql in enumerate(sqls) if attempt_table in sql)
-            before_insert = sqls[:insert_at]
-            counts.append(
-                (
-                    sum(class_table in sql for sql in before_insert),
-                    sum(target_table in sql for sql in before_insert),
-                )
-            )
-        self.assertEqual(counts[0], counts[1], f"exclusion queries grew with the candidate count: {counts}")
+        locks = [f'FROM "{model._meta.db_table}"' for model in (NSORoutePolicyObjectClass, CommunityList)]
+        counts = [
+            tuple(sum(lock in sql and "FOR UPDATE" in sql for sql in sqls) for lock in locks)
+            for sqls in (one_sql, many_sql)
+        ]
+        self.assertTrue(all(all(count) for count in counts), f"no route-policy lock queries were captured: {counts}")
+        self.assertEqual(counts[0], counts[1], f"lock queries grew with the candidate count: {counts}")
         for prepared in (one, many):
             for row in prepared.rows:
                 row.refresh_from_db()
