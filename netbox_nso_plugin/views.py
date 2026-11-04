@@ -3064,7 +3064,7 @@ def _fresh_apply_preview_response(request, management, *, is_ajax):
             status=409,
         )
     messages.warning(request, _FRESH_PREVIEW_MESSAGE)
-    return redirect(_device_nso_tab_url(management.device_id) + "?apply_preview=1")
+    return redirect(_device_nso_tab_url(management.device_id))
 
 
 #: What a preparation step did, in the operator's words. A closed vocabulary: with the

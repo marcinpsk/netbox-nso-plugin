@@ -22,6 +22,23 @@ async function open(payload, csrfToken = '') {
 }
 afterEach(() => { vi.unstubAllGlobals(); document.body.innerHTML = ''; });
 
+it('does not start a preview or Apply from the page URL', async () => {
+  window.history.replaceState(null, '', '/?apply_preview=1');
+  try {
+    document.body.innerHTML = `<div id="nso-job-status">
+      <div class="alert"></div><span id="nso-job-spinner"></span><span id="nso-job-message"></span></div>
+      <form class="nso-action-form nso-apply-form" data-preview-url="/preview/" action="/apply/" data-label="Apply Intent"></form>
+      <div id="nso-apply-modal" class="d-none"><div id="nso-apply-modal-body"></div><button id="nso-apply-confirm">Confirm Apply</button></div>`;
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ can_apply: true, nothing_pending: true, total: 0 }) }));
+    vi.stubGlobal('fetch', fetchMock);
+    new Function(script)();
+    await new Promise(resolveTick => setTimeout(resolveTick, 0));
+    expect(fetchMock).not.toHaveBeenCalled();
+  } finally {
+    window.history.replaceState(null, '', '/');
+  }
+});
+
 it('does not infer per-row satisfaction from a nonempty whole-device diff', async () => {
   const body = await open({ total: 2, diff_available: true, device_diff: { device_intent: '+ device configuration' },
     routing_changes: [

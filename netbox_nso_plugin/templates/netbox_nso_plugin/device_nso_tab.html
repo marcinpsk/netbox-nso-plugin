@@ -1165,8 +1165,6 @@
       finally { previewLoading = false; }
     }
 
-    if (applyForm && new URLSearchParams(window.location.search).get('apply_preview') === '1') openApply();
-
     if (confirmBtn) { confirmBtn.addEventListener('click', function () {
       if (confirmBtn.disabled) return;
       confirmBtn.disabled = true; hideModal(); runAction(applyForm);

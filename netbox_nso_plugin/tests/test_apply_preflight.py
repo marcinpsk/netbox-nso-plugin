@@ -288,6 +288,15 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(adapter.requests, [])
         self.assertEqual(adapter.applies, [])
 
+    def test_a_stale_confirm_without_javascript_does_not_reopen_the_preview_from_the_url(self):
+        adapter = PreflightAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            response = self.client.post(self.apply_url, {"apply_preview": ""})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
+        self.assertEqual(adapter.requests, [])
+
     def test_preview_refuses_an_active_receipt_claim_without_promoting_rows(self):
         from netbox_nso_plugin import delivery, drain
         from netbox_nso_plugin.models import NSOIntentOutboxState
