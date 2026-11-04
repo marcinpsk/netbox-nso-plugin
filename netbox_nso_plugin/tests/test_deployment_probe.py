@@ -1386,6 +1386,40 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertEqual(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id, attempt.pk)
         self.assertTrue(deployment.is_quiesced())
 
+    def test_a_failed_probe_send_claim_rolls_back_its_promotion(self):
+        from django.db import OperationalError, connection
+
+        from .test_apply_selector import _promoted
+
+        self._prepare_bgp_observation_capture()
+        deployment.quiesce(paired_activation=True)
+        self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
+
+        def admission(selected):
+            response = _promoted(selected)
+            response["generations"] = response["generations"][:1]
+            return 202, response
+
+        def fail_the_send_claim(execute, sql, params, many, context):
+            if sql.startswith("UPDATE") and '"send_seq"' in sql:
+                raise OperationalError("canceling statement due to lock timeout")
+            return execute(sql, params, many, context)
+
+        self.adapter.apply_response = admission
+        attempt_id = uuid4()
+        with connection.execute_wrapper(fail_the_send_claim), self.assertRaises(OperationalError):
+            self.command(start_probe=str(attempt_id), device_id=self.device.pk)
+        attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+        self.assertIsNone(attempt.adapter_apply_attempt_id)
+        self.assertEqual(attempt.send_seq, 0)
+        self.assertEqual(self.adapter.apply_requests, [])
+
+        self.command(start_probe=str(attempt_id), device_id=self.device.pk)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.adapter_apply_attempt_id, attempt.pk)
+        self.assertEqual(attempt.send_seq, 1)
+        self.assertEqual(len(self.adapter.apply_requests), 1)
+
     def test_malformed_no_op_probe_keeps_unresolved_snapshots(self):
         from .test_apply_selector import _promoted
 

@@ -588,7 +588,8 @@ def start_probe(attempt_id, device_id):
                 "Probe preflight did not admit its exact BGP selection",
             )
             record_preflight(attempt, preflight)
-        if attempt.adapter_apply_attempt_id is None:
+        first_admission = attempt.adapter_apply_attempt_id is None
+        if first_admission:
             _require(attempt.response is None and attempt.http_status is None, "Unsent probe has an admission response")
             promote_snapshots(attempt)
         _require(attempt.adapter_apply_attempt_id == attempt.pk, "Probe promotion identity changed")
@@ -597,7 +598,8 @@ def start_probe(attempt_id, device_id):
             control.save(update_fields=("verification_attempt",))
         try:
             if attempt.response is None:
-                _require(claim_send(attempt), "Probe admission was rejected; select a fresh probe UUID")
+                if not first_admission:
+                    _require(claim_send(attempt), "Probe admission was rejected; select a fresh probe UUID")
                 response = adapter_client.trigger_apply(
                     management.adapter_device_id, attempt.pk, attempt.selected, request_identity(attempt)
                 )

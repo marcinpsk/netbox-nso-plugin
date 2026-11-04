@@ -3045,7 +3045,7 @@ def _confirmed_apply(request, management):
     except AdapterError as exc:
         raise ApplyIntentChanged from exc
     try:
-        promote_snapshots(attempt, claim=True)
+        promote_snapshots(attempt)
     except IntentChangedDuringPreparation as exc:
         raise ApplyIntentChanged from exc
     except DatabaseError as exc:

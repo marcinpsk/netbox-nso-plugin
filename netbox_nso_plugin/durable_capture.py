@@ -560,10 +560,10 @@ def _promote_snapshot(item, target, attempt, admitted):
         item.save(update_fields=("expected_fence_revision",))
 
 
-def promote_snapshots(attempt, *, claim=False):
+def promote_snapshots(attempt):
     """Promote manual snapshots and return whether this is the first submission.
 
-    With ``claim``, the same transaction also claims the next send, so a failure keeps neither.
+    The same transaction also claims the next send, so a failure keeps neither.
     """
     from .apply_state import IntentChangedDuringPreparation
     from .apply_submission import claim_locked_send
@@ -581,7 +581,7 @@ def promote_snapshots(attempt, *, claim=False):
         if locked.adapter_apply_attempt_id == locked.pk:
             if locked.response is not None and locked.http_status not in (200, 202):
                 raise IntentChangedDuringPreparation
-            if claim and not claim_locked_send(locked, attempt):
+            if not claim_locked_send(locked, attempt):
                 raise IntentChangedDuringPreparation
             attempt.adapter_apply_attempt_id = locked.pk
             return False
@@ -615,7 +615,7 @@ def promote_snapshots(attempt, *, claim=False):
             _promote_snapshot(item, rows[(item.model_label, item.overlay_pk)], locked, admitted)
         locked.adapter_apply_attempt_id = locked.pk
         locked.save(update_fields=("adapter_apply_attempt_id",))
-        if claim and not claim_locked_send(locked, attempt):
+        if not claim_locked_send(locked, attempt):
             raise IntentChangedDuringPreparation
         attempt.adapter_apply_attempt_id = locked.pk
         return True
