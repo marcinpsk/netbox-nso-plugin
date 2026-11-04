@@ -251,6 +251,24 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(response.json()["status"], "preflight_stale")
         self.assertEqual(adapter.applies, [])
 
+    def test_a_stored_preflight_that_no_longer_validates_requires_new_admission(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        adapter = PreflightAdapter()
+        preview = self.preview(adapter)
+        attempt = NSOApplyAttempt.objects.get(management=self.mgmt, preflight__isnull=False)
+        stored = attempt.preflight
+        # A stream that the delivery registry no longer knows makes the stored preflight invalid.
+        NSOApplyAttempt.objects.filter(pk=attempt.pk).update(
+            preflight={**stored, "selected": {**stored["selected"], "retired-stream": 1}}
+        )
+        response = self.confirm(adapter, preview["apply_preview"])
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(response.json()["status"], "preflight_stale")
+        self.assertEqual(adapter.applies, [])
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "accepted")
+
     def test_confirm_without_preview_does_not_prepare_or_apply(self):
         adapter = PreflightAdapter()
         response = self.confirm(adapter, "")

@@ -3041,7 +3041,10 @@ def _confirmed_apply(request, management):
     ).first()
     if attempt is None:
         raise ApplyIntentChanged
-    identity = request_identity(attempt)
+    try:
+        identity = request_identity(attempt)
+    except AdapterError as exc:
+        raise ApplyIntentChanged from exc
     try:
         promote_snapshots(attempt)
         if not claim_send(attempt):
