@@ -375,6 +375,43 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         for _, row in self.rows:
             self._assert_prior_bookkeeping(row)
 
+    def _assert_contradicting_journal_rejection_is_not_recorded(self, change, error):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+
+        adapter = ManualAdmissionAdapter(lambda _body: requests.ConnectionError("Apply admission answer was lost."))
+        self.assertEqual(self._apply(adapter).status_code, 502)
+        attempt_id = adapter.apply_requests[0]["apply_attempt_id"]
+        adapter.answer = lambda _body: (409, adapter.rejection())
+        original = adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                body = response.json()
+                for attempt in body["attempts"]:
+                    attempt["projection"].update(change)
+                return make_response(200, body)
+            return response
+
+        adapter._handle = handle
+        config, session = adapter.patches()
+        with config, session, self.assertRaisesRegex(EvidenceInvariantError, error):
+            load_deployment_evidence(NSODeviceManagement.objects.get(pk=self.management.pk))
+        attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+        self.assertIsNone(attempt.http_status)
+        self.assertIsNone(attempt.response)
+
+    def test_a_journal_rejection_with_a_promoted_status_is_not_recorded(self):
+        self._assert_contradicting_journal_rejection_is_not_recorded({"http_status": 202}, "status contradicts")
+
+    def test_a_journal_rejection_with_a_no_op_status_is_not_recorded(self):
+        self._assert_contradicting_journal_rejection_is_not_recorded({"http_status": 200}, "status contradicts")
+
+    def test_a_journal_rejection_for_another_selection_is_not_recorded(self):
+        self._assert_contradicting_journal_rejection_is_not_recorded(
+            {"selected": {"interface": 999999}}, "changed the Apply selection"
+        )
+
     def test_replay_rejection_without_a_remote_journal_keeps_the_admission_unresolved(self):
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence
 

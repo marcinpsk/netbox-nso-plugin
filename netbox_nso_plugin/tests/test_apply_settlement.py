@@ -964,6 +964,7 @@ class TestAttemptSettlement(TestCase):
             "admission_state": "rejected",
             "http_status": 409,
             "response": rejection,
+            "selected": {"vlan": 303},
             "generations": [],
         }
 

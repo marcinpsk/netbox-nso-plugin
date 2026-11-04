@@ -156,8 +156,13 @@ def _validate_attempt(raw, local, store_incarnation=None, *, settlement_sequence
         raise EvidenceInvariantError("deployment evidence has an invalid admission state")
     if not 100 <= raw["http_status"] <= 599:
         raise EvidenceInvariantError("deployment evidence has an invalid stored response")
+    if (raw["admission_state"] == "admitted") != (raw["http_status"] in (200, 202)):
+        raise EvidenceInvariantError("deployment evidence status contradicts its admission state")
     response = raw["response"]
     selected = response.get("selected")
+    # A rejection response has no selector echo, so its row selection is the only binding.
+    if raw["admission_state"] == "rejected" and raw.get("selected") != local.selected:
+        raise EvidenceInvariantError("deployment evidence changed the Apply selection")
     if raw["admission_state"] == "admitted":
         if response.get("device_id") != local.adapter_device_id:
             raise EvidenceInvariantError("admission_mapping_changed")
