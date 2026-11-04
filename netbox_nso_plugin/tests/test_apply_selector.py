@@ -133,12 +133,14 @@ class _ApplyContractAdapter(ReceiptAdapter):
         *,
         accepted_intent_suffixes=("-intent", "/intent"),
         failed_intent_suffix=None,
+        raised_intent_suffix=None,
         failed_direct_suffix=None,
     ):
         super().__init__()
         self.apply_response = apply_response
         self.accepted_intent_suffixes = accepted_intent_suffixes
         self.failed_intent_suffix = failed_intent_suffix
+        self.raised_intent_suffix = raised_intent_suffix
         self.failed_direct_suffix = failed_direct_suffix
         self.apply_requests: list[dict] = []
         self.direct_requests: list[str] = []
@@ -217,6 +219,8 @@ class _ApplyContractAdapter(ReceiptAdapter):
                     }
                 ),
             )
+        if method == "PUT" and self.raised_intent_suffix and url.endswith(self.raised_intent_suffix):
+            raise ConnectionError(f"transport failed for {url}")
         if method == "PUT" and self.failed_intent_suffix and url.endswith(self.failed_intent_suffix):
             # Copied from ErrorEnvelope in ../nso-adapter/tests/api/openapi_snapshot.json.
             return make_response(
@@ -638,7 +642,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
     def test_a_raised_preparation_push_aborts_apply_after_a_sibling_succeeds(self):
         adapter = _ApplyContractAdapter(
             lambda selected: (202, _promoted(selected)),
-            failed_intent_suffix="/isis-interface-intent",
+            raised_intent_suffix="/isis-interface-intent",
         )
         response = self._post(adapter)
 
