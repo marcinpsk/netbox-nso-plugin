@@ -6613,7 +6613,11 @@ class NSOApplyPreviewView(AuthorizedView):
             prepared, selected = _prepare_apply(management)
             preflight = client.apply_preflight(management.adapter_device_id, selected)
             attempt = NSOApplyAttempt.objects.get(pk=prepared.attempt_id)
-            record_preflight(attempt, preflight)
+            try:
+                record_preflight(attempt, preflight)
+            except DatabaseError as exc:
+                logger.warning("Apply preflight store failed for device %s: %s", management.device_id, exc)
+                return JsonResponse({"status": "error", "message": _PREFLIGHT_STORE_MESSAGE}, status=409)
         except (ApplyRefused, DeploymentQuiesced) as exc:
             message = _apply_refusal_message(exc, management)
             return JsonResponse({"status": "error", "message": message}, status=409)
@@ -6623,9 +6627,6 @@ class NSOApplyPreviewView(AuthorizedView):
             if exc.code == "conflict":
                 return NSODeviceActionView()._incumbent_job(request, management, exc, action="apply", is_ajax=True)
             return JsonResponse({"status": "error", "message": public_error_message(exc)}, status=502)
-        except DatabaseError as exc:
-            logger.warning("Apply preflight store failed for device %s: %s", management.device_id, exc)
-            return JsonResponse({"status": "error", "message": _PREFLIGHT_STORE_MESSAGE}, status=409)
         can_apply = preflight["status"] == "ready"
         reference = (
             signing.dumps(
