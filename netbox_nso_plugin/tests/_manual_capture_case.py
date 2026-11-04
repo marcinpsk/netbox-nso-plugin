@@ -68,7 +68,7 @@ def post_apply(client, management, **kwargs):
     preview = client.post(
         reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[management.device_id]), **kwargs
     )
-    if preview.status_code != 200:
+    if preview.status_code != 200 or not preview.json()["can_apply"]:
         return preview
     return client.post(
         reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[management.pk, "apply"]),

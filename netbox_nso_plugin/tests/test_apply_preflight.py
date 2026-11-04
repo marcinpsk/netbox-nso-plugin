@@ -196,6 +196,24 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
 
+    def test_post_apply_returns_a_refused_preview_without_confirming(self):
+        from ._manual_capture_case import post_apply
+
+        def verdict(selected):
+            result = preflight_wire(selected, status="refused")
+            result["error"] = {"code": "removal_blocked_collateral", "message": "placeholder refusal"}
+            return result
+
+        adapter = PreflightAdapter(verdict)
+        adapter.preparation_revisions = self.preparation_revisions
+        config, session = adapter.patches()
+        with config, session:
+            response = post_apply(self.client, self.mgmt, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertFalse(response.json()["can_apply"])
+        self.assertEqual(len(adapter.preflights), 1)
+        self.assertEqual(adapter.applies, [])
+
     @override_settings(CSRF_COOKIE_HTTPONLY=True)
     def test_preview_accepts_the_rendered_form_token_with_csrf_checks(self):
         client = Client(enforce_csrf_checks=True)
