@@ -315,6 +315,28 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 finally:
                     drain.abandon(held)
 
+    def test_preview_refuses_a_database_failure_while_storing_the_preflight(self):
+        from django.db import OperationalError, connection
+
+        adapter = PreflightAdapter()
+
+        def lock_timeout_after_preflight(execute, sql, params, many, context):
+            if adapter.preflights and "FOR UPDATE" in sql:
+                raise OperationalError("canceling statement due to lock timeout")
+            return execute(sql, params, many, context)
+
+        config, session = adapter.patches()
+        with config, session, connection.execute_wrapper(lock_timeout_after_preflight):
+            response = self.client.post(self.preview_url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("could not store the preflight", response.json()["message"])
+        self.assertEqual(len(adapter.preflights), 1)
+        self.assertEqual(adapter.applies, [])
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "accepted")
+        self.assertIsNone(self.row.apply_attempt_id)
+
     def test_preview_refuses_an_audit_timeout_between_preparation_calls(self):
         import time
 
@@ -342,6 +364,38 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 self.row.refresh_from_db()
                 self.assertEqual(self.row.status, "accepted")
                 self.assertIsNone(self.row.apply_attempt_id)
+
+    def test_a_failed_send_claim_rolls_back_the_confirmed_promotion(self):
+        from django.db import OperationalError, connection
+
+        from netbox_nso_plugin.apply_settlement import deploying_attempt_ids
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        adapter = PreflightAdapter()
+        preview = self.preview(adapter)
+
+        def fail_the_send_claim(execute, sql, params, many, context):
+            if sql.startswith("UPDATE") and '"send_seq"' in sql:
+                raise OperationalError("canceling statement due to lock timeout")
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(fail_the_send_claim):
+            response = self.confirm(adapter, preview["apply_preview"])
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertIn("could not mark the selected intent as deploying", response.json()["message"])
+        self.assertEqual(adapter.applies, [])
+        attempt = NSOApplyAttempt.objects.get(management=self.mgmt, trigger_kind="manual")
+        self.assertIsNone(attempt.adapter_apply_attempt_id)
+        self.assertEqual(attempt.send_seq, 0)
+        self.assertEqual(deploying_attempt_ids(self.mgmt), ())
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "accepted")
+
+        retried = self.confirm(adapter, preview["apply_preview"])
+        self.assertEqual(retried.status_code, 200, retried.content)
+        self.assertEqual(len(adapter.applies), 1)
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "deploying")
 
     def test_stale_identity_requires_new_preview_and_new_attempt(self):
         adapter = PreflightAdapter()

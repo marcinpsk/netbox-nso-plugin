@@ -10,12 +10,16 @@ from .models import NSOApplyAttempt
 def claim_send(attempt):
     """Commit a send sequence unless this attempt has a definite rejection."""
     with transaction.atomic():
-        locked = NSOApplyAttempt.objects.select_for_update().get(pk=attempt.pk)
-        if locked.response is not None and locked.http_status not in (200, 202):
-            return False
-        locked.send_seq += 1
-        locked.save(update_fields=("send_seq",))
-        attempt.send_seq = locked.send_seq
+        return claim_locked_send(NSOApplyAttempt.objects.select_for_update().get(pk=attempt.pk), attempt)
+
+
+def claim_locked_send(locked, attempt):
+    """Advance the send sequence of an attempt row that the caller holds locked."""
+    if locked.response is not None and locked.http_status not in (200, 202):
+        return False
+    locked.send_seq += 1
+    locked.save(update_fields=("send_seq",))
+    attempt.send_seq = locked.send_seq
     return True
 
 

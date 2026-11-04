@@ -3018,7 +3018,6 @@ def _confirmed_apply(request, management):
     """Load and promote the exact user-bound preview without preparing receipts."""
     from .apply_preflight import request_identity
     from .apply_state import IntentChangedDuringPreparation
-    from .apply_submission import claim_send
     from .durable_capture import promote_snapshots
     from .models import NSOApplyAttempt
 
@@ -3046,9 +3045,7 @@ def _confirmed_apply(request, management):
     except AdapterError as exc:
         raise ApplyIntentChanged from exc
     try:
-        promote_snapshots(attempt)
-        if not claim_send(attempt):
-            raise ApplyIntentChanged
+        promote_snapshots(attempt, claim=True)
     except IntentChangedDuringPreparation as exc:
         raise ApplyIntentChanged from exc
     except DatabaseError as exc:
@@ -3077,6 +3074,10 @@ _PREPARE_NOT_SETTLED = "did not settle successfully"
 _PREPARE_NOT_STARTED = "did not start before the preparation deadline expired"
 
 _APPLY_DEADLINE_MESSAGE = "Apply stopped before submission because the intent preparation deadline expired."
+_PREFLIGHT_STORE_MESSAGE = (
+    "Apply preview stopped because NetBox could not store the preflight result. "
+    "No stream was admitted. Try a fresh preview."
+)
 _APPLY_PROMOTION_MESSAGE = (
     "Apply stopped because NetBox could not mark the selected intent as deploying. "
     "No Apply job was enqueued and all local promotion marks were rolled back."
@@ -6622,6 +6623,9 @@ class NSOApplyPreviewView(AuthorizedView):
             if exc.code == "conflict":
                 return NSODeviceActionView()._incumbent_job(request, management, exc, action="apply", is_ajax=True)
             return JsonResponse({"status": "error", "message": public_error_message(exc)}, status=502)
+        except DatabaseError as exc:
+            logger.warning("Apply preflight store failed for device %s: %s", management.device_id, exc)
+            return JsonResponse({"status": "error", "message": _PREFLIGHT_STORE_MESSAGE}, status=409)
         can_apply = preflight["status"] == "ready"
         reference = (
             signing.dumps(
