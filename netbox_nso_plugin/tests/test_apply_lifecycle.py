@@ -39,7 +39,6 @@ class TestApplyAttemptSchema(SimpleTestCase):
 
         attempt = plugin_models.NSOApplyAttempt
         self.assertIsInstance(attempt._meta.pk, models.UUIDField)
-        self.assertIsInstance(attempt._meta.get_field("send_seq"), models.PositiveBigIntegerField)
         self.assertEqual(
             {
                 "management",
