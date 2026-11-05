@@ -441,6 +441,24 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
 
+    def test_a_promoted_answer_without_a_chain_is_kept_and_stalls_settlement(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, _admission_keep_streams
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        adapter = PreflightAdapter()
+        adapter.apply_response = lambda selected: {**_promoted(selected), "generations": []}
+        preview = self.preview(adapter)
+        response = self.confirm(adapter, preview["apply_preview"])
+        self.assertEqual(response.status_code, 502, response.content)
+        self.assertIn("without a generation chain", response.json()["message"])
+        attempt = NSOApplyAttempt.objects.get(pk=adapter.applies[0]["apply_attempt_id"])
+        # The adapter admitted the selection, so its exact answer stays durable and the rows stay deploying.
+        self.assertEqual((attempt.http_status, attempt.response["generations"]), (202, []))
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "deploying")
+        with self.assertRaisesRegex(EvidenceInvariantError, "no valid generation chain"):
+            _admission_keep_streams(attempt, attempt.response)
+
     def test_stale_identity_requires_new_preview_and_new_attempt(self):
         from netbox_nso_plugin.models import NSOApplyAttempt
 
