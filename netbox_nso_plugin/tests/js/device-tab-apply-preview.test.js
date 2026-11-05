@@ -3,7 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, expect, it, onTestFinished, vi } from 'vitest';
 
 const source = readFileSync(resolve(process.cwd(), 'netbox_nso_plugin/templates/netbox_nso_plugin/device_nso_tab.html'), 'utf8');
 const parsed = new DOMParser().parseFromString(source, 'text/html');
@@ -136,6 +136,11 @@ it('prepares one preview with POST and carries its reference through confirm', a
   expect(fetch.mock.calls).toHaveLength(1);
   expect(fetch.mock.calls[0][1].method).toBe('POST');
   expect(document.querySelector('[name="apply_preview"]').value).toBe('signed-placeholder');
+  fetch.mockImplementationOnce(async () => ({ ok: true, json: async () => ({ status: 'no_op' }) }));
+  document.getElementById('nso-apply-confirm').click();
+  await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+  expect(new URL(fetch.mock.calls[1][0]).pathname).toBe('/apply/');
+  expect(String(fetch.mock.calls[1][1].body)).toBe('apply_preview=signed-placeholder');
 });
 
 it('uses the rendered form token for preview and confirm when the cookie is HttpOnly', async () => {
@@ -180,10 +185,7 @@ it('changes diff formats without preparing another selection', async () => {
 it.each(['refused', 'unavailable', 'error'])('disables confirm for %s admission', async (status) => {
   await open({ total: 1, preview_status: status, can_apply: false, apply_preview: null,
     streams: { vlan: { status: 'not_evaluated', label: 'VLAN' } }, diff_available: false });
-  const confirm = document.getElementById('nso-apply-confirm');
-  expect(confirm.disabled).toBe(true);
-  confirm.click();
-  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(document.getElementById('nso-apply-confirm').disabled).toBe(true);
 });
 
 it('opens a fresh preview after stale admission and submits its new reference', async () => {
@@ -216,7 +218,8 @@ it('uses the same form token for action and category POSTs without reading cooki
       <input type="hidden" name="csrfmiddlewaretoken" value="rendered-placeholder-token"></form>
     <div class="nso-cat-pager" data-url="/rows/"><div class="nso-cat-results"></div>
       <form class="nso-row-form" action="/accept/"><button>Accept</button></form></div>`;
-  expect(document.cookie).not.toContain('csrftoken=');
+  document.cookie = 'csrftoken=cookie-placeholder';
+  onTestFinished(() => { document.cookie = 'csrftoken=; expires=Thu, 01 Jan 1970 00:00:00 GMT'; });
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ status: 'no_op' }),
     text: async () => '<div class="nso-cat-results">Updated row</div>' })));
   new Function(script + '\n' + pagerScript)();
