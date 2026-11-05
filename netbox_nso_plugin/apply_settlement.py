@@ -714,10 +714,20 @@ def deployment_evidence_attempt_ids(management) -> tuple[UUID, ...]:
     return tuple(sorted(attempt_ids, key=str))
 
 
-def _record_replay_answer(attempt, result=None, error=None):
-    """Persist verified admission facts and return any later restoration decision."""
+def _record_replayed_response(attempt, *, http_status, response):
+    """Record a replayed answer; a contradiction with the stored answer is an evidence invariant."""
     from .apply_submission import record_response
 
+    try:
+        return record_response(attempt.pk, http_status=http_status, response=response, send_seq=attempt.send_seq)
+    except EvidenceInvariantError:
+        raise
+    except RuntimeError as exc:
+        raise EvidenceInvariantError("apply_replay_answer_conflict") from exc
+
+
+def _record_replay_answer(attempt, result=None, error=None):
+    """Persist verified admission facts and return any later restoration decision."""
     if isinstance(result, dict):
         if result.get("outcome") not in ("promoted", "no_op"):
             return None
@@ -729,7 +739,7 @@ def _record_replay_answer(attempt, result=None, error=None):
     else:
         return None
     keep_streams = _admission_keep_streams(attempt, response, rejected=error is not None)
-    if not record_response(attempt.pk, http_status=status, response=response, send_seq=attempt.send_seq):
+    if not _record_replayed_response(attempt, http_status=status, response=response):
         return None
     if keep_streams is not None:
         return attempt.pk, keep_streams
@@ -772,7 +782,7 @@ def _replay_apply_answer(management, attempt):
     """Validate a replay answer before reconciliation can use its admission facts."""
     from . import adapter_client as client
     from .apply_preflight import request_identity
-    from .apply_submission import claim_send, record_response
+    from .apply_submission import claim_send
     from .settlement_schemas import validate_settlement_response
 
     try:
@@ -787,8 +797,8 @@ def _replay_apply_answer(management, attempt):
         if exc.code == "invalid_response" and exc.status_code is None:
             raise EvidenceInvariantError("invalid_apply_replay_response") from exc
         if exc.status_code != 409 or exc.code != "conflict":
-            if exc.definitely_not_enqueued and not record_response(
-                attempt.pk, http_status=exc.status_code, response=exc.rejection_response, send_seq=attempt.send_seq
+            if exc.definitely_not_enqueued and not _record_replayed_response(
+                attempt, http_status=exc.status_code, response=exc.rejection_response
             ):
                 return None
             return attempt, None, exc

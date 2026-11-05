@@ -390,6 +390,54 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 attempt.refresh_from_db()
                 self.assertIsNone(attempt.response)
 
+    def test_a_replay_answer_that_contradicts_the_stored_answer_stalls_with_a_banner(self):
+        self.prepare()
+        stored = (self.attempt.http_status, copy.deepcopy(self.attempt.response))
+        link = self.attempt.response["generations"][0]
+        # The stored admission link matches the listing, so only the replayed answer contradicts it.
+        self.generation_page = [
+            make_generation_listing(
+                **{key: link[key] for key in ("generation_id", "seq", "job_id", "mode", "digest")},
+                stream_revisions=link["stream_revisions"],
+                source_push_seq=link["source_push_seq"],
+                status="pending",
+                carrier_job_id=link["job_id"],
+                carrier_job_status="queued",
+                settlement_cohort=None,
+            )
+        ]
+        self.deployment_body = _payload(self.management.adapter_device_id, [])
+        self.deployment_body["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
+        self.serve_feed([])
+        original = self.adapter._handle
+        no_op = {
+            "device_id": self.management.adapter_device_id,
+            "outcome": "no_op",
+            "job_id": None,
+            "selected": self.attempt.selected,
+            "skipped": dict.fromkeys(self.attempt.selected, "already_applied"),
+            "skipped_detail": None,
+            "generations": [],
+        }
+        calls = []
+
+        def handle(method, url, **kwargs):
+            if method == "POST" and url.endswith("/actions/apply"):
+                calls.append(kwargs["json"])
+                return make_response(200, no_op)
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        self.assert_visible_stall()
+        self.assertEqual(len(calls), 1)
+        self.assert_metadata_banner("invalid settlement evidence")
+        self.assertEqual(
+            (self.management.settle_evidence_error["class"], self.management.settle_evidence_error["code"]),
+            ("evidence_invariant", "apply_replay_answer_conflict"),
+        )
+        self.attempt.refresh_from_db()
+        self.assertEqual((self.attempt.http_status, self.attempt.response), stored)
+
     def test_malformed_response_bodies_show_a_banner(self):
         feed, generations, deployment = self.settlement_responses()
         cases = [
