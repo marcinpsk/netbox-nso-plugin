@@ -68,8 +68,10 @@ def post_apply(client, management, **kwargs):
     preview = client.post(
         reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[management.device_id]), **kwargs
     )
-    if preview.status_code != 200 or not preview.json()["can_apply"]:
+    if preview.status_code != 200:
         return preview
+    # A refused preview must not pass as a confirmed Apply; post the preview URL directly to inspect one.
+    assert preview.json()["can_apply"], preview.json()
     return client.post(
         reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[management.pk, "apply"]),
         {"apply_preview": preview.json()["apply_preview"]},
