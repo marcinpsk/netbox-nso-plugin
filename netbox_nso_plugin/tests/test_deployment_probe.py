@@ -916,6 +916,37 @@ class TestDeploymentProbe(DeploymentCase):
             NSOApplyExecution.objects.filter(attempt_id__in=attempts, consumption_state="consumed").count(), 3
         )
 
+    def test_paired_verification_ignores_an_unsent_preview_and_blocks_a_submitted_manual_attempt(self):
+        from ._adapter_http import make_stored_preflight
+
+        attempts = self.paired_probes()
+        settled = [str(pk) for pk in attempts]
+        # A submitted attempt, and a pre-ledger admission that stored no preflight, are both in flight.
+        for adapter_apply_attempt_id in (uuid4(), None):
+            with self.subTest(adapter_apply_attempt_id=adapter_apply_attempt_id):
+                in_flight = NSOApplyAttempt.objects.create(
+                    management=self.management,
+                    adapter_device_id=self.management.adapter_device_id,
+                    adapter_apply_attempt_id=adapter_apply_attempt_id,
+                    trigger_kind="manual",
+                    selected={"bgp": 1},
+                )
+                with self.assertRaisesRegex(CommandError, "Unanswered or unconsumed attempts remain"):
+                    self.command(verify=True, device_id=self.device.pk, settled_probe=settled)
+                self.assertTrue(deployment.is_quiesced())
+                in_flight.delete()
+        preview = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            trigger_kind="manual",
+            selected={"bgp": 1},
+            preflight=make_stored_preflight({"bgp": 1}),
+        )
+        output = self.command(verify=True, device_id=self.device.pk, settled_probe=settled)
+        self.assertIn("normal intent operation resumed", output)
+        self.assertFalse(deployment.is_quiesced())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=preview.pk, lifecycle="open").exists())
+
     def test_paired_verification_refuses_a_store_that_changed_after_the_generation_listing(self):
         from netbox_nso_plugin import adapter_client
 

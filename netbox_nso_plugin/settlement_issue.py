@@ -296,10 +296,11 @@ def _candidate_attempts(management, stall, observation, members, provenance):
         identity = row.evidence_identity
         if identity["generation_id"] in members and identity["apply_attempt_id"] is not None:
             attempts.add(UUID(identity["apply_attempt_id"]))
-    from .models import NSOApplyAttempt
+    from .models import UNSENT_MANUAL_PREVIEW, NSOApplyAttempt
 
     # A lost answer is ambiguous linkage, also for an attempt from before the adapter identity existed.
-    for attempt in NSOApplyAttempt.objects.filter(management=management, trigger_kind="manual", response__isnull=True):
+    lost = NSOApplyAttempt.objects.filter(management=management, trigger_kind="manual", response__isnull=True)
+    for attempt in lost.exclude(UNSENT_MANUAL_PREVIEW):
         if any(
             attempt.selected.get(stream) == next(iter(_selector(provenance[generation_id], stream).values()))
             for generation_id in members

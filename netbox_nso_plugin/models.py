@@ -3185,6 +3185,8 @@ APPLY_ATTEMPT_PRUNABLE = models.Q(lifecycle="terminal") | models.Q(
     trigger_kind="manual", adapter_apply_attempt_id__isnull=True
 )
 APPLY_ATTEMPT_RETENTION_AT = Coalesce("completed_at", "created_at")
+# A manual preview that stored its preflight and never reached the adapter; a pre-ledger admission stored none.
+UNSENT_MANUAL_PREVIEW = models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, preflight__isnull=False)
 
 
 class NSOApplyAttempt(models.Model):
