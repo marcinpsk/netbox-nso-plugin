@@ -1509,6 +1509,8 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         from ._adapter_http import make_apply_preflight
 
         previous = self.refused_bgp()
+        before = type(self.owners[1]).objects.get(pk=self.owners[1].pk)
+        self.assertIn(previous["message"], row_projection(before)["refusal_text"])
         catalog = MESSAGES[
             "bgp.ned-unsupported" if previous["message_id"] != "bgp.ned-unsupported" else "write-blocked"
         ]
@@ -1550,6 +1552,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         projected = row_projection(peer)
         self.assertEqual(projected["state"], "pending")
         self.assertIn(catalog.text, projected["refusal_text"])
+        self.assertNotIn(previous["message"], projected["refusal_text"])
 
 
 class TestRefusalCauseFormatting(SimpleTestCase):
