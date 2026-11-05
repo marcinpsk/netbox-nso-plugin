@@ -13,6 +13,7 @@ from netbox_nso_plugin.models import NSOInterfaceState
 
 from ._adapter_http import make_apply_preview, make_response
 from ._bgp_settlement import BGPSettlementHelpers
+from ._manual_capture_case import post_apply
 from ._outbox_case import without_commit_drain
 from ._ownership_case import acquire_overlay
 from ._refusal_display import RefusalDisplayHelpers
@@ -1088,10 +1089,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
             return 202, result
 
         self.adapter.apply_response = admission
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200, response.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         generation = self.evidence(dispositions={"interface.description": disposition})
@@ -1454,10 +1452,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
             202,
             {**_promoted(selected), "generations": _promoted(selected)["generations"][:1]},
         )
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200, response.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         generation = self.evidence(dispositions={"vlan.vlan": "unavailable"})
@@ -1506,6 +1501,58 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertIsNone(projection["refusal"])
         self.assertNotIn("commit not attempted", projection["summary"])
         self.assertNotIn("nothing committed", projection["summary"])
+
+    def test_preflight_block_shows_the_new_cause_after_a_failed_execution(self):
+        from netbox_nso_plugin.refusal_display import row_projection
+        from netbox_nso_plugin.refusal_protocol import MESSAGES
+
+        from ._adapter_http import make_apply_preflight
+
+        previous = self.refused_bgp()
+        before = type(self.owners[1]).objects.get(pk=self.owners[1].pk)
+        self.assertIn(previous["message"], row_projection(before)["refusal_text"])
+        catalog = MESSAGES[
+            "bgp.ned-unsupported" if previous["message_id"] != "bgp.ned-unsupported" else "write-blocked"
+        ]
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "POST" and url.endswith("/actions/apply-preflight"):
+                selected = kwargs["json"]["selected"]
+                cause = copy.deepcopy(previous)
+                cause.update(
+                    reason=catalog.reason,
+                    message_id=catalog.id,
+                    message=catalog.text,
+                    sender_phase="pre_commit_dry_run",
+                )
+                for logical in cause["logical_rows"]:
+                    for identity in (logical, logical["carrier"]):
+                        identity.update(source_push_seq=selected["bgp"], generation_id=None, settlement_cohort=None)
+                return make_response(
+                    200,
+                    make_apply_preflight(
+                        selected,
+                        blocked={
+                            "bgp": {"status": "blocked", "refusals": [cause]},
+                        },
+                    ),
+                )
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk]),
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        peer = self.owners[1]
+        peer.refresh_from_db()
+        self.assertEqual(peer.status, "accepted")
+        projected = row_projection(peer)
+        self.assertEqual(projected["state"], "pending")
+        self.assertIn(catalog.text, projected["refusal_text"])
+        self.assertNotIn(previous["message"], projected["refusal_text"])
 
 
 class TestRefusalCauseFormatting(SimpleTestCase):

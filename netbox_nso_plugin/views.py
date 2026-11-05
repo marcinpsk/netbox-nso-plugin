@@ -12,6 +12,7 @@ from uuid import uuid4
 from dcim.models import Device
 from django.apps import apps
 from django.contrib import messages
+from django.core import signing
 from django.core.exceptions import BadRequest, ObjectDoesNotExist, PermissionDenied, ValidationError
 from django.db import DatabaseError, transaction
 from django.http import Http404, HttpResponseBadRequest, JsonResponse
@@ -26,7 +27,7 @@ from utilities.exceptions import PermissionsViolation
 from utilities.forms import restrict_form_fields
 from utilities.views import ViewTab, register_model_view
 
-from .adapter_client import AdapterError, public_error_message
+from .adapter_client import AdapterError, PreflightStale, public_error_message
 from .apply_settlement import apply_stream_partition, promoted_stream_coverage
 from .deployment import DeploymentQuiesced
 from .filters import (
@@ -3003,6 +3004,67 @@ class PreparedApply:
     """The durable identity of one prepared manual Apply."""
 
     attempt_id: object
+    send_seq: int | None = None
+
+
+_APPLY_PREVIEW_SALT = "netbox_nso_plugin.apply_preview"
+_APPLY_PREVIEW_MAX_AGE = 900
+_FRESH_PREVIEW_MESSAGE = (
+    "Apply needs a fresh preview. The selection or executable inputs changed, or the preview expired."
+)
+
+
+def _confirmed_apply(request, management):
+    """Load and promote the exact user-bound preview without preparing receipts."""
+    from .apply_preflight import request_identity
+    from .apply_state import IntentChangedDuringPreparation
+    from .durable_capture import promote_snapshots
+    from .models import NSOApplyAttempt
+
+    token = request.POST.get("apply_preview", "")
+    if len(token) > 1024:
+        raise ApplyIntentChanged
+    try:
+        reference = signing.loads(token, salt=_APPLY_PREVIEW_SALT, max_age=_APPLY_PREVIEW_MAX_AGE)
+    except signing.BadSignature as exc:
+        raise ApplyIntentChanged from exc
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"attempt", "user", "management"}
+        or reference["user"] != request.user.pk
+        or reference["management"] != management.pk
+    ):
+        raise ApplyIntentChanged
+    attempt = NSOApplyAttempt.objects.filter(
+        pk=reference["attempt"], management=management, trigger_kind="manual"
+    ).first()
+    if attempt is None:
+        raise ApplyIntentChanged
+    try:
+        identity = request_identity(attempt)
+    except AdapterError as exc:
+        raise ApplyIntentChanged from exc
+    try:
+        promote_snapshots(attempt)
+    except IntentChangedDuringPreparation as exc:
+        raise ApplyIntentChanged from exc
+    except DatabaseError as exc:
+        raise ApplyPromotionFailed from exc
+    return PreparedApply(attempt.pk, attempt.send_seq), MappingProxyType(attempt.selected), identity
+
+
+def _fresh_apply_preview_response(request, management, *, is_ajax):
+    if is_ajax:
+        return JsonResponse(
+            {
+                "status": "preflight_stale",
+                "message": _FRESH_PREVIEW_MESSAGE,
+                "preview_url": reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[management.device_id]),
+            },
+            status=409,
+        )
+    messages.warning(request, _FRESH_PREVIEW_MESSAGE)
+    return redirect(_device_nso_tab_url(management.device_id))
 
 
 #: What a preparation step did, in the operator's words. A closed vocabulary: with the
@@ -3012,6 +3074,10 @@ _PREPARE_NOT_SETTLED = "did not settle successfully"
 _PREPARE_NOT_STARTED = "did not start before the preparation deadline expired"
 
 _APPLY_DEADLINE_MESSAGE = "Apply stopped before submission because the intent preparation deadline expired."
+_PREFLIGHT_STORE_MESSAGE = (
+    "Apply preview stopped because NetBox could not store the preflight result. "
+    "No stream was admitted. Try a fresh preview."
+)
 _APPLY_PROMOTION_MESSAGE = (
     "Apply stopped because NetBox could not mark the selected intent as deploying. "
     "No Apply job was enqueued and all local promotion marks were rolled back."
@@ -3119,6 +3185,7 @@ def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
 def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, int], dict[str, int]]:
     """Prepare switching snapshots and return selection and source revisions."""
     from . import delivery, drain
+    from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed
 
     applied_direct_keys = []
     selected = {}
@@ -3136,7 +3203,14 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, 
                 force=True,
                 deadline=deadline,
             )
-        except Exception as exc:  # noqa: BLE001 (a preparation may have reached the adapter)
+        except (
+            AdapterError,
+            DatabaseError,
+            drain.ClaimBusy,
+            delivery.SendDeadlineExceeded,
+            RendererAuditBudgetExceeded,
+            RendererAuditRepairFailed,
+        ) as exc:
             logger.warning("Apply switching preparation failed for device %s: %s", mgmt.device_id, exc)
             raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_FAILED) from exc
         if response is None:
@@ -3156,20 +3230,17 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, 
 def _prepare_apply(mgmt):
     """Pre-Apply bookkeeping for one device's single Apply.
 
-    Refresh every adapter intent mirror with store-only pushes first. Prepare
-    LACP and switchport snapshots after those pushes succeed. Then move owned
-    'accepted' or 'apply_failed' overlays →
-    'deploying' so they read as "applying" and settle to 'in_sync' on the next
-    reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
-    re-reported). ``.update()`` avoids firing the per-row push signal.
+    Refresh adapter intent mirrors with store-only pushes. Prepare LACP and
+    switchport snapshots after those pushes succeed. Capture the exact owner
+    snapshots without changing their status. Confirmation promotes admitted owners.
 
-    Returns the durable attempt identity and an immutable adapter-stream selector. The
-    caller restores the attempt's snapshots if no job is enqueued.
+    Return the durable attempt identity and an immutable adapter-stream selector.
     Raises :class:`ApplyRefused` when a preparation call escapes or the SNMP refresh is
     refused. Preparation completes before promotion, so an abort leaves no rows to roll back.
     Completed switching preparations remain selectable until another preparation replaces them.
     """
     from . import delivery, drain
+    from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed
     from .signals import stored_static_route_count
 
     prepare_deadline = drain._send_clock() + drain.SEND_DEADLINE.total_seconds()
@@ -3214,7 +3285,14 @@ def _prepare_apply(mgmt):
                     force=True,
                     deadline=deadline,
                 )
-            except Exception as exc:  # noqa: BLE001 (a partial selector must never be applied)
+            except (
+                AdapterError,
+                DatabaseError,
+                drain.ClaimBusy,
+                delivery.SendDeadlineExceeded,
+                RendererAuditBudgetExceeded,
+                RendererAuditRepairFailed,
+            ) as exc:
                 logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
                 raise ApplyPreparationRefused(entry.key, _PREPARE_FAILED) from exc
             if response is None:
@@ -3237,7 +3315,14 @@ def _prepare_apply(mgmt):
                 force=True,
                 deadline=deadline,
             )
-        except Exception as exc:  # noqa: BLE001 (a partial selector must never be applied)
+        except (
+            AdapterError,
+            DatabaseError,
+            drain.ClaimBusy,
+            delivery.SendDeadlineExceeded,
+            RendererAuditBudgetExceeded,
+            RendererAuditRepairFailed,
+        ) as exc:
             logger.warning("Apply push failed for device %s: %s", mgmt.device_id, exc)
             raise ApplyPreparationRefused("snmp", _PREPARE_FAILED) from exc
         if outcome == drain.REFUSED:
@@ -3264,9 +3349,9 @@ def _prepare_apply(mgmt):
             mgmt.device_id,
         )
     try:
-        from .apply_state import IntentChangedDuringPreparation, promote_current_intent
+        from .apply_state import IntentChangedDuringPreparation, capture_current_intent
 
-        attempt = promote_current_intent(
+        attempt = capture_current_intent(
             mgmt,
             registry,
             pushed,
@@ -3277,7 +3362,7 @@ def _prepare_apply(mgmt):
         )
     except IntentChangedDuringPreparation as exc:
         raise ApplyIntentChanged from exc
-    except Exception as exc:  # noqa: BLE001 (abort before the adapter can promote a partial local state)
+    except DatabaseError as exc:
         logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
         raise ApplyPromotionFailed from exc
     attempt.refresh_from_db(fields=["selected"])
@@ -3293,21 +3378,13 @@ def _rollback_prepare_apply(prepared, *, keep_streams=()) -> None:
     restore_attempt(prepared.attempt_id, keep_streams=keep_streams)
 
 
-def _record_apply_response(prepared, *, http_status, response) -> None:
+def _record_apply_response(prepared, *, http_status, response) -> bool:
     """Persist the exact replayable adapter answer for one local attempt."""
-    from .models import NSOApplyAttempt
+    from .apply_submission import record_response
 
     if not isinstance(prepared, PreparedApply):
         raise TypeError("Apply response recording requires a durable prepared attempt")
-    with transaction.atomic():
-        updated = NSOApplyAttempt.objects.filter(pk=prepared.attempt_id, response__isnull=True).update(
-            http_status=http_status,
-            response=response,
-        )
-        if updated != 1:
-            stored = NSOApplyAttempt.objects.get(pk=prepared.attempt_id)
-            if stored.http_status != http_status or stored.response != response:
-                raise RuntimeError("an Apply attempt received two different responses")
+    return record_response(prepared.attempt_id, http_status=http_status, response=response, send_seq=prepared.send_seq)
 
 
 def _stream_reason_message(prefix, reasons) -> str:
@@ -3477,13 +3554,24 @@ class NSODeviceActionView(AuthorizedView):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
     def _adapter_error(self, request, mgmt, exc, prepared, *, action, label, is_ajax):
-        """Roll back a definitely rejected Apply and surface the adapter's failure."""
+        """Restore only a rejected sole send and preserve uncertain admissions."""
         definitely_not_enqueued = exc.definitely_not_enqueued
-        # An ambiguous failure may still have enqueued the Apply, and the stored response is the
-        # attempt's immutable answer, so only a deterministic rejection may become it.
+        rejected = False
         if prepared is not None and definitely_not_enqueued:
-            _record_apply_response(prepared, http_status=exc.status_code, response=exc.rejection_response)
+            rejected = _record_apply_response(prepared, http_status=exc.status_code, response=exc.rejection_response)
+        if prepared is not None and (prepared.send_seq != 1 or definitely_not_enqueued and not rejected):
+            msg = (
+                "The adapter could not resolve this Apply retry. An earlier submission may already be admitted. "
+                "Its state is unchanged. Restore adapter access and retry; reconciliation will resolve the admission."
+            )
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": msg}, status=502)
+            messages.error(request, msg)
+            return redirect(_device_nso_tab_url(mgmt.device.pk))
+        if rejected:
             _rollback_prepare_apply(prepared)
+        if isinstance(exc, PreflightStale):
+            return _fresh_apply_preview_response(request, mgmt, is_ajax=is_ajax)
         if exc.code == "conflict":
             return self._incumbent_job(request, mgmt, exc, action=action, is_ajax=is_ajax)
         if action == "apply" and exc.code == "apply_unexecutable":
@@ -3533,16 +3621,15 @@ class NSODeviceActionView(AuthorizedView):
             "apply": client.trigger_apply,
         }[action]
 
-        # One Apply commits everything: the adapter worker applies the intent-stored
-        # scopes (attrs/IP/SNMP/routing/L2), and here we force-commit the LACP +
-        # switchport snapshots, which are owned in NetBox rather than mirrored in the
-        # adapter. Accept itself only marks rows owned (no immediate device write).
+        # Confirmation uses the exact durable selector from the preview.
         prepared = None
         selected = None
         try:
             if action == "apply":
-                prepared, selected = _prepare_apply(mgmt)
-        except ApplyRefused as exc:
+                prepared, selected, identity = _confirmed_apply(request, mgmt)
+        except ApplyIntentChanged:
+            return _fresh_apply_preview_response(request, mgmt, is_ajax=is_ajax)
+        except (ApplyRefused, DeploymentQuiesced) as exc:
             # CodeQL py/stack-trace-exposure: rebuild the wording from the refusal type and
             # its registry-keyed fields, never from the exception object.
             msg = _apply_refusal_message(exc, mgmt)
@@ -3554,7 +3641,7 @@ class NSODeviceActionView(AuthorizedView):
 
         try:
             result = (
-                action_fn(mgmt.adapter_device_id, prepared.attempt_id, selected)
+                action_fn(mgmt.adapter_device_id, prepared.attempt_id, selected, identity)
                 if action == "apply"
                 else action_fn(mgmt.adapter_device_id)
             )
@@ -3569,8 +3656,7 @@ class NSODeviceActionView(AuthorizedView):
             else:
                 messages.success(request, f"{label} triggered.")
         except AdapterError as exc:
-            # A typed HTTP rejection proves no Apply was accepted. A transport failure or
-            # unreadable success can happen after enqueue, so reconciliation owns that outcome.
+            # Reconciliation owns any admission that this submission cannot rule out.
             return self._adapter_error(
                 request,
                 mgmt,
@@ -6502,13 +6588,92 @@ def _apply_preview_owner_changes(device_pk):
 
 
 class NSOApplyPreviewView(AuthorizedView):
-    """JSON preview of what 'Apply Intent' would push to the device.
+    """Prepare manual admission by POST; read the stored executable head by GET."""
 
-    Lists the pending-apply changes (NetBox intent that differs from the device) so the
-    operator can confirm before pushing. Drives the apply-confirmation modal.
-    """
+    policy = {
+        "get": EndpointPolicy(DeviceRead("device_pk"), "read"),
+        "post": EndpointPolicy(Management("change", "device_pk", by="device", device_view=True), "adapter_action"),
+    }
 
-    policy = EndpointPolicy(DeviceRead("device_pk"), "read")
+    def post(self, request, device_pk):
+        """Prepare receipts once and return the adapter's complete admission verdict."""
+        from . import adapter_client as client
+        from .apply_preflight import preflight_message, stream_verdicts
+        from .apply_state import IntentChangedDuringPreparation
+        from .durable_capture import record_preflight
+        from .models import NSOApplyAttempt
+        from .refusal_display import attributed_projection
+
+        management = self.target.management
+        if management.adapter_device_id is None:
+            return JsonResponse(
+                {"status": "error", "message": "Device is not yet onboarded to the adapter."}, status=409
+            )
+        try:
+            prepared, selected = _prepare_apply(management)
+            preflight = client.apply_preflight(management.adapter_device_id, selected)
+            attempt = NSOApplyAttempt.objects.get(pk=prepared.attempt_id)
+            try:
+                record_preflight(attempt, preflight)
+            except DatabaseError as exc:
+                logger.warning("Apply preflight store failed for device %s: %s", management.device_id, exc)
+                return JsonResponse({"status": "error", "message": _PREFLIGHT_STORE_MESSAGE}, status=409)
+        except (ApplyRefused, DeploymentQuiesced) as exc:
+            message = _apply_refusal_message(exc, management)
+            return JsonResponse({"status": "error", "message": message}, status=409)
+        except IntentChangedDuringPreparation:
+            return _fresh_apply_preview_response(request, management, is_ajax=True)
+        except client.AdapterError as exc:
+            if exc.code == "conflict":
+                return NSODeviceActionView()._incumbent_job(request, management, exc, action="apply", is_ajax=True)
+            return JsonResponse({"status": "error", "message": public_error_message(exc)}, status=502)
+        can_apply = preflight["status"] == "ready"
+        reference = (
+            signing.dumps(
+                {"attempt": str(attempt.pk), "user": request.user.pk, "management": management.pk},
+                salt=_APPLY_PREVIEW_SALT,
+            )
+            if can_apply
+            else None
+        )
+        changes = _apply_preview_interface_changes(device_pk)
+        routing_changes = _apply_preview_owner_changes(device_pk)
+        projection = attributed_projection(preflight["refusals"]) if preflight["refusals"] else None
+        streams = stream_verdicts(preflight)
+        total = len(changes) + len(routing_changes)
+        response = JsonResponse(
+            {
+                "auto_apply": management.auto_apply,
+                "changes": changes,
+                "routing_changes": routing_changes,
+                "routing": len(routing_changes),
+                "total": total,
+                "nothing_pending": total == 0
+                and can_apply
+                and not any(preflight["diffs"].values())
+                and all(verdict["status"] != "blocked" for verdict in streams.values()),
+                "outformat": "native",
+                "device_diffs": preflight["diffs"] if can_apply else {"native": "", "cli": ""},
+                "device_diff": {"device_intent": preflight["diffs"]["native"]}
+                if can_apply and preflight["diffs"]["native"]
+                else {},
+                "diff_available": can_apply,
+                "preview_status": preflight["status"],
+                "streams": streams,
+                "baseline_refused": preflight["baseline_refused"],
+                "cross_stream": preflight["cross_stream"],
+                "context_disturbed": preflight["context_disturbed"],
+                "admitted_selection": preflight["admitted_selection"],
+                "skips": preflight["skips"],
+                "refusal": projection,
+                "refusal_text": projection["text"] if projection else "",
+                "can_apply": can_apply,
+                "apply_preview": reference,
+                "message": preflight_message(preflight),
+            }
+        )
+        response["Cache-Control"] = "no-store"
+        return response
 
     def get(self, request, device_pk):
         """Return {auto_apply, changes:[{interface, attribute, device, netbox}], routing}."""
@@ -6559,9 +6724,6 @@ class NSOApplyPreviewView(AuthorizedView):
                     else "preview_unavailable"
                 )
                 logger.debug("apply-diff unavailable for device %s", device_pk)
-            except Exception as exc:  # noqa: BLE001
-                diff_error = "preview_unavailable"
-                logger.debug("apply-diff unavailable for device %s (%s)", device_pk, type(exc).__name__)
 
         # #107: the Apply button auto-proceeds (no confirm modal) only when NOTHING would
         # be committed. The itemised total alone cannot prove that: accepting an imported

@@ -7,9 +7,15 @@ from django.db.migrations.executor import MigrationExecutor
 
 from . import adapter_client
 from .deployment_probe import _require, authority
-from .models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution, NSODeviceManagement
+from .models import (
+    UNSENT_MANUAL_PREVIEW,
+    NSOAcceptedSelection,
+    NSOApplyAttempt,
+    NSOApplyExecution,
+    NSODeviceManagement,
+)
 
-PLUGIN_MIGRATION_HEAD = "0041_settle_resume_pending"
+PLUGIN_MIGRATION_HEAD = "0043_attempt_prune_index"
 
 
 def check_contracts():
@@ -92,7 +98,9 @@ def check_active_streams():
     from .settlement_resolution import released_head_evidence, unreleased_generations
 
     _require(
-        not NSOApplyAttempt.objects.filter(lifecycle="open", trigger_kind="manual").exists()
+        not NSOApplyAttempt.objects.filter(lifecycle="open", trigger_kind="manual")
+        .exclude(UNSENT_MANUAL_PREVIEW)
+        .exists()
         and not NSOApplyExecution.objects.filter(consumption_state__in=("unconsumed", "unresolved")).exists(),
         "Unanswered or unconsumed attempts remain",
     )

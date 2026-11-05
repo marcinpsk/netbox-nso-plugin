@@ -45,6 +45,8 @@ class TestApplyAttemptSchema(SimpleTestCase):
                 "adapter_device_id",
                 "scope_revisions",
                 "selected",
+                "preflight",
+                "send_seq",
                 "http_status",
                 "response",
                 "trigger_kind",

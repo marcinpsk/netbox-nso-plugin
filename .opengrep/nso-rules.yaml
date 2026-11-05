@@ -17,6 +17,20 @@ rules:
     paths:
       include: ["netbox_nso_plugin/apply_settlement.py"]
 
+  - id: nso-settlement-record-response-bypass
+    languages: [python]
+    severity: ERROR
+    message: Record a settlement replay answer through _record_replayed_response so a contradiction stalls the feed.
+    patterns:
+      - pattern-either:
+          - pattern: record_response(...)
+          - pattern: $M.record_response(...)
+      - pattern-not-inside: |
+          def _record_replayed_response(...):
+              ...
+    paths:
+      include: ["netbox_nso_plugin/apply_settlement.py"]
+
   - id: nso-unreleased-generation-listing-evidence-check
     languages: [python]
     severity: ERROR

@@ -14,15 +14,20 @@ import socket
 import threading
 import time
 import weakref
+from collections.abc import Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import requests
 from django.conf import settings
 
 from .settlement_schemas import canonical_uuid, within_wire_bounds
 from .vault_refs import is_secret_fingerprint
+
+if TYPE_CHECKING:
+    from .apply_preflight import ApplyPreflight
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +343,10 @@ class AdapterError(Exception):
         if isinstance(self.response, dict):
             return self.response
         return {"error": {"code": self.code, "message": public_error_message(self)}}
+
+
+class PreflightStale(AdapterError):
+    """Manual Apply requires a fresh preview of its executable inputs."""
 
 
 class InvalidJobEvidence(AdapterError):
@@ -678,7 +687,10 @@ def _request_response(method, path, **kwargs):
         detail = err.get("detail")
         # ``or`` not ``.get(key, default)``: the adapter emits nulls, and a present null
         # would otherwise beat the fallback and leave the operator an empty message.
-        raise AdapterError(
+        error_class = (
+            PreflightStale if resp.status_code == 409 and err.get("code") == "preflight_stale" else AdapterError
+        )
+        raise error_class(
             err.get("message") or resp.text,
             code=str(err.get("code") or resp.status_code),
             detail=detail if isinstance(detail, dict) else None,
@@ -1940,7 +1952,17 @@ def preflight_route_policy(
         return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 
-def trigger_apply(adapter_device_id, apply_attempt_id, selected):
+def apply_preflight(adapter_device_id: int, selected: Mapping[str, int]) -> "ApplyPreflight":
+    """Validate the admission evidence for an exact stored selection."""
+    from .apply_preflight import validate_preflight
+
+    body = _request(
+        "POST", f"/api/v1/devices/{adapter_device_id}/actions/apply-preflight", json={"selected": dict(selected)}
+    )
+    return validate_preflight(body, dict(selected))
+
+
+def trigger_apply(adapter_device_id, apply_attempt_id, selected, preflight_identity: str):
     """Promote the exact stored intent receipts named by a frozen selector.
 
     Raise AdapterError when a device job is already queued or running.
@@ -1948,7 +1970,11 @@ def trigger_apply(adapter_device_id, apply_attempt_id, selected):
     body = _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/actions/apply",
-        json={"apply_attempt_id": str(apply_attempt_id), "selected": dict(selected)},
+        json={
+            "apply_attempt_id": str(apply_attempt_id),
+            "selected": dict(selected),
+            "preflight_identity": preflight_identity,
+        },
     )
     # The decoder depth limit follows the C stack size, so bound the body explicitly.
     if body is not None and not within_wire_bounds(body):

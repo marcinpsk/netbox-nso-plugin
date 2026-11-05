@@ -17,6 +17,8 @@ empty ``.content`` together with a non-empty ``.json()``, or a 503 body whose
 body makes ``.json()`` raise a real ``JSONDecodeError``, exactly as in prod.
 """
 
+import hashlib as _hashlib
+import itertools as _itertools
 import json as _json
 from unittest.mock import MagicMock, patch
 
@@ -160,3 +162,40 @@ def make_generation_envelope(projection, *, device_id=7, **values):
         "apply_attempt_id": projection.get("apply_attempt_id"),
     }
     return make_evidence_envelope(projection, identity=identity, **values)
+
+
+_PREFLIGHT_COUNTER = _itertools.count(1)
+
+
+def make_apply_preflight(selected, *, blocked=None, status="ready"):
+    blocked = blocked or {}
+    result = {
+        "status": status,
+        "streams": {
+            stream: blocked.get(stream, {"status": "admitted" if status == "ready" else "not_evaluated"})
+            for stream in selected
+        },
+        "baseline_refused": [],
+        "cross_stream": [],
+        "context_disturbed": [],
+        "admitted_selection": {key: value for key, value in selected.items() if key not in blocked}
+        if status == "ready"
+        else {},
+        "skips": {},
+        "diffs": {"native": "+ placeholder configuration", "cli": "+ device-intent"},
+        "attempts": [{"selection": selected, "dropped": list(blocked)}],
+        "refusals": [],
+        "error": None,
+    }
+    if status == "ready":
+        # Each ready verdict gets its own identity, so a test can tell which preflight a request carries.
+        issued = f"{next(_PREFLIGHT_COUNTER)}:{_json.dumps(selected, sort_keys=True)}"
+        result["preflight_identity"] = _hashlib.sha256(issued.encode()).hexdigest()
+        if blocked:
+            result["attempts"].append({"selection": result["admitted_selection"], "dropped": []})
+    return result
+
+
+def make_stored_preflight(selected):
+    """Keep exact admission evidence for a durable manual replay fixture."""
+    return {"selected": dict(selected), "result": make_apply_preflight(selected)}

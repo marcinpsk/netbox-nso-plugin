@@ -503,24 +503,26 @@ def _validate_capture(attempt, management, incarnation):
 
 
 def _finish_rejected(attempt, *, status, response):
+    from .apply_submission import record_response
     from .durable_capture import restore_attempt
-    from .views import PreparedApply, _record_apply_response
 
     with transaction.atomic():
-        _record_apply_response(PreparedApply(attempt.pk), http_status=status, response=response)
+        if not record_response(attempt.pk, http_status=status, response=response, send_seq=attempt.send_seq):
+            return False
         restore_attempt(attempt.pk)
         NSOApplyAttempt.objects.filter(pk=attempt.pk).update(lifecycle="terminal", completed_at=timezone.now())
+    return True
 
 
 def start_probe(attempt_id, device_id):
     """Capture a prepared BGP selection and register its permit before remote admission."""
     from . import delivery, drain
     from .apply_settlement import apply_stream_partition, promoted_stream_coverage
-    from .apply_state import promote_current_intent
+    from .apply_state import capture_current_intent
+    from .apply_submission import claim_send, record_response
     from .durable_capture import _validate_snapshot_membership, _wire, promote_snapshots
     from .models import NSOAcceptedSelection, NSODeviceManagement, NSOIntentOutboxState
     from .signals import suppress_intent_push
-    from .views import PreparedApply, _record_apply_response
 
     attempt_id = UUID(str(attempt_id))
     with maintenance_gate(verification_attempt=attempt_id), deployment.gate_bypass(), suppress_intent_push():
@@ -565,7 +567,7 @@ def start_probe(attempt_id, device_id):
             pushed = drain.SuccessfulPush(
                 selection.source_push_seq, state.last_success_identity, selection.plugin_revision
             )
-            attempt = promote_current_intent(
+            attempt = capture_current_intent(
                 management,
                 {"bgp": delivery.delivery_keys()["bgp"]},
                 {"bgp": pushed},
@@ -575,7 +577,19 @@ def start_probe(attempt_id, device_id):
                 static_route_stored=False,
             )
         _validate_capture(attempt, management, incarnation)
-        if attempt.adapter_apply_attempt_id is None:
+        from .apply_preflight import request_identity
+        from .durable_capture import record_preflight
+
+        if attempt.preflight is None:
+            _require(attempt.adapter_apply_attempt_id is None, "Submitted probe has no preflight identity")
+            preflight = adapter_client.apply_preflight(management.adapter_device_id, attempt.selected)
+            _require(
+                preflight["status"] == "ready" and preflight["admitted_selection"] == attempt.selected,
+                "Probe preflight did not admit its exact BGP selection",
+            )
+            record_preflight(attempt, preflight)
+        first_admission = attempt.adapter_apply_attempt_id is None
+        if first_admission:
             _require(attempt.response is None and attempt.http_status is None, "Unsent probe has an admission response")
             promote_snapshots(attempt)
         _require(attempt.adapter_apply_attempt_id == attempt.pk, "Probe promotion identity changed")
@@ -584,7 +598,11 @@ def start_probe(attempt_id, device_id):
             control.save(update_fields=("verification_attempt",))
         try:
             if attempt.response is None:
-                response = adapter_client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
+                if not first_admission:
+                    _require(claim_send(attempt), "Probe admission was rejected; select a fresh probe UUID")
+                response = adapter_client.trigger_apply(
+                    management.adapter_device_id, attempt.pk, attempt.selected, request_identity(attempt)
+                )
                 _require(
                     isinstance(response, dict) and response.get("device_id") == management.adapter_device_id,
                     "Probe admission device changed",
@@ -615,9 +633,11 @@ def start_probe(attempt_id, device_id):
                     and response.get("job_id") == response["generations"][0]["job_id"],
                     "Probe promoted generation coverage changed",
                 )
-                _record_apply_response(PreparedApply(attempt.pk), http_status=202, response=response)
-        except Exception as exc:
-            if isinstance(exc, adapter_client.AdapterError) and exc.definitely_not_enqueued:
-                _finish_rejected(attempt, status=exc.status_code, response=exc.rejection_response)
+                record_response(attempt.pk, http_status=202, response=response, send_seq=attempt.send_seq)
+        except adapter_client.AdapterError as exc:
+            if exc.definitely_not_enqueued and not _finish_rejected(
+                attempt, status=exc.status_code, response=exc.rejection_response
+            ):
+                raise ProbePending("Probe admission is uncertain; restore adapter access and retry") from exc
             raise
     return attempt_id

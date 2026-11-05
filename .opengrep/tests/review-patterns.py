@@ -3493,6 +3493,23 @@ def carrier_generation_bypass(bound):
     return rows, filtered, collected, terminal
 
 
+def settlement_replay_records_directly(attempt, submission):
+    # ruleid: nso-settlement-record-response-bypass
+    record_response(attempt.pk, http_status=202, response={}, send_seq=attempt.send_seq)
+    # ruleid: nso-settlement-record-response-bypass
+    submission.record_response(attempt.pk, http_status=200, response={})
+
+
+def _record_replayed_response(attempt, *, http_status, response):
+    # ok: nso-settlement-record-response-bypass
+    return record_response(attempt.pk, http_status=http_status, response=response, send_seq=attempt.send_seq)
+
+
+def settlement_replay_records_through_helper(attempt):
+    # ok: nso-settlement-record-response-bypass
+    return _record_replayed_response(attempt, http_status=202, response={})
+
+
 def _carrier_generations(bound):
     # ok: nso-carrier-generations-bypass-helper
     return [generation for attempt in bound["attempts"] for generation in attempt["generations"]]

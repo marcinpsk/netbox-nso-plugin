@@ -369,7 +369,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
     def test_static_route_repair_demotes_a_deploying_row_the_push_filter_omits(self):
         """Apply deploys every accepted row; the repair must be able to demote every one.
 
-        ``promote_current_intent`` moves accepted/apply_failed rows to ``deploying`` with no
+        ``promote_snapshots`` moves admitted accepted/apply_failed rows to ``deploying`` with no
         next-hop condition, so a repair that only considers the rows the renderer pushes
         strands an interface-next-hop row in ``deploying`` forever.
         """

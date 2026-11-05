@@ -14,7 +14,15 @@ from django.utils import timezone
 from . import adapter_client, refusal_contract
 from .deployment import guarded
 from .durable_capture import mapping_epoch
-from .models import NSOAcceptedSelection, NSOApplyAttempt, NSODeviceManagement, NSOIntentOutboxState
+from .models import (
+    APPLY_ATTEMPT_PRUNABLE,
+    APPLY_ATTEMPT_RETENTION_AT,
+    NSOAcceptedSelection,
+    NSOApplyAttempt,
+    NSODeviceManagement,
+    NSOIntentOutboxState,
+    NSOSettlementIssue,
+)
 from .refusal_registry import OVERLAYS
 
 logger = logging.getLogger(__name__)
@@ -75,6 +83,12 @@ def _acknowledged_history(execution, management):
 
 
 def _referenced(attempt):
+    if NSOSettlementIssue.objects.filter(
+        management_id=attempt.management_id,
+        state="open",
+        proposal__attempt_locks__contains=[str(attempt.pk)],
+    ).exists():
+        return True
     if attempt.referenced_prior_snapshots.exclude(attempt=attempt).exists():
         return True
     if attempt.referenced_expected_snapshots.exclude(attempt=attempt).exists():
@@ -85,6 +99,8 @@ def _referenced(attempt):
 
 
 def _eligible(attempt, management):
+    if attempt.trigger_kind == "manual" and attempt.adapter_apply_attempt_id is None:
+        return not _referenced(attempt) and not attempt.executions.exists()
     if attempt.trigger_kind == "manual" and (attempt.response is None or attempt.http_status is None):
         return False
     if _referenced(attempt):
@@ -194,13 +210,19 @@ def _historical_certificate_required(attempt, management, remote):
     )
 
 
+def _expired_attempts(cutoff):
+    return NSOApplyAttempt.objects.annotate(retention_at=APPLY_ATTEMPT_RETENTION_AT).filter(
+        APPLY_ATTEMPT_PRUNABLE, retention_at__lt=cutoff
+    )
+
+
 @guarded("Apply ledger retention")
 def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=None):
     """Examine at most one batch and retain all unresolved or referenced records."""
     if type(batch_size) is not int or not 1 <= batch_size <= 10000:
         raise ValueError("batch size must be between 1 and 10000")
     cutoff = timezone.now() - timedelta(days=RETENTION_DAYS)
-    query = NSOApplyAttempt.objects.filter(lifecycle="terminal", completed_at__lt=cutoff)
+    query = _expired_attempts(cutoff)
     if cursor is not None:
         try:
             stamp, attempt_id = cursor.split("|", 1)
@@ -209,12 +231,12 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
             raise ValueError("The retention cursor must be a next_cursor value from a previous run") from exc
         if timezone.is_naive(stamp):
             raise ValueError("The retention cursor must have a timezone")
-        query = query.filter(Q(completed_at__gt=stamp) | Q(completed_at=stamp, pk__gt=attempt_id))
+        query = query.filter(Q(retention_at__gt=stamp) | Q(retention_at=stamp, pk__gt=attempt_id))
     candidates = list(
-        query.order_by("completed_at", "pk").values_list(
+        query.order_by("retention_at", "pk").values_list(
             "pk",
             "management_id",
-            "completed_at",
+            "retention_at",
         )[:batch_size]
     )
     eligible = deleted = 0
@@ -236,15 +258,7 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
             management = NSODeviceManagement.objects.select_for_update().get(pk=management_id)
             if management.adapter_device_id != remote.adapter_device_id:
                 continue
-            attempt = (
-                NSOApplyAttempt.objects.select_for_update()
-                .filter(
-                    pk=attempt_id,
-                    lifecycle="terminal",
-                    completed_at__lt=cutoff,
-                )
-                .first()
-            )
+            attempt = _expired_attempts(cutoff).select_for_update().filter(pk=attempt_id).first()
             if attempt is None or not _eligible(attempt, management):
                 continue
             if _historical_certificate_required(attempt, management, remote):

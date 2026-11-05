@@ -95,7 +95,10 @@ PRODUCERS = {
 }
 
 CONTINUATIONS = {
+    ("apply_preflight.py", "ApplyPreflight"): (1, "Wire verdict declarations do not acquire overlay ownership."),
+    ("apply_preflight.py", "StreamVerdict"): (1, "Wire verdict declarations do not acquire overlay ownership."),
     ("durable_capture.py", "_snapshot"): (3, "Snapshot values do not acquire overlay ownership."),
+    ("durable_capture.py", "record_preflight"): (2, "Only repends blocked rows that already have ownership."),
     ("forms.py", "NSOInterfaceMtuStateForm.save"): (2, "Repends owned rows; unowned edits remain changed."),
     ("intent_drift.py", "_backfill_static_route_generations"): (2, "Repends deploying static routes only."),
     ("lifecycle_fence.py", "finish_locked_owners"): (

@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
+from ._manual_capture_case import post_apply
 from ._outbox_case import mirror_update
 from ._settlement_case import _make_device
 
@@ -147,7 +148,6 @@ class TestApplyRefusalSealing(TestCase):
 
     def test_a_refused_snmp_refresh_answers_the_rebuilt_wording(self):
         """End to end: POST to view to 409 never exposes the persisted exception text."""
-        from django.urls import reverse
 
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.views import _snmp_refusal_message
@@ -160,8 +160,7 @@ class TestApplyRefusalSealing(TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "apply"])
-        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        response = post_apply(self.client, mgmt, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
         assert response.status_code == 409
         mgmt.refresh_from_db()
@@ -173,16 +172,13 @@ class TestApplyRefusalSealing(TestCase):
         """End to end: the deadline refusal serves its fixed wording with a 409."""
         from itertools import chain, repeat
 
-        from django.urls import reverse
-
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.views import _APPLY_DEADLINE_MESSAGE
 
         mgmt = self._mgmt("seal-deadline", 98)
         spent = drain.SEND_DEADLINE.total_seconds() + 1
         with patch("netbox_nso_plugin.drain._send_clock", side_effect=chain([0, spent], repeat(spent))):
-            url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "apply"])
-            response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            response = post_apply(self.client, mgmt, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
         assert response.status_code == 409
         assert response.json()["message"] == _APPLY_DEADLINE_MESSAGE

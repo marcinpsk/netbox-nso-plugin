@@ -22,6 +22,7 @@ from netbox_nso_plugin.reconcile import run_device_reconcile
 
 from ._adapter_http import _REAL_SESSION, make_response
 from ._authority_case import concurrent_writer
+from ._manual_capture_case import post_apply
 from ._outbox_case import make_managed, reset_renderer_audit_rotation, without_commit_drain
 from ._settlement_case import _evidence_generation
 from ._settlement_wire import deployment_wire, generation_wire
@@ -232,10 +233,7 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
     def apply_device(self):
         request_start = len(self.adapter.requests)
         apply_start = len(self.adapter.apply_requests)
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["status"], "ok", response.json())
         self.assertEqual(len(self.adapter.apply_requests), apply_start + 1)

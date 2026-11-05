@@ -31,6 +31,7 @@ from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_response, make_session
 from ._authority_case import concurrent_writer
+from ._manual_capture_case import post_apply
 from ._outbox_case import (
     ReceiptAdapter,
     content_bulk_update,
@@ -8381,22 +8382,16 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
             username="applysnmpadmin", password=TEST_PASSWORD, email="applysnmp@test.example"
         )
         self.client.force_login(self.user)
-        self.adapter = ReceiptAdapter(
-            respond=lambda body: (
-                ReceiptAdapter._default_response(body) if "source_revision" in body else {"job_id": 7712, "count": 0}
-            )
-        )
+        from .test_apply_selector import _ApplyContractAdapter, _no_op
+
+        self.adapter = _ApplyContractAdapter(lambda selected: (200, {**_no_op(selected), "device_id": 7790}))
         self.device, self.mgmt = make_managed("apsnmp", 7790)
 
     def _apply(self):
-        from django.contrib.messages import get_messages
-
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "apply"])
         config, session = self.adapter.patches()
         with config, session:
-            response = self.client.post(url)
-        applied = [request for request in self.adapter.requests if "/actions/apply" in request["url"]]
-        return applied, [str(message) for message in get_messages(response.wsgi_request)]
+            response = post_apply(self.client, self.mgmt, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        return self.adapter.apply_requests, [response.json()["message"]]
 
     def _own_a_community(self):
         import copy
@@ -8531,14 +8526,13 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
                 )
             connection.settings_dict["OPTIONS"] = request_options
             connection.close()
-            url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "apply"])
             config, session = self.adapter.patches()
             with (
                 config,
                 session,
                 self.assertRaises(OperationalError) as raised,
             ):
-                response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+                response = post_apply(self.client, self.mgmt, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
                 self.fail(f"Apply returned HTTP {response.status_code} instead of propagating the database fault")
         finally:
             connection.close()
@@ -8868,6 +8862,10 @@ class _ApplyBoundaryAdapter(ReceiptAdapter):
         self.apply_requests: list[dict] = []
 
     def _handle(self, method, url, **kwargs):
+        if method == "POST" and url.endswith("/actions/apply-preflight"):
+            from ._adapter_http import make_apply_preflight
+
+            return make_response(200, make_apply_preflight(kwargs["json"]["selected"]))
         if method == "GET" and url.endswith(("/jobs", "/generations")):
             if url.endswith("/generations"):
                 rows = [generation_wire(row, int(url.split("/devices/")[1].split("/")[0])) for row in self.generations]
@@ -8913,10 +8911,9 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
             )
 
     def _apply(self, adapter):
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "apply"])
         config, session = adapter.patches()
         with config, session:
-            return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            return post_apply(self.client, self.mgmt, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
     def test_an_ambiguous_apply_failure_leaves_the_attempt_recoverable(self):
         unavailable = {"error": {"code": "nso_unreachable", "message": "NSO is not reachable", "detail": {}}}

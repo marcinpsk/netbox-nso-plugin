@@ -82,6 +82,11 @@ class ShardingContractTests(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertEqual(workflow[True]["pull_request"]["branches"], ["main", "develop"])
 
+    def test_the_shard_matrix_runs_each_group_of_the_shard_count_once(self):
+        workflow = yaml.safe_load((Path(__file__).parents[1] / "workflows" / "test.yaml").read_text(encoding="utf-8"))
+        shards = int(workflow["env"]["CI_SHARDS"])
+        self.assertEqual(workflow["jobs"]["test-netbox"]["strategy"]["matrix"]["shard"], list(range(1, shards + 1)))
+
     def test_complete_shards_pass_and_incomplete_or_duplicate_runs_fail(self):
         helper = Path(__file__).with_name("sharding.py")
         with tempfile.TemporaryDirectory() as temporary:

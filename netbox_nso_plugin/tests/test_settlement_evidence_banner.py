@@ -13,7 +13,7 @@ from netbox_nso_plugin.durable_capture import mapping_epoch
 from netbox_nso_plugin.refusal_display import settlement_stall_projection
 from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-from ._adapter_http import make_generation_listing, make_response
+from ._adapter_http import make_generation_listing, make_response, make_stored_preflight
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import mirror_update
 from ._settlement_wire import deployment_wire, generation_wire, job_wire
@@ -99,6 +99,14 @@ def _required_success_fields(root, components):
     for component in components:
         visit_schema({"$ref": f"#/components/schemas/{component}"})
     return {(schemas[name]["title"], field) for name in reachable for field in schemas[name].get("required", ())}
+
+
+_RESPONSE_COMPONENTS = (
+    "JobEvidenceOut",
+    "DeviceGenerationEvidenceOut",
+    "DeviceDeploymentEvidenceOut",
+    "ActionApplyOut",
+)
 
 
 class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
@@ -348,6 +356,7 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
             management=self.management,
             adapter_device_id=self.management.adapter_device_id,
             selected={"bgp": 7},
+            preflight=make_stored_preflight({"bgp": 7}),
         )
         attempt.adapter_apply_attempt_id = attempt.pk
         attempt.save(update_fields=("adapter_apply_attempt_id",))
@@ -388,6 +397,54 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 self.assertIsNone(self.management.settle_cursor_seq)
                 attempt.refresh_from_db()
                 self.assertIsNone(attempt.response)
+
+    def test_a_replay_answer_that_contradicts_the_stored_answer_stalls_with_a_banner(self):
+        self.prepare()
+        stored = (self.attempt.http_status, copy.deepcopy(self.attempt.response))
+        link = self.attempt.response["generations"][0]
+        # The stored admission link matches the listing, so only the replayed answer contradicts it.
+        self.generation_page = [
+            make_generation_listing(
+                **{key: link[key] for key in ("generation_id", "seq", "job_id", "mode", "digest")},
+                stream_revisions=link["stream_revisions"],
+                source_push_seq=link["source_push_seq"],
+                status="pending",
+                carrier_job_id=link["job_id"],
+                carrier_job_status="queued",
+                settlement_cohort=None,
+            )
+        ]
+        self.deployment_body = _payload(self.management.adapter_device_id, [])
+        self.deployment_body["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
+        self.serve_feed([])
+        original = self.adapter._handle
+        no_op = {
+            "device_id": self.management.adapter_device_id,
+            "outcome": "no_op",
+            "job_id": None,
+            "selected": self.attempt.selected,
+            "skipped": dict.fromkeys(self.attempt.selected, "already_applied"),
+            "skipped_detail": None,
+            "generations": [],
+        }
+        calls = []
+
+        def handle(method, url, **kwargs):
+            if method == "POST" and url.endswith("/actions/apply"):
+                calls.append(kwargs["json"])
+                return make_response(200, no_op)
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        self.assert_visible_stall()
+        self.assertEqual(len(calls), 1)
+        self.assert_metadata_banner("invalid settlement evidence")
+        self.assertEqual(
+            (self.management.settle_evidence_error["class"], self.management.settle_evidence_error["code"]),
+            ("evidence_invariant", "apply_replay_answer_conflict"),
+        )
+        self.attempt.refresh_from_db()
+        self.assertEqual((self.attempt.http_status, self.attempt.response), stored)
 
     def test_malformed_response_bodies_show_a_banner(self):
         feed, generations, deployment = self.settlement_responses()
@@ -480,7 +537,8 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 self.assert_visible_stall()
                 self.assertEqual(self.management.settle_evidence_error.get("job_id"), job_id)
 
-    def test_required_response_fields_always_stall_with_a_visible_banner(self):
+    def assert_required_fields_stall_with_a_visible_banner(self, component):
+        """Remove or retype each required field that *component* serves and require a visible stall."""
         from netbox_nso_plugin.settlement_schemas import VALIDATORS
 
         self.prepare()
@@ -511,54 +569,65 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         )
         skipped = next(iter(base[3]["skipped"]))
         base[3]["skipped_detail"] = {skipped: {"generation_id": 80, "seq": 3, "status": "failed"}}
-        components = ("JobEvidenceOut", "DeviceGenerationEvidenceOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
+        index = _RESPONSE_COMPONENTS.index(component)
         visited = set()
-        for index, component in enumerate(components):
-            validator = VALIDATORS[component]
-            validator.validate(base[index])
-            count = 0
-            for path, field_schema in _required_paths(validator.schema, validator.schema, base[index], visited=visited):
-                for label, replacement in _structural_mutations(validator.schema, field_schema):
-                    with self.subTest(component=component, path=path, mutation=label):
-                        bodies = copy.deepcopy(base)
-                        parent = bodies[index]
-                        for key in path[:-1]:
-                            parent = parent[key]
-                        if label == "remove":
-                            del parent[path[-1]]
-                        else:
-                            parent[path[-1]] = replacement
-                        self.assertFalse(validator.is_valid(bodies[index]))
-                        mirror_update(self.management, settle_evidence_error={})
-                        if component == "ActionApplyOut":
-                            unknown = _payload(self.management.adapter_device_id, [])
-                            unknown["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
-                            self.serve_settlement_responses([], [], unknown)
-                            evidence_handler = self.adapter._handle
+        validator = VALIDATORS[component]
+        validator.validate(base[index])
+        count = 0
+        for path, field_schema in _required_paths(validator.schema, validator.schema, base[index], visited=visited):
+            for label, replacement in _structural_mutations(validator.schema, field_schema):
+                with self.subTest(component=component, path=path, mutation=label):
+                    bodies = copy.deepcopy(base)
+                    parent = bodies[index]
+                    for key in path[:-1]:
+                        parent = parent[key]
+                    if label == "remove":
+                        del parent[path[-1]]
+                    else:
+                        parent[path[-1]] = replacement
+                    self.assertFalse(validator.is_valid(bodies[index]))
+                    mirror_update(self.management, settle_evidence_error={})
+                    if component == "ActionApplyOut":
+                        unknown = _payload(self.management.adapter_device_id, [])
+                        unknown["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
+                        self.serve_settlement_responses([], [], unknown)
+                        evidence_handler = self.adapter._handle
 
-                            def replay(method, url, **kwargs):
-                                if method == "POST" and url.endswith("/actions/apply"):
-                                    return make_response(200, bodies[3])
-                                return evidence_handler(method, url, **kwargs)
+                        def replay(method, url, **kwargs):
+                            if method == "POST" and url.endswith("/actions/apply"):
+                                return make_response(200, bodies[3])
+                            return evidence_handler(method, url, **kwargs)
 
-                            self.adapter._handle = replay
-                        else:
-                            self.serve_settlement_responses(*bodies[:3])
-                        self.assert_visible_stall()
-                        self.assertEqual(
-                            self.management.settle_evidence_error["reason"],
-                            "invalid job envelope" if index == 0 else "invalid settlement evidence",
-                        )
-                        self.assertIsNone(self.management.settle_cursor_seq)
-                        count += 1
-            self.assertGreater(count, 0)
-        required = _required_success_fields(validator.schema, components)
+                        self.adapter._handle = replay
+                    else:
+                        self.serve_settlement_responses(*bodies[:3])
+                    self.assert_visible_stall()
+                    self.assertEqual(
+                        self.management.settle_evidence_error["reason"],
+                        "invalid job envelope" if index == 0 else "invalid settlement evidence",
+                    )
+                    self.assertIsNone(self.management.settle_cursor_seq)
+                    count += 1
+        self.assertGreater(count, 0)
+        required = _required_success_fields(validator.schema, (component,))
         self.assertEqual(visited, required)
         self.adapter._handle = original
         self.serve_terminal_evidence(generation, manual=True)
         result = consume_static_route_settlements(self.management)
         self.assertTrue(result.drained)
         self.assertEqual(result.cursor, 1)
+
+    def test_required_job_feed_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("JobEvidenceOut")
+
+    def test_required_generation_listing_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("DeviceGenerationEvidenceOut")
+
+    def test_required_deployment_evidence_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("DeviceDeploymentEvidenceOut")
+
+    def test_required_apply_replay_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("ActionApplyOut")
 
     def test_terminal_jobs_without_execution_markers_pass_the_feed_validator(self):
         for kind in ("apply", "removal"):
