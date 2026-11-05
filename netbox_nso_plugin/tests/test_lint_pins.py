@@ -23,12 +23,15 @@ PYPROJECT = ROOT / "pyproject.toml"
 def test_opengrep_runs_only_in_the_local_pre_commit_hook():
     forbidden = re.compile(r"opengrep|semgrep|check-review-patterns|pre-commit", re.IGNORECASE)
     offenders = []
-    for path in sorted(ROOT.joinpath(".github").rglob("*")):
-        if not path.is_file() or path.suffix.casefold() not in {".yml", ".yaml"}:
-            continue
-        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if forbidden.search(line):
-                offenders.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
+    # Only what a job executes counts: dependabot.yml may name the pre-commit ecosystem.
+    for path in sorted(ROOT.joinpath(".github", "workflows").glob("*.y*ml")):
+        for name, job in yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"].items():
+            for command in [
+                job.get("uses"),
+                *(step.get(key) for step in job.get("steps", []) for key in ("run", "uses")),
+            ]:
+                if isinstance(command, str) and forbidden.search(command):
+                    offenders.append(f"{path.relative_to(ROOT)} job {name}: {command.strip()}")
 
     assert not offenders, "OpenGrep runs only in the local pre-commit hook (see .opengrep/README.md).\n" + "\n".join(
         offenders
