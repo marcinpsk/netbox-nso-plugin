@@ -9,13 +9,20 @@ from uuid import UUID
 
 from django.db import transaction
 from django.db.models import ProtectedError, Q, RestrictedError
-from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from . import adapter_client, refusal_contract
 from .deployment import guarded
 from .durable_capture import mapping_epoch
-from .models import NSOAcceptedSelection, NSOApplyAttempt, NSODeviceManagement, NSOIntentOutboxState, NSOSettlementIssue
+from .models import (
+    APPLY_ATTEMPT_PRUNABLE,
+    APPLY_ATTEMPT_RETENTION_AT,
+    NSOAcceptedSelection,
+    NSOApplyAttempt,
+    NSODeviceManagement,
+    NSOIntentOutboxState,
+    NSOSettlementIssue,
+)
 from .refusal_registry import OVERLAYS
 
 logger = logging.getLogger(__name__)
@@ -204,9 +211,8 @@ def _historical_certificate_required(attempt, management, remote):
 
 
 def _expired_attempts(cutoff):
-    return NSOApplyAttempt.objects.annotate(retention_at=Coalesce("completed_at", "created_at")).filter(
-        Q(lifecycle="terminal") | Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True),
-        retention_at__lt=cutoff,
+    return NSOApplyAttempt.objects.annotate(retention_at=APPLY_ATTEMPT_RETENTION_AT).filter(
+        APPLY_ATTEMPT_PRUNABLE, retention_at__lt=cutoff
     )
 
 

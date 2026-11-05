@@ -8,7 +8,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.core.management import CommandError, call_command
-from django.test import TransactionTestCase
+from django.db import connection
+from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from netbox_nso_plugin.durable_capture import mapping_epoch
@@ -643,3 +645,26 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.prune(execute=True)
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
         self.assertTrue(NSOApplyExecution.objects.filter(pk=execution.pk).exists())
+
+
+class TestApplyLedgerRetentionQueryPlan(TestCase):
+    def test_each_prune_batch_reads_candidates_in_index_order(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        for cursor in (None, f"{timezone.now().isoformat()}|{uuid4()}"):
+            with self.subTest(cursor=cursor):
+                with CaptureQueriesContext(connection) as queries:
+                    prune_apply_ledger(cursor=cursor)
+                candidate_queries = [
+                    query["sql"]
+                    for query in queries
+                    if '"netbox_nso_plugin_nsoapplyattempt"' in query["sql"] and "ORDER BY" in query["sql"]
+                ]
+                self.assertEqual(len(candidate_queries), 1)
+                with connection.cursor() as db:
+                    db.execute("SET LOCAL enable_seqscan = off")
+                    db.execute("SET LOCAL enable_bitmapscan = off")
+                    db.execute("EXPLAIN " + candidate_queries[0])
+                    plan = "\n".join(row[0] for row in db.fetchall())
+                self.assertIn("nso_attempt_prune", plan)
+                self.assertNotIn("Sort", plan)

@@ -7,7 +7,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
-from django.db.models.functions import Now
+from django.db.models.functions import Coalesce, Now
 from django.urls import reverse
 from django.utils.functional import cached_property
 from netbox.models import NetBoxModel
@@ -3180,6 +3180,13 @@ class NSOSwitchingRootDeletion(models.Model):
         ]
 
 
+# Retention examines terminal attempts and manual previews that never reached the adapter.
+APPLY_ATTEMPT_PRUNABLE = models.Q(lifecycle="terminal") | models.Q(
+    trigger_kind="manual", adapter_apply_attempt_id__isnull=True
+)
+APPLY_ATTEMPT_RETENTION_AT = Coalesce("completed_at", "created_at")
+
+
 class NSOApplyAttempt(models.Model):
     """One local Apply parent and its exact manual request, when present."""
 
@@ -3225,9 +3232,7 @@ class NSOApplyAttempt(models.Model):
         ]
         indexes = [
             models.Index(fields=["management", "-created_at"], name="nso_apply_attempt_device"),
-            models.Index(
-                fields=["completed_at", "id"], condition=models.Q(lifecycle="terminal"), name="nso_attempt_prune"
-            ),
+            models.Index(APPLY_ATTEMPT_RETENTION_AT, "id", condition=APPLY_ATTEMPT_PRUNABLE, name="nso_attempt_prune"),
         ]
         ordering = ["-created_at"]
         verbose_name = "NSO Apply Attempt"
