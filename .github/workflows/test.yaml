@@ -16,7 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CI_SHARDS: "3"
+  # A matrix cannot read env, so test_sharding.py checks that the shard list is 1..CI_SHARDS.
+  CI_SHARDS: "4"
 
 jobs:
   test-netbox:
@@ -35,7 +36,7 @@ jobs:
           - python-version: "3.14"
             netbox-version: "v4.7.2"
             netbox-ref: "251458b89a5eb2f5fe0d20ecd1140ba08f141a9c"
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
 
     services:
       redis:

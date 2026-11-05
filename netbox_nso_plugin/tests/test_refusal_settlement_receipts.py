@@ -307,7 +307,7 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
             self.assertEqual((row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id), prior)
         self.assertEqual(set(NSOApplyExecution.objects.values_list("consumption_state", flat=True)), {"unconsumed"})
         self.assertFalse(NSOApplyExecution.objects.filter(terminal_projection__isnull=False).exists())
-        self.assertFalse(manual.overlay_snapshots.exclude(settlement_disposition="unresolved").exists())
+        self.assert_unresolved_snapshots(manual, self.owners)
 
         invalid_receipt = False
         settle_device_apply_attempts(self.management)

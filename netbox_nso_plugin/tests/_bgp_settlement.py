@@ -454,3 +454,15 @@ class BGPSettlementHelpers:
         return settle_terminal_generation(
             self.management, generation, "00000000-0000-4000-8000-000000000004", attempt=self.attempt, settle_seq=1
         )
+
+    def assert_unresolved_snapshots(self, attempt, owners):
+        """Require one unresolved snapshot per owner, so an empty snapshot set fails."""
+        self.assertEqual(
+            {
+                (label, pk): disposition
+                for label, pk, disposition in attempt.overlay_snapshots.values_list(
+                    "model_label", "overlay_pk", "settlement_disposition"
+                )
+            },
+            {(row._meta.label_lower, row.pk): "unresolved" for row in owners},
+        )
