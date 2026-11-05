@@ -204,6 +204,16 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         with config, session:
             return self.client.post(self.apply_url, {"apply_preview": token}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
+    def assert_nothing_sent(self):
+        from django.db.models import Q
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        sent = NSOApplyAttempt.objects.filter(management=self.mgmt).filter(
+            Q(send_seq__gt=0) | Q(adapter_apply_attempt_id__isnull=False)
+        )
+        self.assertFalse(sent.exists())
+
     def test_preview_prepares_before_preflight_and_confirm_reuses_it_without_preparation(self):
         adapter = PreflightAdapter()
         preview = self.preview(adapter)
@@ -339,7 +349,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                     self.assertEqual(response.json()["status"], "error")
                     self.assertIn("intent preparation failed", response.json()["message"])
                     self.assertEqual(adapter.preflights, [])
-                    self.assertEqual(adapter.applies, [])
+                    self.assert_nothing_sent()
                     state = NSOIntentOutboxState.objects.get(device=self.device, scope=scope)
                     self.assertEqual(state.push_seq, held.push_seq)
                     self.assertIsNotNone(state.claimed_at)
@@ -366,7 +376,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(response.json()["status"], "error")
         self.assertIn("could not store the preflight", response.json()["message"])
         self.assertEqual(len(adapter.preflights), 1)
-        self.assertEqual(adapter.applies, [])
+        self.assert_nothing_sent()
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "accepted")
         self.assertIsNone(self.row.apply_attempt_id)
@@ -394,7 +404,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 self.assertIn("preparation failed", response.json()["message"])
                 self.assertEqual(len(adapter.requests), prepared_count)
                 self.assertEqual(adapter.preflights, [])
-                self.assertEqual(adapter.applies, [])
+                self.assert_nothing_sent()
                 self.row.refresh_from_db()
                 self.assertEqual(self.row.status, "accepted")
                 self.assertIsNone(self.row.apply_attempt_id)
@@ -477,7 +487,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertIn("intent preparation failed", response.json()["message"])
         self.assertEqual(adapter.requests, [])
         self.assertEqual(adapter.preflights, [])
-        self.assertEqual(adapter.applies, [])
+        self.assert_nothing_sent()
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "accepted")
         self.assertIsNone(self.row.apply_attempt_id)
@@ -524,7 +534,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(response.status_code, 409, response.content)
         self.assertIn("precondition was unmet", response.json()["message"])
         self.assertEqual(adapter.preflights, [])
-        self.assertEqual(adapter.applies, [])
+        self.assert_nothing_sent()
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "accepted")
         self.assertIsNone(self.row.apply_attempt_id)
@@ -795,12 +805,22 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         )
 
     def test_nonready_preview_admits_nothing_and_cannot_confirm(self):
-        for status, diagnosis in (
-            ("unavailable", None),
-            ("error", None),
-            ("refused", "baseline_refused"),
-            ("refused", "cross_stream"),
-        ):
+        from django.core import signing
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+        from netbox_nso_plugin.views import _APPLY_PREVIEW_SALT
+
+        cases = (
+            ("unavailable", None, "Apply preflight is unavailable. No stream was admitted. Try a fresh preview."),
+            (
+                "error",
+                None,
+                "Apply preflight failed. No stream was admitted. Review the adapter state and try a fresh preview.",
+            ),
+            ("refused", "baseline_refused", "Apply refused: the authorized baseline needs repair or Release: ip"),
+            ("refused", "cross_stream", "Apply refused: the selection causes a refusal in another stream: ip"),
+        )
+        for status, diagnosis, message in cases:
             with self.subTest(status=status, diagnosis=diagnosis):
 
                 def verdict(selected):
@@ -810,14 +830,30 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                     return result
 
                 adapter = PreflightAdapter(verdict)
+                earlier = set(NSOApplyAttempt.objects.filter(management=self.mgmt).values_list("pk", flat=True))
                 result = self.preview(adapter)
                 self.assertFalse(result["can_apply"])
                 self.assertIsNone(result["apply_preview"])
-                self.assertEqual(result["admitted_selection"], {})
-                self.assertIn("Apply", result["message"])
+                self.assertEqual(result["message"], message)
+                attempt = (
+                    NSOApplyAttempt.objects.filter(management=self.mgmt, trigger_kind="manual")
+                    .exclude(pk__in=earlier)
+                    .get()
+                )
+                self.assertEqual(attempt.selected, {})
+                self.assertEqual(attempt.preflight["result"]["status"], status)
+                # The view issues no token for this attempt, so the test signs one to prove the confirm guard.
+                token = signing.dumps(
+                    {"attempt": str(attempt.pk), "user": self.user.pk, "management": self.mgmt.pk},
+                    salt=_APPLY_PREVIEW_SALT,
+                )
+                response = self.confirm(adapter, token)
+                self.assertEqual(response.status_code, 409, response.content)
+                self.assertEqual(response.json()["status"], "preflight_stale")
+                self.assertEqual(adapter.applies, [])
+                self.assert_nothing_sent()
                 self.row.refresh_from_db()
                 self.assertEqual(self.row.status, "accepted")
-                self.assertEqual(adapter.applies, [])
 
     def test_expired_capture_after_preflight_failure_is_pruned(self):
         from datetime import timedelta
@@ -1036,4 +1072,4 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 self.assertFalse(preview["can_apply"])
                 self.assertIn(wording, preview["message"])
                 self.assertNotIn("private device diagnostic canary", str(preview))
-                self.assertEqual(adapter.applies, [])
+                self.assert_nothing_sent()
