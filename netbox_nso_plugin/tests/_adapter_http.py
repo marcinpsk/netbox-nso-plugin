@@ -17,6 +17,8 @@ empty ``.content`` together with a non-empty ``.json()``, or a 503 body whose
 body makes ``.json()`` raise a real ``JSONDecodeError``, exactly as in prod.
 """
 
+import hashlib as _hashlib
+import itertools as _itertools
 import json as _json
 from unittest.mock import MagicMock, patch
 
@@ -162,6 +164,9 @@ def make_generation_envelope(projection, *, device_id=7, **values):
     return make_evidence_envelope(projection, identity=identity, **values)
 
 
+_PREFLIGHT_COUNTER = _itertools.count(1)
+
+
 def make_apply_preflight(selected, *, blocked=None, status="ready"):
     blocked = blocked or {}
     result = {
@@ -183,7 +188,9 @@ def make_apply_preflight(selected, *, blocked=None, status="ready"):
         "error": None,
     }
     if status == "ready":
-        result["preflight_identity"] = "a" * 64
+        # Each ready verdict gets its own identity, so a test can tell which preflight a request carries.
+        issued = f"{next(_PREFLIGHT_COUNTER)}:{_json.dumps(selected, sort_keys=True)}"
+        result["preflight_identity"] = _hashlib.sha256(issued.encode()).hexdigest()
         if blocked:
             result["attempts"].append({"selection": result["admitted_selection"], "dropped": []})
     return result

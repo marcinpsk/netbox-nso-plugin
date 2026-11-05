@@ -265,7 +265,11 @@ class TestAttemptSettlement(TestCase):
         local.refresh_from_db(fields=["selected"])
         known = _attempt(attempt_id, self.adapter_device_id, 61, selected, "pending")
         persisted_wire = json.dumps(
-            {"apply_attempt_id": str(attempt_id), "selected": local.selected, "preflight_identity": "a" * 64}
+            {
+                "apply_attempt_id": str(attempt_id),
+                "selected": local.selected,
+                "preflight_identity": local.preflight["result"]["preflight_identity"],
+            }
         )
         requests = []
         admitted = False
@@ -282,7 +286,11 @@ class TestAttemptSettlement(TestCase):
                 self.assertTrue(url.endswith("/actions/apply"))
                 self.assertEqual(
                     body,
-                    {"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": "a" * 64},
+                    {
+                        "apply_attempt_id": str(attempt_id),
+                        "selected": selected,
+                        "preflight_identity": local.preflight["result"]["preflight_identity"],
+                    },
                 )
                 self.assertEqual(json.dumps(body), persisted_wire)
                 admitted = True
@@ -590,7 +598,15 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(local.http_status, 202)
         self.assertEqual(local.response, admitted["response"])
         self.assertEqual(
-            applies, [{"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": "a" * 64}] * 2
+            applies,
+            [
+                {
+                    "apply_attempt_id": str(attempt_id),
+                    "selected": selected,
+                    "preflight_identity": local.preflight["result"]["preflight_identity"],
+                }
+            ]
+            * 2,
         )
 
         self.assertEqual(evidence["attempts"][0]["generations"][0]["status"], "pending")
@@ -804,7 +820,7 @@ class TestAttemptSettlement(TestCase):
                             {
                                 "apply_attempt_id": str(attempt_id),
                                 "selected": {"vlan": 427},
-                                "preflight_identity": "a" * 64,
+                                "preflight_identity": local.preflight["result"]["preflight_identity"],
                             },
                         )
                         return make_response(202, answer["response"])
@@ -867,7 +883,11 @@ class TestAttemptSettlement(TestCase):
                 self.assertTrue(url.endswith("/actions/apply"))
                 self.assertEqual(
                     body,
-                    {"apply_attempt_id": str(attempt_id), "selected": selected, "preflight_identity": "a" * 64},
+                    {
+                        "apply_attempt_id": str(attempt_id),
+                        "selected": selected,
+                        "preflight_identity": local.preflight["result"]["preflight_identity"],
+                    },
                 )
                 admitted = True
                 return make_response(200, no_op)

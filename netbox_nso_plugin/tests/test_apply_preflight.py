@@ -124,6 +124,7 @@ class PreflightAdapter(ReceiptAdapter):
         super().__init__()
         self.verdict = verdict or preflight_wire
         self.preflights = []
+        self.identities = []
         self.applies = []
         self.stale = False
         self.apply_response = _promoted
@@ -131,11 +132,13 @@ class PreflightAdapter(ReceiptAdapter):
     def _handle(self, method, url, **kwargs):
         if method == "POST" and url.endswith("/actions/apply-preflight"):
             self.preflights.append(kwargs["json"]["selected"])
-            return make_response(200, self.verdict(kwargs["json"]["selected"]))
+            result = self.verdict(kwargs["json"]["selected"])
+            self.identities.append(result.get("preflight_identity"))
+            return make_response(200, result)
         if method == "POST" and url.endswith("/actions/apply"):
             body = kwargs["json"]
             assert set(body) == {"selected", "apply_attempt_id", "preflight_identity"}
-            assert body["preflight_identity"] == "a" * 64
+            assert body["preflight_identity"] in self.identities
             self.applies.append(body)
             if self.stale:
                 return make_response(
@@ -429,6 +432,8 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(self.row.status, "deploying")
 
     def test_stale_identity_requires_new_preview_and_new_attempt(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
         adapter = PreflightAdapter()
         preview = self.preview(adapter)
         adapter.stale = True
@@ -438,8 +443,29 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(response.json()["preview_url"], self.preview_url)
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "accepted")
+        stale = NSOApplyAttempt.objects.get(pk=adapter.applies[0]["apply_attempt_id"])
+        self.assertEqual(stale.http_status, 409)
+        self.assertEqual(set(stale.overlay_snapshots.values_list("settlement_disposition", flat=True)), {"not_applied"})
+
+        adapter.stale = False
         fresh = self.preview(adapter)
-        self.assertNotEqual(fresh["apply_preview"], preview["apply_preview"])
+        response = self.confirm(adapter, fresh["apply_preview"])
+        self.assertEqual(response.status_code, 200, response.content)
+        first, second = adapter.applies
+        self.assertNotEqual(second["apply_attempt_id"], first["apply_attempt_id"])
+        self.assertEqual([first["preflight_identity"], second["preflight_identity"]], adapter.identities)
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "deploying")
+        self.assertEqual(str(self.row.apply_attempt_id), second["apply_attempt_id"])
+
+    def test_each_preview_confirms_with_the_identity_of_its_own_preflight(self):
+        adapter = PreflightAdapter()
+        older = self.preview(adapter)
+        self.preview(adapter)
+        self.assertNotEqual(*adapter.identities)
+        response = self.confirm(adapter, older["apply_preview"])
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual([body["preflight_identity"] for body in adapter.applies], adapter.identities[:1])
 
     def test_preview_refuses_a_send_deadline_that_expires_before_the_drain_audit(self):
         adapter = PreflightAdapter()
@@ -632,7 +658,9 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(response.status_code, 502, response.content)
         attempt = NSOApplyAttempt.objects.get(pk=adapter.applies[0]["apply_attempt_id"])
         self.assertEqual(attempt.http_status, 401)
-        self.assertFalse(attempt.overlay_snapshots.exclude(settlement_disposition="not_applied").exists())
+        self.assertEqual(
+            set(attempt.overlay_snapshots.values_list("settlement_disposition", flat=True)), {"not_applied"}
+        )
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "accepted")
 
@@ -645,6 +673,8 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(self.row.status, "accepted")
         fresh = self.preview(adapter)
         self.assertEqual(self.confirm(adapter, fresh["apply_preview"]).status_code, 200)
+        self.assertEqual([body["preflight_identity"] for body in adapter.applies], adapter.identities)
+        self.assertNotEqual(adapter.applies[1]["apply_attempt_id"], adapter.applies[0]["apply_attempt_id"])
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
 

@@ -438,7 +438,9 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         self.assertEqual(attempt.send_seq, 2)
         self.assertIsNone(attempt.http_status)
         self.assertIsNone(attempt.response)
-        self.assertFalse(attempt.overlay_snapshots.exclude(settlement_disposition="unresolved").exists())
+        self.assertEqual(
+            set(attempt.overlay_snapshots.values_list("settlement_disposition", flat=True)), {"unresolved"}
+        )
         for _, row in self.rows:
             row.refresh_from_db()
             self.assertEqual(row.status, "deploying")
