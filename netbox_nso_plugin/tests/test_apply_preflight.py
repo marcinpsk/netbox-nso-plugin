@@ -14,6 +14,7 @@ from django.test import Client, RequestFactory, SimpleTestCase, TransactionTestC
 from django.urls import reverse
 
 from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.apply_preflight import validate_preflight
 
 from ._adapter_http import make_apply_preflight as preflight_wire
 from ._adapter_http import make_response, make_session
@@ -93,6 +94,27 @@ class TestPreflightClient(SimpleTestCase):
                 ):
                     adapter_client.apply_preflight(1558, {"vlan": 41})
                 self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_a_verdict_whose_status_disagrees_with_its_reasons_fails_closed(self):
+        good = preflight_wire({"vlan": 41})
+        cases = {
+            "admitted with a reason": {
+                **good,
+                "streams": {"vlan": {"status": "admitted", "guard": {"interfaces": [["me0"]]}}},
+            },
+            "blocked without a reason": {
+                **good,
+                "streams": {"vlan": {"status": "blocked"}},
+                "admitted_selection": {},
+                "attempts": [{"selection": {"vlan": 41}, "dropped": ["vlan"]}, {"selection": {}, "dropped": []}],
+            },
+        }
+        for name, payload in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(adapter_client.AdapterError) as raised:
+                    validate_preflight(payload, {"vlan": 41})
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertEqual(str(raised.exception.__cause__), "stream verdict reason mismatch")
 
 
 class PreflightAdapter(ReceiptAdapter):
