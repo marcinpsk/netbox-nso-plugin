@@ -775,7 +775,10 @@ def _replay_apply_answer(management, attempt):
     from .apply_submission import claim_send, record_response
     from .settlement_schemas import validate_settlement_response
 
-    identity = request_identity(attempt)
+    try:
+        identity = request_identity(attempt)
+    except client.AdapterError as exc:
+        raise EvidenceInvariantError("invalid_apply_replay_preflight") from exc
     if not claim_send(attempt):
         return None
     try:

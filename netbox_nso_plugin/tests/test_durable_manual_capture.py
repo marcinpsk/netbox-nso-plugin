@@ -446,9 +446,46 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
             self.assertEqual(row.status, "deploying")
             self.assertEqual(row.apply_attempt_id, attempt.pk)
 
+    def test_replay_with_an_invalid_stored_preflight_stalls_without_a_send(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+
+        adapter = ManualAdmissionAdapter(lambda _body: requests.ConnectionError("Apply admission answer was lost."))
+        self.assertEqual(self._apply(adapter).status_code, 502)
+        attempt_id = adapter.apply_requests[0]["apply_attempt_id"]
+        stored = NSOApplyAttempt.objects.get(pk=attempt_id).preflight
+        # A stream that the delivery registry no longer knows makes the stored preflight invalid.
+        NSOApplyAttempt.objects.filter(pk=attempt_id).update(
+            preflight={**stored, "selected": {**stored["selected"], "retired-stream": 1}}
+        )
+        original = adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                body = response.json()
+                body["attempts"] = []
+                body["unknown_apply_attempt_ids"] = [attempt_id]
+                return make_response(200, body)
+            return response
+
+        adapter._handle = handle
+        config, session = adapter.patches()
+        with (
+            config,
+            session,
+            self.assertRaisesRegex(EvidenceInvariantError, "invalid_apply_replay_preflight") as raised,
+        ):
+            load_deployment_evidence(NSODeviceManagement.objects.get(pk=self.management.pk))
+        self.assertEqual(raised.exception.invalid_job.device_id, self.management.adapter_device_id)
+        self.assertEqual(len(adapter.apply_requests), 1)
+        attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+        self.assertEqual(attempt.send_seq, 1)
+        self.assertEqual(
+            set(attempt.overlay_snapshots.values_list("settlement_disposition", flat=True)), {"unresolved"}
+        )
+
     def test_replay_refused_before_http_does_not_claim_a_send(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
 
         adapter = ManualAdmissionAdapter(lambda _body: requests.ConnectionError("Apply admission answer was lost."))
         self.assertEqual(self._apply(adapter).status_code, 502)
@@ -456,7 +493,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         NSOApplyAttempt.objects.filter(pk=attempt_id).update(preflight=None)
         before = NSOApplyAttempt.objects.values().get(pk=attempt_id)
         config, session = adapter.patches()
-        with config, session, self.assertRaises(AdapterError):
+        with config, session, self.assertRaisesRegex(EvidenceInvariantError, "invalid_apply_replay_preflight"):
             load_deployment_evidence(NSODeviceManagement.objects.get(pk=self.management.pk))
         self.assertEqual(NSOApplyAttempt.objects.values().get(pk=attempt_id), before)
         self.assertEqual(len(adapter.apply_requests), 1)
