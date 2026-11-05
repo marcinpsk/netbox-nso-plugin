@@ -203,6 +203,8 @@ class _RestconfState:
 
 class _RestconfHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Send headers and body at once: Nagle plus delayed ACK adds about 40 ms to each keep-alive response.
+    disable_nagle_algorithm = True
 
     @property
     def state(self) -> _RestconfState:

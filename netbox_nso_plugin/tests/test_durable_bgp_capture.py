@@ -40,6 +40,8 @@ class _CaptureHandler(BaseHTTPRequestHandler):
     """Serve the existing Apply contract double over a real socket."""
 
     protocol_version = "HTTP/1.1"
+    # Send headers and body at once: Nagle plus delayed ACK adds about 40 ms to each keep-alive response.
+    disable_nagle_algorithm = True
 
     def log_message(self, *args):
         pass

@@ -101,6 +101,14 @@ def _required_success_fields(root, components):
     return {(schemas[name]["title"], field) for name in reachable for field in schemas[name].get("required", ())}
 
 
+_RESPONSE_COMPONENTS = (
+    "JobEvidenceOut",
+    "DeviceGenerationEvidenceOut",
+    "DeviceDeploymentEvidenceOut",
+    "ActionApplyOut",
+)
+
+
 class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
     def job(self, *, kind="apply", status="failed", result=None):
         return {
@@ -529,7 +537,8 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
                 self.assert_visible_stall()
                 self.assertEqual(self.management.settle_evidence_error.get("job_id"), job_id)
 
-    def test_required_response_fields_always_stall_with_a_visible_banner(self):
+    def assert_required_fields_stall_with_a_visible_banner(self, component):
+        """Remove or retype each required field that *component* serves and require a visible stall."""
         from netbox_nso_plugin.settlement_schemas import VALIDATORS
 
         self.prepare()
@@ -560,54 +569,65 @@ class TestSettlementEvidenceBanner(BGPSettlementHelpers, BGPCaptureCase):
         )
         skipped = next(iter(base[3]["skipped"]))
         base[3]["skipped_detail"] = {skipped: {"generation_id": 80, "seq": 3, "status": "failed"}}
-        components = ("JobEvidenceOut", "DeviceGenerationEvidenceOut", "DeviceDeploymentEvidenceOut", "ActionApplyOut")
+        index = _RESPONSE_COMPONENTS.index(component)
         visited = set()
-        for index, component in enumerate(components):
-            validator = VALIDATORS[component]
-            validator.validate(base[index])
-            count = 0
-            for path, field_schema in _required_paths(validator.schema, validator.schema, base[index], visited=visited):
-                for label, replacement in _structural_mutations(validator.schema, field_schema):
-                    with self.subTest(component=component, path=path, mutation=label):
-                        bodies = copy.deepcopy(base)
-                        parent = bodies[index]
-                        for key in path[:-1]:
-                            parent = parent[key]
-                        if label == "remove":
-                            del parent[path[-1]]
-                        else:
-                            parent[path[-1]] = replacement
-                        self.assertFalse(validator.is_valid(bodies[index]))
-                        mirror_update(self.management, settle_evidence_error={})
-                        if component == "ActionApplyOut":
-                            unknown = _payload(self.management.adapter_device_id, [])
-                            unknown["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
-                            self.serve_settlement_responses([], [], unknown)
-                            evidence_handler = self.adapter._handle
+        validator = VALIDATORS[component]
+        validator.validate(base[index])
+        count = 0
+        for path, field_schema in _required_paths(validator.schema, validator.schema, base[index], visited=visited):
+            for label, replacement in _structural_mutations(validator.schema, field_schema):
+                with self.subTest(component=component, path=path, mutation=label):
+                    bodies = copy.deepcopy(base)
+                    parent = bodies[index]
+                    for key in path[:-1]:
+                        parent = parent[key]
+                    if label == "remove":
+                        del parent[path[-1]]
+                    else:
+                        parent[path[-1]] = replacement
+                    self.assertFalse(validator.is_valid(bodies[index]))
+                    mirror_update(self.management, settle_evidence_error={})
+                    if component == "ActionApplyOut":
+                        unknown = _payload(self.management.adapter_device_id, [])
+                        unknown["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
+                        self.serve_settlement_responses([], [], unknown)
+                        evidence_handler = self.adapter._handle
 
-                            def replay(method, url, **kwargs):
-                                if method == "POST" and url.endswith("/actions/apply"):
-                                    return make_response(200, bodies[3])
-                                return evidence_handler(method, url, **kwargs)
+                        def replay(method, url, **kwargs):
+                            if method == "POST" and url.endswith("/actions/apply"):
+                                return make_response(200, bodies[3])
+                            return evidence_handler(method, url, **kwargs)
 
-                            self.adapter._handle = replay
-                        else:
-                            self.serve_settlement_responses(*bodies[:3])
-                        self.assert_visible_stall()
-                        self.assertEqual(
-                            self.management.settle_evidence_error["reason"],
-                            "invalid job envelope" if index == 0 else "invalid settlement evidence",
-                        )
-                        self.assertIsNone(self.management.settle_cursor_seq)
-                        count += 1
-            self.assertGreater(count, 0)
-        required = _required_success_fields(validator.schema, components)
+                        self.adapter._handle = replay
+                    else:
+                        self.serve_settlement_responses(*bodies[:3])
+                    self.assert_visible_stall()
+                    self.assertEqual(
+                        self.management.settle_evidence_error["reason"],
+                        "invalid job envelope" if index == 0 else "invalid settlement evidence",
+                    )
+                    self.assertIsNone(self.management.settle_cursor_seq)
+                    count += 1
+        self.assertGreater(count, 0)
+        required = _required_success_fields(validator.schema, (component,))
         self.assertEqual(visited, required)
         self.adapter._handle = original
         self.serve_terminal_evidence(generation, manual=True)
         result = consume_static_route_settlements(self.management)
         self.assertTrue(result.drained)
         self.assertEqual(result.cursor, 1)
+
+    def test_required_job_feed_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("JobEvidenceOut")
+
+    def test_required_generation_listing_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("DeviceGenerationEvidenceOut")
+
+    def test_required_deployment_evidence_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("DeviceDeploymentEvidenceOut")
+
+    def test_required_apply_replay_fields_always_stall_with_a_visible_banner(self):
+        self.assert_required_fields_stall_with_a_visible_banner("ActionApplyOut")
 
     def test_terminal_jobs_without_execution_markers_pass_the_feed_validator(self):
         for kind in ("apply", "removal"):
