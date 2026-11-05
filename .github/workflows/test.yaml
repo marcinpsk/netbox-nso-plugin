@@ -298,17 +298,17 @@ jobs:
           ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:${{ job.services['adapter-postgres'].ports['5432'] }}/adapter
           ADAPTER_TOKEN: contract-adapter-token
           NETBOX_TOKEN: contract-netbox-token
-        # The instance entry is a name the store validates onboarding against, nothing more:
-        # it points at a closed port and the streams and both scheduler ticks are off, so no
-        # request ever leaves for it. Without it the store-side contract checks cannot create
-        # the throwaway devices they push intent to.
+        # The instance entry is a name the store validates onboarding against. Its port is
+        # closed except while a contract test serves contract_tests/_fake_nso.py there; the
+        # streams and both scheduler ticks are off. Without it the store-side contract checks
+        # cannot create the throwaway devices they push intent to.
         run: |
           cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<EOF
           secrets:
             provider: local
           nso_instances:
             - name: contract
-              base_url: http://127.0.0.1:9
+              base_url: http://127.0.0.1:18009
               username_ref: CONTRACT_NSO_USERNAME
               password_ref: CONTRACT_NSO_PASSWORD
           netbox:
