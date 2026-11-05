@@ -622,10 +622,20 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
             selected={"vlan": 41},
         )
         NSOApplyAttempt.objects.filter(pk=submitted.pk).update(created_at=old)
+        young = NSOApplyAttempt.objects.create(
+            management=self.management, adapter_device_id=1767, selected={"vlan": 41}
+        )
+        automatic = NSOApplyAttempt.objects.create(
+            management=self.management, adapter_device_id=1767, trigger_kind="push", selected={"vlan": 41}
+        )
+        NSOApplyAttempt.objects.filter(pk=automatic.pk).update(created_at=old)
         result = prune_apply_ledger(execute=True)
         self.assertEqual(result.deleted, 1)
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=preview.pk).exists())
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=submitted.pk).exists())
+        # An unexpired preview and an open automatic attempt fall outside the unsent-preview branch.
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=young.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=automatic.pk).exists())
 
     def test_expired_manual_capture_without_preflight_keeps_its_execution(self):
         attempt, execution = self.history()
