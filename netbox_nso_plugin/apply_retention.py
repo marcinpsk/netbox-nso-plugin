@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 
 from django.db import transaction
-from django.db.models import ProtectedError, Q, RestrictedError
+from django.db.models import BooleanField, ExpressionWrapper, ProtectedError, Q, RestrictedError
 from django.utils import timezone
 
 from . import adapter_client, refusal_contract
@@ -17,6 +17,7 @@ from .durable_capture import mapping_epoch
 from .models import (
     APPLY_ATTEMPT_PRUNABLE,
     APPLY_ATTEMPT_RETENTION_AT,
+    UNSENT_MANUAL_PREVIEW,
     NSOAcceptedSelection,
     NSOApplyAttempt,
     NSODeviceManagement,
@@ -99,7 +100,7 @@ def _referenced(attempt):
 
 
 def _eligible(attempt, management):
-    if attempt.trigger_kind == "manual" and attempt.adapter_apply_attempt_id is None:
+    if attempt.unsent_preview:
         return not _referenced(attempt) and not attempt.executions.exists()
     if attempt.trigger_kind == "manual" and (attempt.response is None or attempt.http_status is None):
         return False
@@ -211,9 +212,10 @@ def _historical_certificate_required(attempt, management, remote):
 
 
 def _expired_attempts(cutoff):
-    return NSOApplyAttempt.objects.annotate(retention_at=APPLY_ATTEMPT_RETENTION_AT).filter(
-        APPLY_ATTEMPT_PRUNABLE, retention_at__lt=cutoff
-    )
+    return NSOApplyAttempt.objects.annotate(
+        retention_at=APPLY_ATTEMPT_RETENTION_AT,
+        unsent_preview=ExpressionWrapper(UNSENT_MANUAL_PREVIEW, output_field=BooleanField()),
+    ).filter(APPLY_ATTEMPT_PRUNABLE, retention_at__lt=cutoff)
 
 
 @guarded("Apply ledger retention")

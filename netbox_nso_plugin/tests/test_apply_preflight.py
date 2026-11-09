@@ -898,6 +898,15 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.addCleanup(remote.stop)
         remote.store.add_device(nso_instance="placeholder", nso_device_name="placeholder", device_id=1558)
         adapter = FailingPreflightAdapter()
+        # A pre-ledger attempt may have reached the adapter, so retention keeps it open or terminal.
+        expired = timezone.now() - timedelta(days=31)
+        pre_ledger = [
+            NSOApplyAttempt.objects.create(
+                management=self.mgmt, pre_ledger=True, http_status=202, response={"status": "accepted"}, **state
+            ).pk
+            for state in ({}, {"lifecycle": "terminal", "completed_at": expired})
+        ]
+        NSOApplyAttempt.objects.filter(pk__in=pre_ledger).update(created_at=expired)
         for failure, expected_status in (("timeout", 502), ("conflict", 409), ("malformed", 502)):
             with self.subTest(failure=failure):
                 adapter.failure = failure
@@ -923,6 +932,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                     result = prune_apply_ledger(execute=True)
                 self.assertEqual(result.deleted, 1)
                 self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+                self.assertEqual(NSOApplyAttempt.objects.filter(pk__in=pre_ledger).count(), 2)
                 self.assertFalse(NSOApplyOverlaySnapshot.objects.filter(attempt_id=attempt.pk).exists())
 
     def test_tampered_preview_and_another_operators_preview_cannot_apply(self):

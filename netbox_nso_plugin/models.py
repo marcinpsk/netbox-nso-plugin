@@ -3180,13 +3180,11 @@ class NSOSwitchingRootDeletion(models.Model):
         ]
 
 
-# Retention examines terminal attempts and manual previews that never reached the adapter.
-APPLY_ATTEMPT_PRUNABLE = models.Q(lifecycle="terminal") | models.Q(
-    trigger_kind="manual", adapter_apply_attempt_id__isnull=True
-)
-APPLY_ATTEMPT_RETENTION_AT = Coalesce("completed_at", "created_at")
 # A manual preview that never reached the adapter, also when its preflight call failed.
 UNSENT_MANUAL_PREVIEW = models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, pre_ledger=False)
+# Retention examines terminal attempts and manual previews that never reached the adapter.
+APPLY_ATTEMPT_PRUNABLE = models.Q(lifecycle="terminal") | UNSENT_MANUAL_PREVIEW
+APPLY_ATTEMPT_RETENTION_AT = Coalesce("completed_at", "created_at")
 
 
 class NSOApplyAttempt(models.Model):
