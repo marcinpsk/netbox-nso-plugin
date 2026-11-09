@@ -1798,20 +1798,40 @@ def footprint_for_instance(instance, spec: RendererInputSpec | None = None, *, s
     return _regular_instance_footprint(instance, spec, stored_before=stored_before)
 
 
+def footprint_for_instances(instances) -> MutationFootprint:
+    """Resolve many instances, with one route-policy lookup for all policy state rows."""
+    groups, device_ids, footprints = set(), set(), []
+    for instance in instances:
+        state_group = _route_policy_state_group(instance)
+        if state_group is None:
+            footprints.append(footprint_for_instance(instance))
+        else:
+            groups.add(state_group[0])
+            device_ids.add(state_group[1])
+    if groups:
+        footprints.append(route_policy_footprint(groups, device_ids=device_ids))
+    return MutationFootprint.merge(*footprints)
+
+
+def _route_policy_state_group(instance):
+    """Return the policy group and device of a named route-policy state row, else None."""
+    if instance._meta.label_lower != "netbox_nso_plugin.nsoroutepolicystate":
+        return None
+    family = getattr(instance, "family", "")
+    name = getattr(instance, "object_name", "")
+    management = getattr(instance, "management", None)
+    if not (family and name and management is not None):
+        return None
+    return (family, name), management.device_id
+
+
 def _route_policy_instance_footprint(instance, spec) -> MutationFootprint:
     """Include current and stored groups so a rename locks both identities."""
     groups = set(_route_policy_groups(instance))
-    if instance._meta.label_lower == "netbox_nso_plugin.nsoroutepolicystate":
-        family = getattr(instance, "family", "")
-        name = getattr(instance, "object_name", "")
-        management = getattr(instance, "management", None)
-        if family and name and management is not None:
-            # The shared revision keys serialize consumer writes. This state-row path
-            # does not mutate consumer overlays, so it needs no consumer row locks.
-            return route_policy_footprint(
-                {(family, name)},
-                device_ids=(management.device_id,),
-            )
+    if (state_group := _route_policy_state_group(instance)) is not None:
+        # The shared revision keys serialize consumer writes. This state-row path
+        # does not mutate consumer overlays, so it needs no consumer row locks.
+        return route_policy_footprint({state_group[0]}, device_ids=(state_group[1],))
     candidates = [instance]
     if instance.pk is not None:
         current = type(instance).objects.filter(pk=instance.pk).first()
@@ -2465,7 +2485,7 @@ def offline_mutation(using=None):
 
 def mirror_rows_transaction(rows):
     """Acquire one read-side footprint for a batch of per-row ``mirror_refresh`` saves."""
-    return mirror_transaction(MutationFootprint.merge(*(footprint_for_instance(row) for row in rows)))
+    return mirror_transaction(footprint_for_instances(rows))
 
 
 @contextlib.contextmanager

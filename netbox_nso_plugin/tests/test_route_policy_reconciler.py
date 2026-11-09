@@ -1723,11 +1723,36 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         ]
         self.assertTrue(all(all(count) for count in counts), f"no route-policy lock queries were captured: {counts}")
         self.assertEqual(counts[0], counts[1], f"lock queries grew with the candidate count: {counts}")
+        lookups = tuple(sum(locks[0] in sql for sql in sqls) for sqls in (one_sql, many_sql))
+        self.assertEqual(lookups[0], lookups[1], f"class lookups grew with the candidate count: {lookups}")
         for prepared in (one, many):
             for row in prepared.rows:
                 row.refresh_from_db()
                 self.assertEqual(row.status, "deploying")
                 self.assertIsNotNone(row.apply_attempt_id)
+
+    def test_batch_footprint_keeps_the_per_row_lock_set_with_one_class_lookup(self):
+        """Resolving policy rows together locks what per-row resolution locks and reads classes once."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, footprint_for_instances
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+
+        self._accepted_local_candidates(self.device, ["CL-BATCH-SOLO"], materialized=True)
+        self._accepted_local_candidates(self.device2, [f"CL-BATCH-{index}" for index in range(6)], materialized=True)
+        rows = list(NSORoutePolicyState.objects.select_related("management").order_by("pk"))
+        expected = MutationFootprint.merge(*(footprint_for_instance(row) for row in rows))
+
+        with CaptureQueriesContext(connection) as captured:
+            footprint = footprint_for_instances(rows)
+
+        self.assertEqual(footprint, expected)
+        self.assertEqual(
+            {device_id for device_id, _scope in footprint.revision_keys}, {self.device.pk, self.device2.pk}
+        )
+        table = f'FROM "{NSORoutePolicyObjectClass._meta.db_table}"'
+        self.assertEqual(sum(table in query["sql"] for query in captured.captured_queries), 1)
 
     def test_promotion_excludes_a_local_row_whose_materialized_target_is_gone(self):
         """A LOCAL row with both GFK ids set but no target row stays excluded, as it does today."""

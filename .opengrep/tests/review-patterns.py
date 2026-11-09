@@ -3638,3 +3638,34 @@ def shared_unsent_preview(attempt):
     first = attempt.adapter_apply_attempt_id is None
     # ok: nso-unsent-preview-predicate-copy
     return first and attempt.trigger_kind == "cadence" and attempt.adapter_apply_attempt_id is None
+
+
+def per_row_overlay_footprints(snapshots, rows):
+    footprints = []
+    for item in snapshots:
+        row = OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first()
+        if row is not None:
+            # ruleid: nso-per-row-overlay-footprint
+            footprints.append(footprint_for_instance(row))
+    for item in snapshots:
+        row = OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first()
+        # ruleid: nso-per-row-overlay-footprint
+        footprints.append(intent_state.footprint_for_instance(row))
+    # ruleid: nso-per-row-overlay-footprint
+    MutationFootprint.merge(*(intent_state.footprint_for_instance(row) for row in rows))
+    # ruleid: nso-per-row-overlay-footprint
+    return MutationFootprint.merge(*(footprint_for_instance(row) for row in rows))
+
+
+def batched_overlay_footprints(snapshots, rows, stale, spec):
+    loaded = (OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first() for item in snapshots)
+    # ok: nso-per-row-overlay-footprint
+    footprint = footprint_for_instances(row for row in loaded if row is not None)
+    for _attempt in range(2):
+        # ok: nso-per-row-overlay-footprint
+        plan = footprint_for_instance(stale)
+    for row in rows:
+        # ok: nso-per-row-overlay-footprint
+        plan = footprint_for_instance(row, spec)
+    # ok: nso-per-row-overlay-footprint
+    return MutationFootprint.merge(footprint, plan, *(footprint_for_instance(row, spec) for row in rows))

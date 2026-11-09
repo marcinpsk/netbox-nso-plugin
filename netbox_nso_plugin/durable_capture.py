@@ -381,22 +381,19 @@ def capture_manual(
 
 def attempt_footprint(attempt_id):
     """Return all frozen owners and native dependencies needed for attempt bookkeeping."""
-    from .intent_state import MutationFootprint, SourceRow, footprint_for_instance
+    from .intent_state import MutationFootprint, SourceRow, footprint_for_instances
 
     before = NSOApplyAttempt.objects.select_related("management").get(pk=attempt_id)
     snapshots = list(before.overlay_snapshots.order_by("model_label", "overlay_pk"))
-    footprints = [
+    rows = (OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first() for item in snapshots)
+    return MutationFootprint.merge(
         MutationFootprint(device_ids=(before.management.device_id,)),
         MutationFootprint.for_keys(
             ((before.management.device_id, scope) for scope in before.scope_revisions),
             overlay_rows=(SourceRow(item.model_label, item.overlay_pk) for item in snapshots),
         ),
-    ]
-    for item in snapshots:
-        row = OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first()
-        if row is not None:
-            footprints.append(footprint_for_instance(row))
-    return MutationFootprint.merge(*footprints)
+        footprint_for_instances(row for row in rows if row is not None),
+    )
 
 
 @contextlib.contextmanager

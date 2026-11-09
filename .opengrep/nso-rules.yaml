@@ -1155,3 +1155,21 @@ rules:
       - pattern-not-inside: '$M.CheckConstraint(...)'
     paths:
       exclude: ["netbox_nso_plugin/tests/**", "netbox_nso_plugin/migrations/**"]
+  - id: nso-per-row-overlay-footprint
+    languages: [python]
+    severity: ERROR
+    message: One footprint_for_instance call per overlay row repeats the route-policy lookups for each row. Resolve the rows with intent_state.footprint_for_instances.
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              for $O in $OWNERS:
+                  ...
+                  $ROW = $REG[$L].model.objects.filter(...).first()
+                  ...
+          - pattern-either:
+              - pattern: footprint_for_instance($ROW)
+              - pattern: $M.footprint_for_instance($ROW)
+      - pattern: '$MF.merge(*(footprint_for_instance($R) for $R in $ROWS))'
+      - pattern: '$MF.merge(*($M.footprint_for_instance($R) for $R in $ROWS))'
+    paths:
+      exclude: ["netbox_nso_plugin/tests/**", "netbox_nso_plugin/migrations/**"]

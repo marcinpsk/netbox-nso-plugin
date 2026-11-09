@@ -59,23 +59,20 @@ def _actor(actor):
 
 def _footprint(issue):
     """Build the lock footprint from the stored proposal, including absent owners."""
-    from .intent_state import MutationFootprint, SourceRow, footprint_for_instance
+    from .intent_state import MutationFootprint, SourceRow, footprint_for_instances
     from .refusal_registry import OVERLAYS
 
     management = issue.management
     owners = list(issue.owners.order_by("model_label", "overlay_pk"))
     keys = {(management.device_id, scope) for owner in owners for scope in OVERLAYS[owner.model_label].delivery_keys}
-    footprints = [
+    rows = (OVERLAYS[owner.model_label].model.objects.filter(pk=owner.overlay_pk).first() for owner in owners)
+    return MutationFootprint.merge(
         MutationFootprint(device_ids=(management.device_id,)),
         MutationFootprint.for_keys(
             keys, overlay_rows=(SourceRow(owner.model_label, owner.overlay_pk) for owner in owners)
         ),
-    ]
-    for owner in owners:
-        row = OVERLAYS[owner.model_label].model.objects.filter(pk=owner.overlay_pk).first()
-        if row is not None:
-            footprints.append(footprint_for_instance(row))
-    return MutationFootprint.merge(*footprints)
+        footprint_for_instances(row for row in rows if row is not None),
+    )
 
 
 def acknowledge(issue, revision_digest, actor, reason) -> AcknowledgementReceipt:
