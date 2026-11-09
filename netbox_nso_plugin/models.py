@@ -3185,8 +3185,8 @@ APPLY_ATTEMPT_PRUNABLE = models.Q(lifecycle="terminal") | models.Q(
     trigger_kind="manual", adapter_apply_attempt_id__isnull=True
 )
 APPLY_ATTEMPT_RETENTION_AT = Coalesce("completed_at", "created_at")
-# A manual preview that stored its preflight and never reached the adapter; a pre-ledger admission stored none.
-UNSENT_MANUAL_PREVIEW = models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, preflight__isnull=False)
+# A manual preview that never reached the adapter, also when its preflight call failed.
+UNSENT_MANUAL_PREVIEW = models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, pre_ledger=False)
 
 
 class NSOApplyAttempt(models.Model):
@@ -3212,6 +3212,8 @@ class NSOApplyAttempt(models.Model):
         choices=(("manual", "Manual"), ("push", "Push"), ("cadence", "Cadence"), ("explicit_retry", "Explicit retry")),
     )
     adapter_apply_attempt_id = models.UUIDField(null=True, blank=True)
+    # Migration 0045 marks a manual attempt that 0034 left without an adapter identity: it may have been sent.
+    pre_ledger = models.BooleanField(default=False)
     source_epoch = models.BigIntegerField(null=True, blank=True)
     lifecycle = models.CharField(max_length=16, default="open", choices=(("open", "Open"), ("terminal", "Terminal")))
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -3225,6 +3227,11 @@ class NSOApplyAttempt(models.Model):
             models.CheckConstraint(
                 condition=models.Q(lifecycle="open") | models.Q(completed_at__isnull=False),
                 name="nso_attempt_terminal_time",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(pre_ledger=False)
+                | models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, preflight__isnull=True),
+                name="nso_attempt_pre_ledger",
             ),
             models.UniqueConstraint(
                 fields=["adapter_apply_attempt_id"],

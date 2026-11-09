@@ -732,21 +732,28 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
 
     def test_an_unsent_preview_of_the_obligation_selection_does_not_block_its_acknowledgement(self):
         self.serve_history()
-        preview = NSOApplyAttempt.objects.create(
-            management=self.management,
-            adapter_device_id=self.management.adapter_device_id,
-            source_epoch=self.management.adapter_source_epoch,
-            selected={"bgp": 999},
-            preflight=make_stored_preflight({"bgp": 999}),
-            scope_revisions={"bgp": 1},
-        )
+        # The second preview has no stored preflight because its adapter preflight call failed.
+        previews = [
+            NSOApplyAttempt.objects.create(
+                management=self.management,
+                adapter_device_id=self.management.adapter_device_id,
+                source_epoch=self.management.adapter_source_epoch,
+                selected={"bgp": 999},
+                preflight=preflight,
+                scope_revisions={"bgp": 1},
+            )
+            for preflight in (make_stored_preflight({"bgp": 999}), None)
+        ]
         issue = self.stall_history()
         self.assertIsNotNone(issue)
-        self.assertNotIn(str(preview.pk), issue.proposal["attempt_locks"])
+        self.assertFalse({str(preview.pk) for preview in previews} & set(issue.proposal["attempt_locks"]))
         acknowledge(issue, issue.revision_digest, self.operator(), "pre-ledger generation")
         issue.refresh_from_db()
         self.assertEqual(issue.state, "acknowledged")
-        self.assertTrue(NSOApplyAttempt.objects.filter(pk=preview.pk, lifecycle="open", response__isnull=True).exists())
+        open_previews = NSOApplyAttempt.objects.filter(
+            pk__in=[preview.pk for preview in previews], lifecycle="open", response__isnull=True
+        )
+        self.assertEqual(open_previews.count(), 2)
 
     def assert_no_exit(self, code):
         issue = self.stall_history()

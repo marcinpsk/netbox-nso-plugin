@@ -112,13 +112,14 @@ class TestHistoricalAcknowledgementRetention(
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_evidence_error, {})
 
-    def test_expired_unsent_capture_stays_while_an_open_issue_reads_its_answer(self):
+    def test_expired_pre_ledger_attempt_stays_while_an_open_issue_reads_its_answer(self):
         self.serve_history()
         attempt = NSOApplyAttempt.objects.create(
             management=self.management,
             adapter_device_id=self.management.adapter_device_id,
             selected={"bgp": 999},
             scope_revisions={"bgp": 1},
+            pre_ledger=True,
         )
         self.assertTrue(consume_static_route_settlements(self.management).stalled)
         issue = NSOSettlementIssue.objects.get(state="open")

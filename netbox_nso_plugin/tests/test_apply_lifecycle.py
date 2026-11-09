@@ -51,6 +51,7 @@ class TestApplyAttemptSchema(SimpleTestCase):
                 "response",
                 "trigger_kind",
                 "adapter_apply_attempt_id",
+                "pre_ledger",
                 "source_epoch",
                 "lifecycle",
                 "completed_at",

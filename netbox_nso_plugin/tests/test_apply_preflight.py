@@ -880,7 +880,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         from django.utils import timezone
 
         from netbox_nso_plugin.apply_retention import prune_apply_ledger
-        from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyOverlaySnapshot
+        from netbox_nso_plugin.models import UNSENT_MANUAL_PREVIEW, NSOApplyAttempt, NSOApplyOverlaySnapshot
 
         class FailingPreflightAdapter(PreflightAdapter):
             failure = "timeout"
@@ -910,6 +910,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 self.assertIsNone(attempt.preflight)
                 self.assertIsNone(attempt.adapter_apply_attempt_id)
                 self.assertEqual(attempt.lifecycle, "open")
+                self.assertTrue(NSOApplyAttempt.objects.filter(UNSENT_MANUAL_PREVIEW, pk=attempt.pk).exists())
                 self.assertTrue(attempt.overlay_snapshots.exists())
                 self.row.refresh_from_db()
                 self.assertEqual(self.row.status, "accepted")

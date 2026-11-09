@@ -921,31 +921,37 @@ class TestDeploymentProbe(DeploymentCase):
 
         attempts = self.paired_probes()
         settled = [str(pk) for pk in attempts]
-        # A submitted attempt, and a pre-ledger admission that stored no preflight, are both in flight.
-        for adapter_apply_attempt_id in (uuid4(), None):
-            with self.subTest(adapter_apply_attempt_id=adapter_apply_attempt_id):
+        # A submitted attempt, and a pre-ledger attempt that may have been sent, are both in flight.
+        for identity in ({"adapter_apply_attempt_id": uuid4()}, {"pre_ledger": True}):
+            with self.subTest(**{key: str(value) for key, value in identity.items()}):
                 in_flight = NSOApplyAttempt.objects.create(
                     management=self.management,
                     adapter_device_id=self.management.adapter_device_id,
-                    adapter_apply_attempt_id=adapter_apply_attempt_id,
                     trigger_kind="manual",
                     selected={"bgp": 1},
+                    **identity,
                 )
                 with self.assertRaisesRegex(CommandError, "Unanswered or unconsumed attempts remain"):
                     self.command(verify=True, device_id=self.device.pk, settled_probe=settled)
                 self.assertTrue(deployment.is_quiesced())
                 in_flight.delete()
-        preview = NSOApplyAttempt.objects.create(
-            management=self.management,
-            adapter_device_id=self.management.adapter_device_id,
-            trigger_kind="manual",
-            selected={"bgp": 1},
-            preflight=make_stored_preflight({"bgp": 1}),
-        )
+        # One preview stored its preflight; the adapter preflight call of the other one failed.
+        previews = [
+            NSOApplyAttempt.objects.create(
+                management=self.management,
+                adapter_device_id=self.management.adapter_device_id,
+                trigger_kind="manual",
+                selected={"bgp": 1},
+                preflight=preflight,
+            )
+            for preflight in (make_stored_preflight({"bgp": 1}), None)
+        ]
         output = self.command(verify=True, device_id=self.device.pk, settled_probe=settled)
         self.assertIn("normal intent operation resumed", output)
         self.assertFalse(deployment.is_quiesced())
-        self.assertTrue(NSOApplyAttempt.objects.filter(pk=preview.pk, lifecycle="open").exists())
+        self.assertEqual(
+            NSOApplyAttempt.objects.filter(pk__in=[row.pk for row in previews], lifecycle="open").count(), 2
+        )
 
     def test_paired_verification_refuses_a_store_that_changed_after_the_generation_listing(self):
         from netbox_nso_plugin import adapter_client
