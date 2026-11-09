@@ -208,6 +208,22 @@ it('opens a fresh preview after stale admission and submits its new reference', 
   expect(String(fetch.mock.calls[3][1].body)).toBe('apply_preview=fresh-reference');
 });
 
+it('waits for the operator after a stale admission even when the fresh preview has nothing pending', async () => {
+  const ready = { total: 1, preview_status: 'ready', can_apply: true, apply_preview: 'original-reference',
+    streams: { vlan: { status: 'admitted', label: 'VLAN' } }, diff_available: true };
+  await open(ready);
+  let applies = 0;
+  fetch.mockImplementation(async (url) => new URL(url, 'http://placeholder.invalid').pathname === '/apply/'
+    ? {ok: ++applies === 1, json: async () => (applies === 1
+      ? {status: 'preflight_stale', message: 'Apply needs a fresh preview.'} : {status: 'no_op'})}
+    : {ok: true, json: async () => ({...ready, total: 0, nothing_pending: true, apply_preview: 'fresh-reference'})});
+  document.getElementById('nso-apply-confirm').click();
+  await vi.waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThanOrEqual(3));
+  await new Promise(resolveTick => setTimeout(resolveTick, 50));
+  expect(fetch.mock.calls.map(call => new URL(call[0], 'http://placeholder.invalid').pathname)).toEqual(['/preview/', '/apply/', '/preview/']);
+  expect(document.getElementById('nso-apply-modal').classList.contains('d-none')).toBe(false);
+});
+
 it('uses the same form token for action and category POSTs without reading cookies', async () => {
   const block = [...parsed.querySelectorAll('script')].find(node => node.textContent.includes('function curState(pager)')).textContent;
   const start = block.lastIndexOf('(function () {', block.indexOf('function curState(pager)'));

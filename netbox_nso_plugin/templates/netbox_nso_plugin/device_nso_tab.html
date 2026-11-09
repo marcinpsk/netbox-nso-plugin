@@ -879,7 +879,8 @@
         var data = await r.json();
         if (data.status === 'preflight_stale') {
           setButtons(false);
-          await openApply();
+          // A stale admission waits for the operator, so a nothing-pending preview cannot resubmit in a loop.
+          await openApply({ autoRun: false });
           setStatus(data.message, 'warning', false);
         }
         else if (data.status === 'error') { setStatus('Error: ' + data.message, 'danger', false); setButtons(false); }
@@ -1151,14 +1152,14 @@
       });
     }
 
-    async function openApply() {
+    async function openApply({ autoRun = true } = {}) {
       if (!applyForm || previewLoading) return;
       previewLoading = true;
       try {
         previewCache = {};
         if (confirmBtn) confirmBtn.disabled = true;
         var d = await fetchPreview('cli');
-        if (d.can_apply === true && d.nothing_pending) { runAction(applyForm); return; }
+        if (autoRun && d.can_apply === true && d.nothing_pending) { runAction(applyForm); return; }
         modalBody.innerHTML = renderPreview(diffMode === 'native' ? await fetchPreview('native') : d);
         showModal();
       } catch (e) { setStatus('Could not load apply preview: ' + e.message, 'warning', false); }
