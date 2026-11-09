@@ -21,7 +21,7 @@ from netbox_nso_plugin.settlement import consume_static_route_settlements
 from netbox_nso_plugin.settlement_acknowledgement import AcknowledgementRefused, acknowledge
 from netbox_nso_plugin.settlement_issue import publish_stall_issue
 
-from ._adapter_http import make_generation_listing, make_response
+from ._adapter_http import make_generation_listing, make_response, make_stored_preflight
 from ._bgp_settlement import BGPSettlementHelpers
 from ._settlement_observation import INCARNATION, failed_item, published_job, serve_observation
 from ._settlement_wire import generation_wire, job_wire
@@ -220,7 +220,7 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
         applied = {}
         for owner in self.owners:
             owner.refresh_from_db()
-            applied[owner.pk] = owner.last_apply_at
+            applied[(owner._meta.label_lower, owner.pk)] = owner.last_apply_at
         with patch("netbox_nso_plugin.adapter_client.trigger_apply", side_effect=AssertionError("no Apply")):
             receipt = acknowledge(issue, issue.revision_digest, operator, "  the carrier result cannot be read  ")
         self.assertFalse(receipt.replayed)
@@ -255,7 +255,7 @@ class TestSettlementIssueAcknowledgement(SettlementIssueHelpers, BGPSettlementHe
             self.assertEqual(owner.status, "apply_failed")
             self.assertEqual(owner.last_apply_error, ADVISORY.format(501))
             self.assertEqual(owner.apply_attempt_id, self.attempt.pk)
-            self.assertEqual(owner.last_apply_at, applied[owner.pk])
+            self.assertEqual(owner.last_apply_at, applied[(owner._meta.label_lower, owner.pk)])
             fence = NSOOverlaySettlementFence.objects.get(model_label=owner._meta.label_lower, overlay_pk=owner.pk)
             self.assertEqual((fence.current_attempt_id, fence.last_execution_id), (self.attempt.pk, execution.pk))
         self.assertEqual(
@@ -697,10 +697,17 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
             adapter_device_id=self.management.adapter_device_id,
             source_epoch=self.management.adapter_source_epoch,
             selected={"bgp": 999},
+            preflight=make_stored_preflight({"bgp": 999}),
             scope_revisions={"bgp": 1},
+            send_seq=1,
         )
         issue = self.stall_history()
         self.assertIn(str(lost.pk), issue.proposal["attempt_locks"])
+        lost.refresh_from_db()
+        self.assertEqual(lost.send_seq, 2)
+        before = NSOApplyAttempt.objects.values().get(pk=lost.pk)
+        self.assertEqual(publish_stall_issue(self.management).pk, issue.pk)
+        self.assertEqual(NSOApplyAttempt.objects.values().get(pk=lost.pk), before)
         armed, outcome = [], {}
 
         def record_answer(_document):
@@ -722,6 +729,31 @@ class TestHistoricalAcknowledgement(SettlementIssueHelpers, HistoricalStore, BGP
         self.assertEqual(outcome, {"recorded": False})
         lost.refresh_from_db()
         self.assertIsNone(lost.response)
+
+    def test_an_unsent_preview_of_the_obligation_selection_does_not_block_its_acknowledgement(self):
+        self.serve_history()
+        # The second preview has no stored preflight because its adapter preflight call failed.
+        previews = [
+            NSOApplyAttempt.objects.create(
+                management=self.management,
+                adapter_device_id=self.management.adapter_device_id,
+                source_epoch=self.management.adapter_source_epoch,
+                selected={"bgp": 999},
+                preflight=preflight,
+                scope_revisions={"bgp": 1},
+            )
+            for preflight in (make_stored_preflight({"bgp": 999}), None)
+        ]
+        issue = self.stall_history()
+        self.assertIsNotNone(issue)
+        self.assertFalse({str(preview.pk) for preview in previews} & set(issue.proposal["attempt_locks"]))
+        acknowledge(issue, issue.revision_digest, self.operator(), "pre-ledger generation")
+        issue.refresh_from_db()
+        self.assertEqual(issue.state, "acknowledged")
+        open_previews = NSOApplyAttempt.objects.filter(
+            pk__in=[preview.pk for preview in previews], lifecycle="open", response__isnull=True
+        )
+        self.assertEqual(open_previews.count(), 2)
 
     def assert_no_exit(self, code):
         issue = self.stall_history()

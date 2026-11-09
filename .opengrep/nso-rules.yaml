@@ -17,6 +17,20 @@ rules:
     paths:
       include: ["netbox_nso_plugin/apply_settlement.py"]
 
+  - id: nso-settlement-record-response-bypass
+    languages: [python]
+    severity: ERROR
+    message: Record a settlement replay answer through _record_replayed_response so a contradiction stalls the feed.
+    patterns:
+      - pattern-either:
+          - pattern: record_response(...)
+          - pattern: $M.record_response(...)
+      - pattern-not-inside: |
+          def _record_replayed_response(...):
+              ...
+    paths:
+      include: ["netbox_nso_plugin/apply_settlement.py"]
+
   - id: nso-unreleased-generation-listing-evidence-check
     languages: [python]
     severity: ERROR
@@ -1126,3 +1140,18 @@ rules:
           ...
     paths:
       exclude: ["netbox_nso_plugin/tests/**"]
+
+  - id: nso-unsent-preview-predicate-copy
+    languages: [python]
+    severity: ERROR
+    message: A manual attempt without an adapter identity can be a pre-ledger send. Read models.UNSENT_MANUAL_PREVIEW instead of a copy of its fields.
+    patterns:
+      - pattern-either:
+          - pattern: '$Q(..., trigger_kind="manual", ..., adapter_apply_attempt_id__isnull=True, ...)'
+          - pattern: '$Q(..., adapter_apply_attempt_id__isnull=True, ..., trigger_kind="manual", ...)'
+          - pattern: '$A.trigger_kind == "manual" and $A.adapter_apply_attempt_id is None'
+          - pattern: '$A.adapter_apply_attempt_id is None and $A.trigger_kind == "manual"'
+      - pattern-not-inside: 'UNSENT_MANUAL_PREVIEW = $DEFINITION'
+      - pattern-not-inside: '$M.CheckConstraint(...)'
+    paths:
+      exclude: ["netbox_nso_plugin/tests/**", "netbox_nso_plugin/migrations/**"]

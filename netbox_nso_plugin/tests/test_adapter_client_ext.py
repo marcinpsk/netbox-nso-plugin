@@ -1391,13 +1391,13 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
         apply_attempt_id = "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8"
 
-        result = trigger_apply(5, apply_attempt_id, selector)
+        result = trigger_apply(5, apply_attempt_id, selector, "a" * 64)
 
         self.assertEqual(result, promoted)
         _, kwargs = session.request.call_args
         self.assertEqual(
             kwargs["json"],
-            {"apply_attempt_id": apply_attempt_id, "selected": {"vlan": 4711}},
+            {"apply_attempt_id": apply_attempt_id, "selected": {"vlan": 4711}, "preflight_identity": "a" * 64},
         )
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
@@ -1422,6 +1422,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
                 5,
                 "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
                 MappingProxyType({"unknown": 9}),
+                "a" * 64,
             )
 
         self.assertEqual(raised.exception.status_code, 422)
@@ -1447,6 +1448,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
                 5,
                 "8a2c9231-7ad8-4b17-a4b8-f5b4df745dd8",
                 MappingProxyType({"vlan": 4712}),
+                "a" * 64,
             )
 
         self.assertEqual(raised.exception.status_code, 409)

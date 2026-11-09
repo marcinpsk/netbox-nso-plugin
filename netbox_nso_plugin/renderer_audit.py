@@ -134,7 +134,7 @@ def _repair_plan(device_id: int, scope: str) -> RendererMutationPlan:
 
         # Two questions, two candidate sets. Only a row with a next hop is rendered, so only
         # that row needs a fresh generation. Apply promotes rows WITHOUT that condition
-        # (``apply_state.promote_current_intent``), so every deploying row has to be
+        # (``durable_capture.promote_snapshots``), so every deploying row has to be
         # demotable or an interface-next-hop route stays deploying for good.
         rows = (
             NSOStaticRouteState.objects.filter(

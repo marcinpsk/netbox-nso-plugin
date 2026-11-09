@@ -11,6 +11,7 @@ from django.urls import reverse
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._manual_capture_case import post_apply
 from ._settlement_wire import generation_wire, job_wire
 from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
@@ -1294,7 +1295,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
                 before[(row._meta.label_lower, row.pk)],
             )
-        self.assertFalse(self.attempt.overlay_snapshots.exclude(settlement_disposition="unresolved").exists())
+        self.assert_unresolved_snapshots(self.attempt, self.owners)
 
     def test_noop_restore_rolls_back_when_another_generation_has_a_missing_owner(self):
         import requests
@@ -1314,10 +1315,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             raise requests.ConnectionError("The admission response was lost.")
 
         self.adapter.apply_response = lost_answer
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(answer.status_code, 502, answer.content)
         no_op = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         self.assertNotEqual(no_op.pk, manual.pk)
@@ -1349,7 +1347,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             settle_apply_attempts(self.management, evidence)
         vlan.refresh_from_db()
         self.assertEqual((vlan.status, vlan.last_apply_at, vlan.last_apply_error, vlan.apply_attempt_id), before)
-        self.assertFalse(no_op.overlay_snapshots.exclude(settlement_disposition="unresolved").exists())
+        self.assert_unresolved_snapshots(no_op, [*self.owners, vlan])
         self.assertEqual(NSOApplyExecution.objects.get().consumption_state, "unconsumed")
 
     def test_coalesced_head_uuid_binds_only_its_manual_generations(self):
@@ -1510,10 +1508,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 return 202, response
 
             self.adapter.apply_response = admission
-            answer = self.client.post(
-                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-            )
+            answer = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
             self.assertEqual(answer.status_code, 200, answer.content)
             self.attempt = NSOApplyAttempt.objects.get(
                 pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"])
@@ -1720,7 +1715,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             else:
                 self.assertEqual(row.status, "in_sync")
                 self.assertEqual(row.last_apply_at.isoformat(), generation["updated_at"])
-        self.assertFalse(self.attempt.overlay_snapshots.exclude(settlement_disposition="unresolved").exists())
+        self.assert_unresolved_snapshots(self.attempt, self.owners)
 
     def test_historical_selection_without_owner_revision_cannot_settle(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError

@@ -19,6 +19,7 @@ from netbox_nso_plugin.models import NSOPlatformNedMapping, NSOSVIState, NSOVLAN
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_session
+from ._manual_capture_case import post_apply
 from ._outbox_case import (
     CFG,
     ReceiptAdapter,
@@ -198,10 +199,7 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         config, session = adapter.patches()
         with config, session:
             drain.push_now(self.device.pk, "svi", force=True)
-            response = self.client.post(
-                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"]),
-                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-            )
+            response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
         snapshots = [request for request in adapter.requests if request["url"].endswith("/svi-intent")]
@@ -395,7 +393,9 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
 
     def test_bad_owned_row_blocks_the_snapshot_until_repaired(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.views import ApplyPreparationRefused, _prepare_apply
+        from netbox_nso_plugin.views import ApplyPreparationRefused
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         vlan = self._vlan(10)
         other_vlan = self._vlan(1723)
@@ -427,7 +427,7 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
             self.management.refresh_from_db()
             self.assertEqual(self.management.intent_push_errors["svi"]["code"], "validation_error")
             with self.assertRaises(ApplyPreparationRefused):
-                _prepare_apply(self.management)
+                prepare_and_confirm_apply(self.management)
             self.assertEqual(
                 [request for request in adapter.requests if request["url"].endswith("/svi-intent")], acknowledged
             )
@@ -567,12 +567,7 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
                 config, session = adapter.patches()
                 with config, session:
                     drain.push_now(self.device.pk, "svi", mode=MODE_STORE_ONLY, force=True)
-                    apply_response = self.client.post(
-                        reverse(
-                            "plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"]
-                        ),
-                        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-                    )
+                    apply_response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
                 self.assertEqual(apply_response.status_code, 200)
                 self.assertEqual(apply_response.json()["status"], "ok")
                 requests = [request for request in adapter.requests if request["url"].endswith("/svi-intent")]

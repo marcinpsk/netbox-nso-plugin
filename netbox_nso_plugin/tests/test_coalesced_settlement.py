@@ -7,6 +7,7 @@ import copy
 import pytest
 
 from ._bgp_settlement import BGPSettlementHelpers
+from ._manual_capture_case import post_apply
 from ._settlement_wire import generation_wire
 from .test_durable_bgp_capture import BGPCaptureCase
 from .test_refusal_contract import generation
@@ -75,8 +76,6 @@ class CoalescedCarrierHelpers:
     def prepare_carrier(self):
         from uuid import UUID
 
-        from django.urls import reverse
-
         from netbox_nso_plugin.models import NSOApplyAttempt
 
         from ._outbox_case import own_vlan
@@ -100,10 +99,7 @@ class CoalescedCarrierHelpers:
             return 202, response
 
         self.adapter.apply_response = admission
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200, response.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         first = self.evidence(dispositions={"bgp.router": "in_sync", "vlan.vlan": "in_sync"})

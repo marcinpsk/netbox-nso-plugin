@@ -226,6 +226,23 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
 
 
 class TestDeploymentProbe(DeploymentCase):
+    def test_late_probe_rejection_preserves_the_recorded_admission(self):
+        from netbox_nso_plugin.deployment_probe import _finish_rejected
+
+        self.probe()
+        self.assertEqual(self.attempt.send_seq, 1)
+        before = NSOApplyAttempt.objects.values().get(pk=self.attempt.pk)
+        snapshots = list(self.attempt.overlay_snapshots.values())
+        self.assertFalse(
+            _finish_rejected(
+                self.attempt,
+                status=401,
+                response={"error": {"code": "unauthorized", "message": "Placeholder rejection"}},
+            )
+        )
+        self.assertEqual(NSOApplyAttempt.objects.values().get(pk=self.attempt.pk), before)
+        self.assertEqual(list(self.attempt.overlay_snapshots.values()), snapshots)
+
     def acknowledged_failed_item(self):
         """Return a failed adapter row for an obligation that an acknowledged issue released."""
         from django.utils import timezone
@@ -899,6 +916,43 @@ class TestDeploymentProbe(DeploymentCase):
             NSOApplyExecution.objects.filter(attempt_id__in=attempts, consumption_state="consumed").count(), 3
         )
 
+    def test_paired_verification_ignores_an_unsent_preview_and_blocks_a_submitted_manual_attempt(self):
+        from ._adapter_http import make_stored_preflight
+
+        attempts = self.paired_probes()
+        settled = [str(pk) for pk in attempts]
+        # A submitted attempt, and a pre-ledger attempt that may have been sent, are both in flight.
+        for identity in ({"adapter_apply_attempt_id": uuid4()}, {"pre_ledger": True}):
+            with self.subTest(**{key: str(value) for key, value in identity.items()}):
+                in_flight = NSOApplyAttempt.objects.create(
+                    management=self.management,
+                    adapter_device_id=self.management.adapter_device_id,
+                    trigger_kind="manual",
+                    selected={"bgp": 1},
+                    **identity,
+                )
+                with self.assertRaisesRegex(CommandError, "Unanswered or unconsumed attempts remain"):
+                    self.command(verify=True, device_id=self.device.pk, settled_probe=settled)
+                self.assertTrue(deployment.is_quiesced())
+                in_flight.delete()
+        # One preview stored its preflight; the adapter preflight call of the other one failed.
+        previews = [
+            NSOApplyAttempt.objects.create(
+                management=self.management,
+                adapter_device_id=self.management.adapter_device_id,
+                trigger_kind="manual",
+                selected={"bgp": 1},
+                preflight=preflight,
+            )
+            for preflight in (make_stored_preflight({"bgp": 1}), None)
+        ]
+        output = self.command(verify=True, device_id=self.device.pk, settled_probe=settled)
+        self.assertIn("normal intent operation resumed", output)
+        self.assertFalse(deployment.is_quiesced())
+        self.assertEqual(
+            NSOApplyAttempt.objects.filter(pk__in=[row.pk for row in previews], lifecycle="open").count(), 2
+        )
+
     def test_paired_verification_refuses_a_store_that_changed_after_the_generation_listing(self):
         from netbox_nso_plugin import adapter_client
 
@@ -1368,6 +1422,40 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertEqual(len(self.adapter.apply_requests), 1)
         self.assertEqual(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id, attempt.pk)
         self.assertTrue(deployment.is_quiesced())
+
+    def test_a_failed_probe_send_claim_rolls_back_its_promotion(self):
+        from django.db import OperationalError, connection
+
+        from .test_apply_selector import _promoted
+
+        self._prepare_bgp_observation_capture()
+        deployment.quiesce(paired_activation=True)
+        self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
+
+        def admission(selected):
+            response = _promoted(selected)
+            response["generations"] = response["generations"][:1]
+            return 202, response
+
+        def fail_the_send_claim(execute, sql, params, many, context):
+            if sql.startswith("UPDATE") and '"send_seq"' in sql:
+                raise OperationalError("canceling statement due to lock timeout")
+            return execute(sql, params, many, context)
+
+        self.adapter.apply_response = admission
+        attempt_id = uuid4()
+        with connection.execute_wrapper(fail_the_send_claim), self.assertRaises(OperationalError):
+            self.command(start_probe=str(attempt_id), device_id=self.device.pk)
+        attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+        self.assertIsNone(attempt.adapter_apply_attempt_id)
+        self.assertEqual(attempt.send_seq, 0)
+        self.assertEqual(self.adapter.apply_requests, [])
+
+        self.command(start_probe=str(attempt_id), device_id=self.device.pk)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.adapter_apply_attempt_id, attempt.pk)
+        self.assertEqual(attempt.send_seq, 1)
+        self.assertEqual(len(self.adapter.apply_requests), 1)
 
     def test_malformed_no_op_probe_keeps_unresolved_snapshots(self):
         from .test_apply_selector import _promoted

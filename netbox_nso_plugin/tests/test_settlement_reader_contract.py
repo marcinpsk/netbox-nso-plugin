@@ -30,6 +30,7 @@ SETTLEMENT_EVIDENCE_READERS = frozenset(
 )
 ADAPTER_LOCAL_HELPERS = frozenset(
     {
+        "AdapterError",
         "EvidenceItem",
         "InvalidJobEvidence",
         "_validated_job",
@@ -54,7 +55,7 @@ def _read_response(reader):
     if reader == "get_intent_receipts":
         return adapter_client.get_intent_receipts(device_id=7)
     if reader == "trigger_apply":
-        return adapter_client.trigger_apply(7, UUID(int=1), {"bgp": 1})
+        return adapter_client.trigger_apply(7, UUID(int=1), {"bgp": 1}, "a" * 64)
     if reader == "get_deployment_evidence":
         return adapter_client.get_deployment_evidence(7, [])
     if reader == "get_settlement_observation":

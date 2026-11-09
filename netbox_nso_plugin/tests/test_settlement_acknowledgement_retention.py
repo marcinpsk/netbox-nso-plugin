@@ -89,8 +89,11 @@ class TestHistoricalAcknowledgementRetention(
 
         # The adapter still lists the generation, so the acknowledged disposition must stay.
         result = self.prune_after_retention()
-        self.assertEqual((result.eligible, result.deleted), (0, 0))
         self.assertTrue(NSOApplyExecution.objects.filter(pk=execution.pk, consumption_state="acknowledged").exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=execution.attempt_id).exists())
+        self.assertEqual({row.pk: self.audit(row) for row in (superseded, issue)}, audits)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=self.prior_attempt.pk).exists())
+        self.assertEqual((result.eligible, result.deleted), (1, 1))
         self.assertTrue(consume_static_route_settlements(self.management).drained)
 
         # Adapter-side retention drops the generation; the local history is then free to go.
@@ -108,6 +111,23 @@ class TestHistoricalAcknowledgementRetention(
         self.assertTrue(consume_static_route_settlements(self.management).drained)
         self.management.refresh_from_db()
         self.assertEqual(self.management.settle_evidence_error, {})
+
+    def test_expired_pre_ledger_attempt_stays_while_an_open_issue_reads_its_answer(self):
+        self.serve_history()
+        attempt = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            selected={"bgp": 999},
+            scope_revisions={"bgp": 1},
+            pre_ledger=True,
+        )
+        self.assertTrue(consume_static_route_settlements(self.management).stalled)
+        issue = NSOSettlementIssue.objects.get(state="open")
+        self.assertIn(str(attempt.pk), issue.proposal["attempt_locks"])
+        audit = self.audit(issue)
+        self.prune_after_retention()
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertEqual(self.audit(issue), audit)
 
 
 class TestOwnerAcknowledgementRetention(

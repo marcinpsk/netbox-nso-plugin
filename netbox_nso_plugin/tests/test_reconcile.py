@@ -75,6 +75,10 @@ def _patch_apply_pushes(answers=None, *, apply_error=None):
 
     class PreparationAdapter(ReceiptAdapter):
         def _handle(self, method, url, **kwargs):
+            if method == "POST" and url.endswith("/actions/apply-preflight"):
+                from ._adapter_http import make_apply_preflight
+
+                return make_response(200, make_apply_preflight(kwargs["json"]["selected"]))
             if method == "POST" and url.endswith("/actions/apply") and apply_error is not None:
                 if apply_error.status_code is None:
                     raise requests.ConnectionError("Apply admission answer was lost.")
@@ -729,13 +733,13 @@ class TestStaticRouteApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
         return mgmt, row
 
-    def test_prepare_apply_marks_accepted_static_route_deploying(self):
-        from netbox_nso_plugin.views import _prepare_apply
+    def test_confirmed_apply_marks_accepted_static_route_deploying(self):
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         mgmt, row = self._setup(status_="accepted")
         # A stored count, not a bare mock: the promotion gate reads the count.
         with _patch_apply_pushes({"static_route": {"device_id": 89, "count": 1, "routes": []}}) as push:
-            _prepare_apply(mgmt)
+            prepare_and_confirm_apply(mgmt)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
         # And the owned snapshot is re-sent under its own forced claim, so a stale adapter
@@ -749,13 +753,13 @@ class TestStaticRouteApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         row in 'deploying' against intent the adapter may not be holding, and no apply
         result can then name it.
         """
-        from netbox_nso_plugin.views import _prepare_apply
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         for tag, answer in (("sr-nondict", "stored"), ("sr-nocount", {"device_id": 89, "routes": []})):
             with self.subTest(answer=answer):
                 mgmt, row = self._setup(status_="accepted", tag=tag)
                 with _patch_apply_pushes({"static_route": answer}):
-                    _prepare_apply(mgmt)
+                    prepare_and_confirm_apply(mgmt)
                 row.refresh_from_db()
                 self.assertEqual(row.status, "accepted")
 
@@ -787,12 +791,12 @@ class TestL2SapApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         )
         return mgmt, row
 
-    def test_prepare_apply_marks_accepted_l2_sap_deploying(self):
-        from netbox_nso_plugin.views import _prepare_apply
+    def test_confirmed_apply_marks_accepted_l2_sap_deploying(self):
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         mgmt, row = self._setup(status_="accepted")
         with _patch_apply_pushes() as push:
-            _prepare_apply(mgmt)
+            prepare_and_confirm_apply(mgmt)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
         # And the owned snapshot is re-sent under its own forced claim, so a stale adapter
@@ -829,12 +833,12 @@ class TestRoutePolicyApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
         return mgmt, row
 
-    def test_prepare_apply_marks_accepted_route_policy_deploying(self):
-        from netbox_nso_plugin.views import _prepare_apply
+    def test_confirmed_apply_marks_accepted_route_policy_deploying(self):
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         mgmt, row = self._setup(status_="accepted")
         with _patch_apply_pushes():
-            _prepare_apply(mgmt)
+            prepare_and_confirm_apply(mgmt)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
@@ -842,11 +846,11 @@ class TestRoutePolicyApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         """Apply re-sends the owned interface snapshot (status-based) under a forced claim, so
         an owned attribute whose adapter intent went stale is actually re-applied instead of
         silently dropped. Ownership is kept durable by the reconciler's owned-guard."""
-        from netbox_nso_plugin.views import _prepare_apply
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         mgmt, _row = self._setup(status_="accepted")
         with _patch_apply_pushes() as push:
-            _prepare_apply(mgmt)
+            prepare_and_confirm_apply(mgmt)
         self.assertEqual(_forced_scopes(push, mgmt.device_id).count("interface"), 1)
 
     def test_prepare_apply_force_pushes_owned_route_policy_intent(self):
@@ -854,11 +858,11 @@ class TestRoutePolicyApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         route-policy object whose adapter intent went stale/empty otherwise applies 0 items and
         the row sticks in 'deploying' forever — observed on rg03, where an owned as-path had NO
         adapter intent row, so Apply pushed nothing and the row never settled."""
-        from netbox_nso_plugin.views import _prepare_apply
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         mgmt, _row = self._setup(status_="accepted")
         with _patch_apply_pushes() as push:
-            _prepare_apply(mgmt)
+            prepare_and_confirm_apply(mgmt)
         self.assertEqual(_forced_scopes(push, mgmt.device_id).count("route_policy"), 1)
 
     def test_prepare_apply_force_pushes_deferred_scopes(self):
@@ -867,11 +871,11 @@ class TestRoutePolicyApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         but that mirror can go stale/empty (a failed push, an out-of-band adapter reset). Without a
         forced claim, Apply marks the row 'deploying' but the acknowledged baseline drops the send →
         0 items applied → the row sticks in 'deploying' forever (route-policy's rg03 failure mode)."""
-        from netbox_nso_plugin.views import _prepare_apply
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         mgmt, _row = self._setup(status_="accepted")
         with _patch_apply_pushes() as push:
-            _prepare_apply(mgmt)
+            prepare_and_confirm_apply(mgmt)
         forced = _forced_scopes(push, mgmt.device_id)
         for scope in ("svi", "subinterface", "bfd", "interface_mtu"):
             self.assertEqual(forced.count(scope), 1, scope)
@@ -892,7 +896,8 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
     def test_prepare_apply_force_pushes_snmp_snapshot(self):
         from netbox_nso_plugin.models import NSOSnmpHostState
-        from netbox_nso_plugin.views import _prepare_apply
+
+        from ._manual_capture_case import prepare_and_confirm_apply
 
         with without_commit_drain(), transaction.atomic():
             device = _make_device("snmp-apply")
@@ -914,7 +919,7 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         adapter = ReceiptAdapter()
         config, session = adapter.patches()
         with config, session:
-            _prepare_apply(mgmt)
+            prepare_and_confirm_apply(mgmt)
         pushes = [request for request in adapter.requests if request["url"].endswith("/snmp-intent")]
         self.assertEqual(len(pushes), 1)
         self.assertIn(f"/devices/{mgmt.adapter_device_id}/", pushes[0]["url"])
@@ -955,8 +960,10 @@ class TestApplyRollbackOnAdapterError(_CascadeFlushMixin, IntentPushResetMixin, 
 
         admin = get_user_model().objects.create_superuser(username="apply-rb-admin", password="pw", email="a@x.y")  # noqa: S106
         self.client.force_login(admin)
+        from ._manual_capture_case import post_apply
+
         with _patch_apply_pushes(apply_error=error):
-            return self.client.post(f"/plugins/nso/device-management/{mgmt.pk}/actions/apply/")
+            return post_apply(self.client, mgmt)
 
     def test_an_ambiguous_transport_failure_keeps_deploying_for_reconciliation(self):
         from netbox_nso_plugin.adapter_client import AdapterError
