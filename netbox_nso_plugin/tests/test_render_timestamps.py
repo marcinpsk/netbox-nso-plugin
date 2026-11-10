@@ -46,6 +46,7 @@ def test_candidate_and_persisted_wire_bodies_keep_explicit_acceptance_times(scop
         row.accepted_at = ACCEPTED_AT.astimezone(timezone(timedelta(hours=2)))
     batch = CandidateBatch(rows, relations)
     candidate = wire_body(scope, delivery.render(scope, device.pk, management.adapter_device_id, candidates=batch))
+    checked = []
 
     def check_timestamps(value):
         if isinstance(value, list):
@@ -54,6 +55,7 @@ def test_candidate_and_persisted_wire_bodies_keep_explicit_acceptance_times(scop
         elif isinstance(value, dict):
             if scope in delivery.direct_keys():
                 assert value["accepted_at"] == ACCEPTED_AT.isoformat()
+                checked.append(value)
                 return
             for key, item in value.items():
                 if key in {
@@ -70,8 +72,10 @@ def test_candidate_and_persisted_wire_bodies_keep_explicit_acceptance_times(scop
                 }:
                     for row in item:
                         assert row["accepted_at"] == ACCEPTED_AT.isoformat()
+                        checked.append(row)
 
     check_timestamps(candidate)
+    assert checked, f"no accepted_at value was checked for scope {scope}"
     persist_candidates(rows, relations)
     confirmed = wire_body(scope, delivery.render(scope, device.pk, management.adapter_device_id))
     assert candidate == confirmed
