@@ -17,6 +17,7 @@ from uuid import uuid4
 import pytest
 from _fake_nso import fake_nso
 from django.conf import settings
+from django.utils import timezone
 from django.utils.functional import empty
 
 pytestmark = pytest.mark.skipif(
@@ -55,6 +56,7 @@ def test_generation_wire_keys_match_the_live_adapter_contract():
         prepared = client.apply_lag_config(
             device_id,
             [{"name": "Port-channel1", "lag_id": 1, "members": []}],
+            accepted_at=timezone.now().isoformat(),
             deleted_roots=[],
             source_revision=1,
         )

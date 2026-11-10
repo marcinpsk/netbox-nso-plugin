@@ -22,6 +22,7 @@ from django.utils import timezone
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
 from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
@@ -403,6 +404,7 @@ class TestRekeyedNativeDelete(_SignalDBBase):
             algo_id=130,
             isis_flex_algo=flex_algo,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
             state.save()
@@ -2200,7 +2202,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 name=str(local_as.asn),
             )
             scope = BGPScope.objects.create(router=router)
-            acquire_bgp_router(mgmt, router)
+            router_state = acquire_bgp_router(mgmt, router)
             peer = BGPPeer.objects.create(
                 scope=scope,
                 peer=IPAddress.objects.create(address="198.18.0.2/32"),
@@ -2222,7 +2224,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 {
                     "asn": "64512",
                     "router_id": None,
-                    "accepted_at": None,
+                    "accepted_at": router_state.accepted_at.isoformat(),
                     "scopes": [{"vrf": "", "address_families": [], "peers": []}],
                 }
             ],
@@ -2256,7 +2258,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 destination_id=address_family.pk,
                 source_protocol="connected",
             )
-            acquire_bgp_router(mgmt, router)
+            router_state = acquire_bgp_router(mgmt, router)
             row = acquire_overlay(
                 NSORedistributionState,
                 management=mgmt,
@@ -2274,7 +2276,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 {
                     "asn": "64512",
                     "router_id": None,
-                    "accepted_at": None,
+                    "accepted_at": router_state.accepted_at.isoformat(),
                     "scopes": [
                         {
                             "vrf": "",
@@ -2428,7 +2430,9 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         )
         self.assertEqual(roots, {root_name} if root_name else set())
         self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope=scope).exists())
-        snapshot = delivery.render(scope, self.device.pk, row.management.adapter_device_id).payload
+        snapshot = delivery.render(scope, self.device.pk, row.management.adapter_device_id).payload[
+            "bundles" if scope == "lacp" else "interfaces"
+        ]
         if scope == "lacp" and root_name is None:
             self.assertEqual(len(snapshot), 1)
             self.assertEqual(snapshot[0]["members"], [])
@@ -2511,7 +2515,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
         group = VLANGroup.objects.create(name="SVI device VLANs", slug=f"nso-{self.device.pk}")
         vlan = VLAN.objects.create(group=group, vid=444, name="do-v444")
         interface = Interface.objects.create(device=self.device, name="irb.7", type="virtual")
-        state = NSOSVIState(management=mgmt, interface=interface, vlan=vlan, svi_type="irb", status="accepted")
+        state = NSOSVIState(
+            management=mgmt, interface=interface, vlan=vlan, svi_type="irb", status="accepted", accepted_at=ACCEPTED_AT
+        )
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         plan = RendererMutationPlan.build(
@@ -2570,7 +2576,12 @@ class TestDeleteOriginMarking(_SignalDBBase):
         native = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
         mgmt = self._mgmt()
         state = NSOISISFlexAlgoState(
-            management=mgmt, process_tag="CORE", algo_id=130, isis_flex_algo=native, status="accepted"
+            management=mgmt,
+            process_tag="CORE",
+            algo_id=130,
+            isis_flex_algo=native,
+            status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         with self._arranged():
             self._save_with_writer(state, natural_key=("management", "process_tag", "algo_id"))
@@ -2591,7 +2602,12 @@ class TestDeleteOriginMarking(_SignalDBBase):
         native = ISISInterface.objects.create(interface=self.iface, address_family="ipv4", instance=instance)
         mgmt = self._mgmt()
         state = NSOISISInterfaceState(
-            management=mgmt, interface=self.iface, isis_interface=native, af="ipv4", status="accepted"
+            management=mgmt,
+            interface=self.iface,
+            isis_interface=native,
+            af="ipv4",
+            status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         with self._arranged():
             self._save_with_writer(state, natural_key=("management", "interface", "af"))
@@ -2763,6 +2779,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
             algo_id=130,
             isis_flex_algo=flex_algo,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         with self._arranged(), intent_transaction(footprint_for_instance(state)):
             save_overlay_fixture(state)
@@ -2915,6 +2932,7 @@ class TestNativeDeviceReassignment(_SignalDBBase):
             algo_id=132,
             isis_flex_algo=flex_algo,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
             state.save()
@@ -2978,7 +2996,9 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
 
         management = self._make_mgmt(adapter_device_id=42)
         other = self._second_managed_device()
-        state = NSOISISFlexAlgoState(management=management, process_tag="CORE", algo_id=133, status="accepted")
+        state = NSOISISFlexAlgoState(
+            management=management, process_tag="CORE", algo_id=133, status="accepted", accepted_at=ACCEPTED_AT
+        )
         with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
             save_overlay_fixture(state)
 
@@ -3015,7 +3035,9 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
         from netbox_nso_plugin.signals import suppress_intent_push
 
         management = self._make_mgmt(adapter_device_id=42)
-        state = NSOISISFlexAlgoState(management=management, process_tag="CORE", algo_id=134, status="accepted")
+        state = NSOISISFlexAlgoState(
+            management=management, process_tag="CORE", algo_id=134, status="accepted", accepted_at=ACCEPTED_AT
+        )
         with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
             save_overlay_fixture(state)
         revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis_flex_algo")

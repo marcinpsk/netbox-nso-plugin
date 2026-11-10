@@ -95,7 +95,7 @@ PRODUCERS = {
 }
 
 CONTINUATIONS = {
-    ("apply_preflight.py", "ApplyPreflight"): (1, "Wire verdict declarations do not acquire overlay ownership."),
+    ("apply_preflight.py", "_PreflightEvidence"): (1, "Wire verdict declarations do not acquire overlay ownership."),
     ("apply_preflight.py", "StreamVerdict"): (1, "Wire verdict declarations do not acquire overlay ownership."),
     ("durable_capture.py", "_snapshot"): (3, "Snapshot values do not acquire overlay ownership."),
     ("durable_capture.py", "record_preflight"): (2, "Only repends blocked rows that already have ownership."),

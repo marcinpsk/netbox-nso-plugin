@@ -687,7 +687,7 @@ class TestV3PushDerivation(_SecretBase):
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         mgmt = self._make_mgmt(adapter_device_id=4203)
-        acquire_overlay(
+        user = acquire_overlay(
             NSOSnmpV3UserState,
             management=mgmt,
             username="monitor",
@@ -716,6 +716,7 @@ class TestV3PushDerivation(_SecretBase):
             community_hash="oldhash1234567890",
             port=1162,
         )
+        self.assertIsNotNone(user.accepted_at)
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
             deliver("snmp", self.device.pk, mgmt.adapter_device_id)
@@ -732,6 +733,7 @@ class TestV3PushDerivation(_SecretBase):
                     "priv_protocol": None,
                     "auth_vault_ref": "network/netbox/snmp/v3/monitor#auth",
                     "priv_vault_ref": None,
+                    "accepted_at": user.accepted_at.isoformat(),
                 }
             ],
         )

@@ -9,6 +9,7 @@ from django.test import TestCase
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin
 
@@ -132,6 +133,7 @@ class TestFlexAlgoOwnershipSignals(_FlexAlgoBase):
             algo_id=130,
             isis_flex_algo=native,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),

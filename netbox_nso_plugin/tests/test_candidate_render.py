@@ -16,7 +16,7 @@ from netbox_nso_plugin.candidate_render import CandidateBatch, bind_candidates, 
 from netbox_nso_plugin.models import NSOInterfaceIPState, NSOInterfaceMtuState
 from netbox_nso_plugin.renderer_writer import planned_m2m_set
 
-from ._candidate_render_case import persist_candidates, render_candidates
+from ._candidate_render_case import ACCEPTED_AT, persist_candidates, render_candidates
 from ._outbox_case import make_managed
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -25,12 +25,30 @@ def payload_bytes(payload):
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode()
 
 
+def timestamped_characterization(snapshot):
+    """Add only the reviewed acceptance fields to the independent pre-candidate capture."""
+    payloads = {key: json.loads(value) for key, value in snapshot.items()}
+    for key in ("interface_mtu", "vlan", "static_route", "isis_flex_algo", "route_policy"):
+        for item in payloads[key]:
+            item["accepted_at"] = ACCEPTED_AT.isoformat()
+    for group in payloads["isis"]:
+        for item in group:
+            item["accepted_at"] = ACCEPTED_AT.isoformat()
+    for group in payloads["ospf"].values():
+        for item in group:
+            item["accepted_at"] = ACCEPTED_AT.isoformat()
+    # Switching moves its list inside an envelope because the adapter accepts only a top-level time.
+    for scope, field in (("lacp", "bundles"), ("switchport", "interfaces")):
+        payloads[scope] = {field: payloads[scope], "accepted_at": ACCEPTED_AT.isoformat()}
+    return {key: payload_bytes(value).decode() for key, value in payloads.items()}
+
+
 class TestPersistedRenderCharacterization(IntentPushResetMixin, TestCase):
     def test_populated_persisted_renders_match_characterization(self):
         device, management = make_managed("render-characterization", 1788)
         route_ids = {}
         for index in (2, 1):
-            rows, relations = render_candidates(device, management, index)
+            rows, relations = render_candidates(device, management, index, rich=True)
             persist_candidates(rows, relations)
             route_ids[rows[4].static_route_id] = index
         actual = {}
@@ -41,7 +59,7 @@ class TestPersistedRenderCharacterization(IntentPushResetMixin, TestCase):
             actual[key] = payload_bytes(payload).decode()
         from ._persisted_render_snapshot import PERSISTED_RENDERS
 
-        self.assertEqual(actual, PERSISTED_RENDERS)
+        self.assertEqual(actual, timestamped_characterization(PERSISTED_RENDERS))
 
 
 RENDER_FAMILIES = (
@@ -83,7 +101,15 @@ def test_intend_candidate_render_matches_confirmed_render(family):
         "candidate contribution is missing or the persisted value survived its replacement"
     )
     if family == "mtu-replacement":
-        assert rendered.payload == [{"interface_name": "Ethernet2", "mtu": 9000, "ip_mtu": None, "mpls_mtu": None}]
+        assert rendered.payload == [
+            {
+                "interface_name": "Ethernet2",
+                "mtu": 9000,
+                "ip_mtu": None,
+                "mpls_mtu": None,
+                "accepted_at": "2026-11-01T00:00:00+00:00",
+            }
+        ]
         candidate.pk = retained[2].pk
     persist_candidates(rows, relations)
     confirmed = delivery.render(scope, device.pk, management.adapter_device_id)
@@ -103,7 +129,7 @@ def test_intend_switchport_candidate_renders_planned_tagged_vlans():
     rendered = delivery.render(
         "switchport", device.pk, management.adapter_device_id, candidates=CandidateBatch((candidate,), planned)
     )
-    assert rendered.payload[0]["tagged_vlans"] == [101, 102], "planned VLANs are missing"
+    assert rendered.payload["interfaces"][0]["tagged_vlans"] == [101, 102], "planned VLANs are missing"
     candidate.pk = rows[15].pk
     persist_candidates((candidate,), planned)
     assert payload_bytes(rendered.payload) == payload_bytes(
@@ -208,6 +234,7 @@ def test_candidate_policy_names_follow_database_collation():
                 content_type=ContentType.objects.get_for_model(PrefixList),
                 object_id=policy.pk,
                 status="accepted",
+                accepted_at=ACCEPTED_AT,
             )
         )
     persist_candidates(rows[:1])
@@ -233,6 +260,7 @@ def test_candidate_text_order_matches_database_with_nulls(ordering):
             interface=Interface.objects.create(device=device, name=f"Ethernet{index}", type="1000base-t"),
             process_id=name,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         for index, name in enumerate(("alpha", "Beta", "beta", "Alpha", None), start=1)
     )
@@ -288,7 +316,15 @@ def test_candidate_replaces_an_unowned_row_by_native_identity():
     rendered = delivery.render(
         "interface_mtu", device.pk, management.adapter_device_id, candidates=CandidateBatch((candidate,))
     )
-    assert rendered.payload == [{"interface_name": "Ethernet1", "mtu": 9000, "ip_mtu": None, "mpls_mtu": None}]
+    assert rendered.payload == [
+        {
+            "interface_name": "Ethernet1",
+            "mtu": 9000,
+            "ip_mtu": None,
+            "mpls_mtu": None,
+            "accepted_at": "2026-11-01T00:00:00+00:00",
+        }
+    ]
     candidate.pk = current.pk
     persist_candidates((candidate,))
     assert rendered.payload == delivery.render("interface_mtu", device.pk, management.adapter_device_id).payload
@@ -319,12 +355,12 @@ def test_switchport_candidate_without_planned_m2m_reads_the_stable_existing_rela
     payload = delivery.render(
         "switchport", device.pk, management.adapter_device_id, candidates=CandidateBatch((candidate,))
     ).payload
-    assert payload[0]["tagged_vlans"] == [101]
+    assert payload["interfaces"][0]["tagged_vlans"] == [101]
     cleared = CandidateBatch((candidate,), (planned_m2m_set(candidate, "tagged_vlans", ()),))
     assert (
-        delivery.render("switchport", device.pk, management.adapter_device_id, candidates=cleared).payload[0][
-            "tagged_vlans"
-        ]
+        delivery.render("switchport", device.pk, management.adapter_device_id, candidates=cleared).payload[
+            "interfaces"
+        ][0]["tagged_vlans"]
         == []
     )
 
@@ -334,7 +370,9 @@ def test_candidate_lacp_qualification_runs_after_replacement():
     device, management = make_managed("candidate-lacp-qualification", 17894)
     rows, relations = render_candidates(device, management, 1)
     assert (
-        delivery.render("lacp", device.pk, management.adapter_device_id, candidates=CandidateBatch((rows[14],))).payload
+        delivery.render(
+            "lacp", device.pk, management.adapter_device_id, candidates=CandidateBatch((rows[14],))
+        ).payload["bundles"]
         == []
     )
     persist_candidates(rows, relations)
@@ -344,10 +382,10 @@ def test_candidate_lacp_qualification_runs_after_replacement():
     assert (
         delivery.render(
             "lacp", device.pk, management.adapter_device_id, candidates=CandidateBatch((candidate,))
-        ).payload
+        ).payload["bundles"]
         == []
     )
-    assert len(delivery.render("lacp", device.pk, management.adapter_device_id).payload) == 1
+    assert len(delivery.render("lacp", device.pk, management.adapter_device_id).payload["bundles"]) == 1
 
 
 @pytest.mark.django_db
@@ -404,7 +442,12 @@ def test_bgp_candidate_redistribution_survives_unsaved_observation_rows():
     persist_candidates(retained, relations)
     rows, _ = render_candidates(device, management, 1)
     observation = NSORedistributionState(
-        management=management, dest_protocol="bgp", dest_ref="64514/", source_protocol="static", status="accepted"
+        management=management,
+        dest_protocol="bgp",
+        dest_ref="64514/",
+        source_protocol="static",
+        status="accepted",
+        accepted_at=ACCEPTED_AT,
     )
     batch = CandidateBatch((rows[10], rows[-1], observation))
     payload = delivery.render("bgp", device.pk, management.adapter_device_id, candidates=batch).payload

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
-"""Validate stored-selection admission and project safe operator causes."""
+"""Validate adapter admission evidence and project safe operator causes."""
 
 import re
+from collections.abc import Collection
 from typing import Literal, NotRequired, TypedDict, get_args
 
 from .refusal_contract import ContractError, _require, validate_refusals
@@ -26,7 +27,7 @@ class StreamVerdict(TypedDict):
     context_disturbed: NotRequired[list[str]]
 
 
-class ApplyPreflight(TypedDict):
+class _PreflightEvidence(TypedDict):
     status: PreflightStatus
     streams: dict[str, StreamVerdict]
     baseline_refused: list[str]
@@ -34,11 +35,30 @@ class ApplyPreflight(TypedDict):
     context_disturbed: list[str]
     admitted_selection: dict[str, int]
     skips: dict[str, str]
-    preflight_identity: NotRequired[str]
     diffs: dict[str, str]
     attempts: list[dict]
     refusals: list[dict]
     error: dict | None
+
+
+class ApplyPreflight(_PreflightEvidence):
+    preflight_identity: NotRequired[str]
+
+
+class DeliveryPromotion(TypedDict):
+    stream: str
+    kind: str
+
+
+class DeliveryEffect(TypedDict):
+    promotes: bool
+    effects: NotRequired[list[DeliveryPromotion]]
+
+
+class CandidatePreflight(_PreflightEvidence):
+    candidate_identity: NotRequired[str]
+    plan_digest: NotRequired[str]
+    delivery_effect: NotRequired[DeliveryEffect]
 
 
 def _selection(raw, known):
@@ -69,10 +89,12 @@ def _verdict(raw, known):
     _require((raw["status"] == "blocked") == reasons, "stream verdict reason mismatch")
 
 
-def _validate(body, selected, known):
+def _validate(body, selected, known, *, candidate=False):
     _require(isinstance(body, dict) and within_wire_bounds(body), "invalid preflight response")
-    fields = set(ApplyPreflight.__required_keys__)
-    _require(fields <= set(body) <= fields | {"preflight_identity"}, "invalid preflight fields")
+    fields = set(_PreflightEvidence.__required_keys__)
+    identities = ("candidate_identity", "plan_digest") if candidate else ("preflight_identity",)
+    optional = set(identities) | ({"delivery_effect"} if candidate else set())
+    _require(fields <= set(body) <= fields | optional, "invalid preflight fields")
     _require(body["status"] in get_args(PreflightStatus), "unknown preflight status")
     _selection(selected, known)
     _require(isinstance(body["streams"], dict) and set(body["streams"]) == set(selected), "stream coverage mismatch")
@@ -89,8 +111,11 @@ def _validate(body, selected, known):
     _require(admitted == set(body["admitted_selection"]), "admission mismatch")
     _require(all(body["streams"][stream]["status"] == "not_evaluated" for stream in skips), "skip verdict mismatch")
     if body["status"] == "ready":
-        identity = body.get("preflight_identity")
-        _require(isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity), "invalid preflight identity")
+        for name in identities:
+            identity = body.get(name)
+            _require(
+                isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity), "invalid preflight identity"
+            )
         _require(
             not any(body[key] for key in ("baseline_refused", "cross_stream", "context_disturbed")), "terminal refusal"
         )
@@ -101,7 +126,7 @@ def _validate(body, selected, known):
             "incomplete admission",
         )
     else:
-        _require(not admitted and "preflight_identity" not in body, "non-ready preflight admits streams")
+        _require(not admitted and not any(name in body for name in identities), "non-ready preflight admits streams")
     _require(isinstance(body["diffs"], dict) and set(body["diffs"]) == {"native", "cli"}, "invalid preflight diffs")
     _require(all(isinstance(value, str) for value in body["diffs"].values()), "invalid preflight diff")
     validate_refusals(body["refusals"])
@@ -109,7 +134,7 @@ def _validate(body, selected, known):
         body["error"] is None or (isinstance(body["error"], dict) and isinstance(body["error"].get("code"), str)),
         "invalid preflight diagnostic",
     )
-    remaining = _validate_attempts(body["attempts"], selected, known)
+    remaining = _validate_attempts(body["attempts"], selected, known, candidate=candidate)
     if body["status"] == "ready":
         _require(
             bool(body["attempts"])
@@ -120,7 +145,7 @@ def _validate(body, selected, known):
         _require(not body["refusals"], "ready preflight carries a terminal refusal")
 
 
-def _validate_attempts(attempts, selected, known):
+def _validate_attempts(attempts, selected, known, *, candidate=False):
     _require(isinstance(attempts, list) and len(attempts) <= len(selected) + 1, "invalid preflight passes")
     current = dict(selected)
     for attempt in attempts:
@@ -128,6 +153,7 @@ def _validate_attempts(attempts, selected, known):
         _selection(attempt["selection"], known)
         _require(attempt["selection"] == current, "preflight pass selection changed")
         _stream_list(attempt["dropped"], set(current))
+        _require(not candidate or not attempt["dropped"], "candidate stream was dropped")
         current = {key: value for key, value in current.items() if key not in attempt["dropped"]}
     return current
 
@@ -142,6 +168,59 @@ def validate_preflight(body, selected) -> ApplyPreflight:
     except ContractError as exc:
         raise AdapterError("Adapter returned invalid Apply preflight evidence.", code="invalid_response") from exc
     return body
+
+
+def _delivery_effect(raw, streams):
+    _require(isinstance(raw, dict) and type(raw.get("promotes")) is bool, "invalid delivery effect")
+    if raw["promotes"] is False:
+        _require(set(raw) == {"promotes"}, "invalid non-promoting effect")
+        return
+    _require(set(raw) == {"promotes", "effects"}, "invalid promoting effect")
+    _require(isinstance(raw["effects"], list) and bool(raw["effects"]), "missing delivery effects")
+    for effect in raw["effects"]:
+        _require(isinstance(effect, dict) and set(effect) == {"stream", "kind"}, "invalid delivery promotion")
+        _require(isinstance(effect["stream"], str) and effect["stream"] in streams, "unknown delivery stream")
+        _require(isinstance(effect["kind"], str) and bool(effect["kind"]), "invalid delivery kind")
+
+
+def validate_candidate_preflight(body, candidate_streams: Collection[str]) -> CandidatePreflight:
+    """Require exact candidate coverage, both hashes and the adapter's delivery effect."""
+    from .adapter_client import AdapterError
+    from .delivery import delivery_keys
+
+    try:
+        known = {entry.section for entry in delivery_keys().values()}
+        streams = set(candidate_streams)
+        _require(bool(streams) and streams <= known, "unknown candidate stream")
+        _require(isinstance(body, dict) and within_wire_bounds(body), "invalid preflight response")
+        attempts = body.get("attempts")
+        _require(isinstance(attempts, list), "invalid preflight passes")
+        selected = dict.fromkeys(streams, 1)
+        if attempts:
+            _require(isinstance(attempts[0], dict), "invalid preflight pass")
+            selected = attempts[0].get("selection")
+            _selection(selected, known)
+            _require(set(selected) == streams, "candidate selection coverage mismatch")
+        _validate(body, selected, known, candidate=True)
+        if body["status"] == "ready" or "delivery_effect" in body:
+            _delivery_effect(body.get("delivery_effect"), streams)
+    except ContractError as exc:
+        raise AdapterError("Adapter returned invalid candidate preflight evidence.", code="invalid_response") from exc
+    return body
+
+
+def admits_intend(preflight: CandidatePreflight) -> bool:
+    """Admit acquisition only when the adapter proves ordinary delivery cannot promote."""
+    return preflight["status"] == "ready" and preflight.get("delivery_effect", {}).get("promotes") is False
+
+
+def candidate_refusal_message(preflight: CandidatePreflight) -> str:
+    """Name the adapter's delivery effects when they refuse acquisition."""
+    effect = preflight.get("delivery_effect", {})
+    if effect.get("promotes"):
+        effects = ", ".join(f"{item['stream']}: {item['kind']}" for item in effect["effects"])
+        return f"Intend refused: ordinary delivery would promote configuration ({effects})."
+    return f"Intend refused: candidate preflight is {preflight['status']}."
 
 
 _SKIP_TEXT = {

@@ -1022,14 +1022,15 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOSwitchportState
 
         self._install_complete_renderer_trace_fixture()
-        for scope, model in (
-            ("lacp", NSOLACPBundleState),
-            ("switchport", NSOSwitchportState),
+        for scope, field, model in (
+            ("lacp", "bundles", NSOLACPBundleState),
+            ("switchport", "interfaces", NSOSwitchportState),
         ):
             row = model.objects.get(management=self.management)
             rendered = delivery.render(scope, self.device.pk, self.management.adapter_device_id)
             with self.subTest(scope=scope):
-                self.assertEqual(canonical_fragment(row), self._normal_fragment(rendered.payload[0]))
+                item = {**rendered.payload[field][0], "accepted_at": rendered.payload["accepted_at"]}
+                self.assertEqual(canonical_fragment(row), self._normal_fragment(item))
 
     def _install_complete_renderer_trace_fixture(self):
         """Create every conditional renderer branch named by the registry."""

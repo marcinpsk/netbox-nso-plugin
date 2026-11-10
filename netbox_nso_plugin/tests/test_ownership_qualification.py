@@ -26,6 +26,7 @@ from netbox_nso_plugin.renderer_writer import (
     renderer_writes,
 )
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin
@@ -125,19 +126,22 @@ class TestAcquisitionQualification(IntentPushResetMixin, TestCase):
     def acquire(self, row, grant):
         candidate = copy.copy(row)
         candidate.status = "accepted"
+        candidate.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            saves=(planned_save(candidate, update_fields=("status",), expected_before=row),), grant=grant
+            saves=(planned_save(candidate, update_fields=("status", "accepted_at"), expected_before=row),), grant=grant
         )
         mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
         with mutation(plan) as writer:
-            writer.save(candidate, update_fields=("status",))
+            writer.save(candidate, update_fields=("status", "accepted_at"))
 
     def test_acquisition_qualifies_after_the_last_native_save(self):
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
         device, management = make_managed("post-plan-qualification", None)
         interface = Interface.objects.create(device=device, name="test-port", type="1000base-t")
-        row = NSOInterfaceMtuState(management=management, interface=interface, status="accepted", l2_mtu=9000)
+        row = NSOInterfaceMtuState(
+            management=management, interface=interface, status="accepted", accepted_at=ACCEPTED_AT, l2_mtu=9000
+        )
         native = copy.copy(interface)
         native.mtu = 9000
         plan = RendererMutationPlan.build(
@@ -158,7 +162,9 @@ class TestAcquisitionQualification(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("post-plan-refusal", None)
         interface = Interface.objects.create(device=device, name="test-port", type="1000base-t", mtu=9000)
-        row = NSOInterfaceMtuState(management=management, interface=interface, status="accepted", l2_mtu=9000)
+        row = NSOInterfaceMtuState(
+            management=management, interface=interface, status="accepted", accepted_at=ACCEPTED_AT, l2_mtu=9000
+        )
         native = copy.copy(interface)
         native.mtu = None
         plan = RendererMutationPlan.build(
@@ -181,7 +187,9 @@ class TestAcquisitionQualification(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("raced-ownership-qualification", None)
         interface = Interface.objects.create(device=device, name="test-port", type="1000base-t", mtu=9000)
-        candidate = NSOInterfaceMtuState(management=management, interface=interface, status="accepted", l2_mtu=9000)
+        candidate = NSOInterfaceMtuState(
+            management=management, interface=interface, status="accepted", accepted_at=ACCEPTED_AT, l2_mtu=9000
+        )
         plan = RendererMutationPlan.build(
             saves=(planned_save(candidate, force_insert=True, natural_key=("management", "interface")),),
             grant=OwnershipGrant("create"),
@@ -191,6 +199,7 @@ class TestAcquisitionQualification(IntentPushResetMixin, TestCase):
             management=management,
             interface=interface,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
             l2_mtu=9000,
         )
         manifests_before = list(NSOOwnershipManifest.objects.filter(device_id=device.pk).order_by("pk").values())
@@ -216,11 +225,12 @@ class TestAcquisitionQualification(IntentPushResetMixin, TestCase):
         )
         candidate = copy.copy(row)
         candidate.status = "accepted"
+        candidate.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            saves=(planned_save(candidate, update_fields=("status",), expected_before=row),),
+            saves=(planned_save(candidate, update_fields=("status", "accepted_at"), expected_before=row),),
             grant=OwnershipGrant("accept"),
         )
-        save_overlay_fixture(candidate, update_fields=("status",))
+        save_overlay_fixture(candidate, update_fields=("status", "accepted_at"))
         manifests_before = list(NSOOwnershipManifest.objects.filter(device_id=device.pk).order_by("pk").values())
         Interface.objects.filter(pk=interface.pk).update(mtu=None)
         with self.assertRaises(OwnershipNotQualified), without_commit_drain(), renderer_writes(plan) as writer:

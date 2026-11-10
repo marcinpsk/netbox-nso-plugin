@@ -73,7 +73,7 @@ class TestPushSwitchportIntent(_SwBase):
 
         mgmt = self._make_mgmt()
         self._state(mgmt, mode="access", status="accepted")
-        ifaces = render("switchport", self.device.pk, mgmt.adapter_device_id).payload
+        ifaces = render("switchport", self.device.pk, mgmt.adapter_device_id).payload["interfaces"]
         assert ifaces[0]["interface_name"] == "GigabitEthernet0/1"
         assert ifaces[0]["mode"] == "access"  # NetBox access -> NSO access
         assert ifaces[0]["untagged_vlan"] == 10
@@ -83,7 +83,7 @@ class TestPushSwitchportIntent(_SwBase):
 
         mgmt = self._make_mgmt()
         self._state(mgmt, status="changed")  # not owned
-        assert render("switchport", self.device.pk, mgmt.adapter_device_id).payload == []
+        assert render("switchport", self.device.pk, mgmt.adapter_device_id).payload["interfaces"] == []
 
     def test_save_no_push_without_auto_apply(self):
         """Deferred flow: a switchport save does not commit to the device unless

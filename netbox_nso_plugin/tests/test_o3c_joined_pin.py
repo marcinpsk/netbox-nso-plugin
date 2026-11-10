@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "d0387e7e497ecde5d713808088a0548548a69c43177a7cf5f1f96b0f1dc2417a"
+_ADAPTER_RUNTIME_DIGEST = "5f2832c37d667525e46a2e543945a4c15a25751d4a5d381409008204b26e4bf6"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -754,6 +754,64 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         matches = [job for job in jobs if job.get("type") == job_type and job["id"] > after_id]
         terminal = [job for job in matches if job.get("status") in _TERMINAL_JOB_STATUSES]
         return terminal[0] if terminal else None
+
+    def test_pinned_adapter_validates_a_plugin_rendered_candidate(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import adapter_client, delivery
+        from netbox_nso_plugin.apply_preflight import admits_intend, validate_candidate_preflight
+        from netbox_nso_plugin.candidate_render import CandidateBatch
+        from netbox_nso_plugin.models import NSOInstance, NSOVLANState
+        from netbox_nso_plugin.ownership_grants import OwnershipGrant
+        from netbox_nso_plugin.vlan_reconciler import rescope_vlan
+
+        from ._candidate_render_case import ACCEPTED_AT
+        from ._ownership_case import acquire_overlay
+
+        instance = NSOInstance.objects.create(name="o3c-candidate", adapter_instance_id="o3c-pin")
+        management = self._link(make_device("candidate-pin"), instance, "candidate-pin")
+        group = VLANGroup.objects.create(name="Candidate survivor", slug="candidate-survivor")
+        with without_commit_drain():
+            source = acquire_overlay(
+                NSOVLANState,
+                management=management,
+                vlan=VLAN.objects.create(vid=100, name="RETAINED"),
+                status="in_sync",
+                accepted_at=ACCEPTED_AT,
+            )
+            survivor = NSOVLANState.objects.create(
+                management=management,
+                vlan=VLAN.objects.create(group=group, vid=100, name="RETAINED"),
+                status="imported",
+            )
+            rescope_vlan(source, group, grant=OwnershipGrant("operator_edit"))
+        survivor.refresh_from_db()
+        assert survivor.accepted_at == ACCEPTED_AT
+        row = NSOVLANState(
+            management=management,
+            vlan=VLAN.objects.create(vid=101, name="candidate-vlan"),
+            status="accepted",
+            accepted_at=ACCEPTED_AT,
+        )
+        _wait_until(
+            lambda: all(
+                job["status"] in _TERMINAL_JOB_STATUSES
+                for job in adapter_client.list_jobs(management.adapter_device_id)
+            ),
+            "candidate fixture jobs did not finish",
+        )
+        rendered = delivery.render(
+            "vlan", management.device_id, management.adapter_device_id, candidates=CandidateBatch((row,))
+        )
+        assert rendered.payload[0] == {"vlan_id": 100, "name": "RETAINED", "accepted_at": ACCEPTED_AT.isoformat()}
+        candidates = {"vlan": json.loads(delivery.wire_body(rendered, rendered.payload))}
+        result = adapter_client.apply_candidate_preflight(management.adapter_device_id, candidates)
+        assert validate_candidate_preflight(result, candidates) == result
+        assert set(result["streams"]) == {"vlan"}
+        assert result["status"] == "ready", result
+        assert len(result["candidate_identity"]) == len(result["plan_digest"]) == 64
+        assert result["delivery_effect"] == {"promotes": False}
+        assert admits_intend(result)
 
     def test_pinned_adapter_exposes_the_paginated_generation_listing(self):
         from netbox_nso_plugin import adapter_client

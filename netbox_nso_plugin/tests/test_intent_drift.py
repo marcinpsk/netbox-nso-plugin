@@ -127,9 +127,14 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # as orphaned and the scope is flagged.
         mock_sum.return_value = {"scopes": {"interface_intent": {"count": 1, "applied": 0, "failed": 0}}}
         type(self.mgmt).objects.filter(pk=self.mgmt.pk).update(manage_description=True)
-        state = acquire_overlay(
-            NSOInterfaceState, interface=self.iface, attribute="description", status="accepted", accepted_at=None
-        )
+        state = acquire_overlay(NSOInterfaceState, interface=self.iface, attribute="description", status="accepted")
+        from netbox_nso_plugin.intent_state import offline_mutation
+
+        # Model a stored row from before the acceptance repair.
+        with offline_mutation():
+            NSOInterfaceState.objects.filter(pk=state.pk).update(accepted_at=None)
+        state.refresh_from_db()
+        self.assertIsNone(state.accepted_at)
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertNotIn("interface", {d["key"] for d in drift})
         # Flip to an unowned status (with a STALE accepted_at) → owned count drops to 0 →

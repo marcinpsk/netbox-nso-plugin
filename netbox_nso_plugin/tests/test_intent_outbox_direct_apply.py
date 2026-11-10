@@ -18,6 +18,7 @@ from django.test import TransactionTestCase
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import (
     ReceiptAdapter,
     enqueue,
@@ -148,7 +149,13 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
             self.mgmt.save(update_fields=["auto_apply"])
             lag = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
             bundle = NSOLACPBundleState(
-                management=self.mgmt, interface=lag, lag_id=1, min_links=2, timer="fast", status="accepted"
+                management=self.mgmt,
+                interface=lag,
+                lag_id=1,
+                min_links=2,
+                timer="fast",
+                status="accepted",
+                accepted_at=ACCEPTED_AT,
             )
             plan = RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),

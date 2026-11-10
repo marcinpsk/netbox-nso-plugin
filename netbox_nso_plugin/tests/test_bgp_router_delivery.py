@@ -18,6 +18,7 @@ from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentRevision, NSOOwne
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import ReceiptAdapter, entries, make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
 from ._routing_observation_case import redistribution_read_payload
@@ -272,7 +273,7 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         # Seed ownership persisted before destination validation.
         from django.db.models import QuerySet
 
-        QuerySet(model=NSORedistributionState).filter(pk=state.pk).update(status="accepted")
+        QuerySet(model=NSORedistributionState).filter(pk=state.pk).update(status="accepted", accepted_at=ACCEPTED_AT)
         NSOOwnershipAcquisition.objects.create(
             state_model_label=state._meta.label_lower, state_id=state.pk, grant_kind="accept"
         )
@@ -330,11 +331,12 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         state.refresh_from_db()
         candidate = copy.copy(state)
         candidate.status = "accepted"
+        candidate.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            grant=OwnershipGrant("accept"), saves=(planned_save(candidate, update_fields=("status",)),)
+            grant=OwnershipGrant("accept"), saves=(planned_save(candidate, update_fields=("status", "accepted_at")),)
         )
         with self.assertRaises(OwnershipNotQualified), without_commit_drain(), renderer_writes(plan) as writer:
-            writer.save(candidate, update_fields=("status",))
+            writer.save(candidate, update_fields=("status", "accepted_at"))
             with offline_mutation():
                 NSORedistributionState.objects.filter(pk=state.pk).update(dest_ref="65123/")
         state.refresh_from_db()

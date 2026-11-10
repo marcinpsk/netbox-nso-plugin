@@ -16,6 +16,7 @@ from django.urls import reverse
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._authority_case import concurrent_writer
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import in_thread
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
@@ -219,8 +220,8 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
         m4 = self._mgmt(self.sw4, 197)
         vlan = self._shared_vlan()
         states = (
-            NSOVLANState(management=m3, vlan=vlan, status="in_sync"),
-            NSOVLANState(management=m4, vlan=vlan, status="in_sync"),
+            NSOVLANState(management=m3, vlan=vlan, status="in_sync", accepted_at=ACCEPTED_AT),
+            NSOVLANState(management=m4, vlan=vlan, status="in_sync", accepted_at=ACCEPTED_AT),
         )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),

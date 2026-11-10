@@ -573,7 +573,15 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
                 requests = [request for request in adapter.requests if request["url"].endswith("/svi-intent")]
                 self.assertEqual(
                     requests[-1]["body"]["interfaces"],
-                    [{"interface_name": expected_name, "vlan_id": vid, "type": state.svi_type, "vrf": ""}],
+                    [
+                        {
+                            "interface_name": expected_name,
+                            "vlan_id": vid,
+                            "type": state.svi_type,
+                            "vrf": "",
+                            "accepted_at": state.accepted_at.isoformat(),
+                        }
+                    ],
                 )
 
     def test_deleted_native_interface_retracts_with_delete_origin(self):

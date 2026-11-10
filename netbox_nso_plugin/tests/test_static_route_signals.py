@@ -9,6 +9,7 @@ from django.test import TestCase, TransactionTestCase
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import trust_scope
 from ._ownership_case import acquire_overlay, update_or_acquire_overlay
 from ._static_route_case import _assign_without_push
@@ -306,7 +307,7 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
         )
         sr = StaticRoute.objects.create(prefix="198.18.0.0/24", next_hop="198.18.1.1", metric=1)
         _assign_without_push(sr, extra_dev)
-        state = NSOStaticRouteState(management=mgmt, static_route=sr, status="accepted")
+        state = NSOStaticRouteState(management=mgmt, static_route=sr, status="accepted", accepted_at=ACCEPTED_AT)
 
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
@@ -527,8 +528,18 @@ class TestStaticRouteIntentGenerationOnTheWire(_StaticRouteWireCase, IntentPushR
         route = put.call_args.args[1][0]
         assert route["route_id"] == state.static_route.pk
         assert route["generation"] == generation
-        # The pre-R3 keys are unchanged — this is an addition, not a reshape.
-        assert set(route) == {"vrf", "prefix", "next_hop", "permanent", "tag", "metric", "route_id", "generation"}
+        # Keep every route identity field and the explicit acceptance time.
+        assert set(route) == {
+            "vrf",
+            "prefix",
+            "next_hop",
+            "permanent",
+            "tag",
+            "metric",
+            "route_id",
+            "generation",
+            "accepted_at",
+        }
 
     def test_the_unallocated_sentinel_goes_on_the_wire_as_null(self):
         """``0`` means "never allocated" — putting it on the wire would let a result correlate

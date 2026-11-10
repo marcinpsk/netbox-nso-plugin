@@ -14,6 +14,7 @@ from . import adapter_client, delivery
 
 SCOPES = delivery.direct_keys()
 _ROOT_FIELD = {"lacp": "name", "switchport": "interface_name"}
+_ROWS_FIELD = {"lacp": "bundles", "switchport": "interfaces"}
 _BOUND: contextvars.ContextVar[tuple[tuple[str, ...], int] | None] = contextvars.ContextVar(
     "nso_switching_preparation", default=None
 )
@@ -59,7 +60,7 @@ def cancel(management, scope: str, root_name: str) -> None:
 def cancel_if_rendered(management, scope: str, root_name: str) -> None:
     """Withdraw a restored root only when the owned snapshot contains its identity."""
     rendered = delivery.render(scope, management.device_id, management.adapter_device_id)
-    if root_name in {item[_ROOT_FIELD[scope]] for item in rendered.payload}:
+    if root_name in {item[_ROOT_FIELD[scope]] for item in rendered.payload[_ROWS_FIELD[scope]]}:
         cancel(management, scope, root_name)
 
 
@@ -103,7 +104,7 @@ def _capture(device_id: int, scope: str, force: bool):
     ):
         raise FingerprintMismatch
     deletions = list(NSOSwitchingRootDeletion.objects.filter(management=management, scope=scope).order_by("root_name"))
-    rendered_names = {item[_ROOT_FIELD[scope]] for item in rendered.payload}
+    rendered_names = {item[_ROOT_FIELD[scope]] for item in rendered.payload[_ROWS_FIELD[scope]]}
     for row in deletions:
         if row.root_name in rendered_names:
             NSOSwitchingRootDeletion.objects.filter(pk=row.pk, event_version=row.event_version).delete()
@@ -137,19 +138,27 @@ def _prepared_fields():
     return bound
 
 
-def send_lag(adapter_device_id, bundles):
+def send_lag(adapter_device_id, body):
     """Send LAG content with the captured deletion authority and revision."""
     deleted_roots, source_revision = _prepared_fields()
     return adapter_client.apply_lag_config(
-        adapter_device_id, bundles, deleted_roots=list(deleted_roots), source_revision=source_revision
+        adapter_device_id,
+        body["bundles"],
+        accepted_at=body["accepted_at"],
+        deleted_roots=list(deleted_roots),
+        source_revision=source_revision,
     )
 
 
-def send_switchport(adapter_device_id, interfaces):
+def send_switchport(adapter_device_id, body):
     """Send switchport content with the captured deletion authority and revision."""
     deleted_roots, source_revision = _prepared_fields()
     return adapter_client.apply_switchport_config(
-        adapter_device_id, interfaces, deleted_roots=list(deleted_roots), source_revision=source_revision
+        adapter_device_id,
+        body["interfaces"],
+        accepted_at=body["accepted_at"],
+        deleted_roots=list(deleted_roots),
+        source_revision=source_revision,
     )
 
 

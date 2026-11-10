@@ -8,7 +8,7 @@ from django.test.utils import CaptureQueriesContext
 
 from netbox_nso_plugin import delivery
 
-from ._candidate_render_case import persist_candidates, render_candidates
+from ._candidate_render_case import ACCEPTED_AT, persist_candidates, render_candidates
 from ._outbox_case import make_managed
 
 
@@ -46,6 +46,7 @@ def test_lacp_without_qualifying_bundles_keeps_persisted_query_count(vpc_only):
             interface=Interface.objects.create(device=device, name="Port-channel1", type="lag"),
             lag_id=1,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         persist_candidates((bundle,))
         bundle.vpc_sensitive = True
@@ -54,5 +55,5 @@ def test_lacp_without_qualifying_bundles_keeps_persisted_query_count(vpc_only):
     with CaptureQueriesContext(connection) as queries:
         rendered = delivery.render("lacp", device.pk, management.adapter_device_id)
 
-    assert rendered.payload == []
+    assert rendered.payload["bundles"] == []
     assert len(queries) == 1

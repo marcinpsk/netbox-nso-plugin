@@ -15,7 +15,7 @@ from .models import (
     NSODeviceManagement,
 )
 
-PLUGIN_MIGRATION_HEAD = "0046_attempt_prune_index_pre_ledger"
+PLUGIN_MIGRATION_HEAD = "0047_owned_acceptance_times"
 
 
 def check_contracts():

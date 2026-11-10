@@ -716,12 +716,14 @@ def _vlan_repoint_plan(old_vlan, target_vlan, *, grant):  # noqa: C901
     """Freeze all native and overlay references moved by one VLAN merge."""
     from dcim.models import Interface
     from django.db.models import Prefetch, Q
+    from django.utils import timezone
     from ipam.models import VLAN
 
     from . import status_machine as sm
     from .models import NSOSVIState, NSOSwitchportState, NSOVLANState
     from .renderer_writer import RendererMutationPlan, planned_delete, planned_m2m_set, planned_save
 
+    planned_at = timezone.now()
     saves = []
     deletes = []
     m2m_writes = []
@@ -799,7 +801,10 @@ def _vlan_repoint_plan(old_vlan, target_vlan, *, grant):  # noqa: C901
                 candidate.status = (
                     "accepted" if rendered_name_changed or source.status == "deploying" else source.status
                 )
-                fields = ("status",)
+                candidate.accepted_at = (
+                    source.accepted_at if transfer_ownership else survivor.accepted_at
+                ) or planned_at
+                fields = ("status", "accepted_at")
                 saves.append(planned_save(candidate, update_fields=fields))
                 save_operations.append((candidate, fields))
             deletes.append(planned_delete(source))
@@ -820,7 +825,9 @@ def _vlan_repoint_plan(old_vlan, target_vlan, *, grant):  # noqa: C901
         if was_owned and rendered_name_changed and source.management.adapter_device_id is not None:
             push_targets.add((source.management.device_id, "vlan"))
 
-    plan = RendererMutationPlan.build(grant=grant, saves=saves, deletes=deletes, m2m_writes=m2m_writes)
+    plan = RendererMutationPlan.build(
+        grant=grant, saves=saves, deletes=deletes, m2m_writes=m2m_writes, planned_at=planned_at
+    )
     return plan, save_operations, m2m_operations, delete_operations, push_targets, device_ids
 
 

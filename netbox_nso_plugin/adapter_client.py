@@ -27,7 +27,7 @@ from .settlement_schemas import canonical_uuid, within_wire_bounds
 from .vault_refs import is_secret_fingerprint
 
 if TYPE_CHECKING:
-    from .apply_preflight import ApplyPreflight
+    from .apply_preflight import ApplyPreflight, CandidatePreflight
 
 logger = logging.getLogger(__name__)
 
@@ -1009,7 +1009,7 @@ def put_vlan_intent(adapter_device_id, vlans):
     )
 
 
-def apply_switchport_config(adapter_device_id, interfaces, *, deleted_roots, source_revision):
+def apply_switchport_config(adapter_device_id, interfaces, *, accepted_at, deleted_roots, source_revision):
     """POST /api/v1/devices/{id}/switchport/apply — prepare L2 switchport intent.
 
     ``interfaces`` is a list of dicts:
@@ -1019,7 +1019,12 @@ def apply_switchport_config(adapter_device_id, interfaces, *, deleted_roots, sou
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/switchport/apply",
-        json={"interfaces": interfaces, "deleted_roots": deleted_roots, "source_revision": source_revision},
+        json={
+            "interfaces": interfaces,
+            "accepted_at": accepted_at,
+            "deleted_roots": deleted_roots,
+            "source_revision": source_revision,
+        },
     )
 
 
@@ -1804,7 +1809,7 @@ def put_subinterface_intent(adapter_device_id, interfaces):
     )
 
 
-def apply_lag_config(adapter_device_id, bundles, *, deleted_roots, source_revision):
+def apply_lag_config(adapter_device_id, bundles, *, accepted_at, deleted_roots, source_revision):
     """POST /api/v1/devices/{id}/lag-config/apply — prepare full LACP bundle intent.
 
     ``bundles`` is a list of dicts:
@@ -1817,7 +1822,12 @@ def apply_lag_config(adapter_device_id, bundles, *, deleted_roots, source_revisi
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/lag-config/apply",
-        json={"bundles": bundles, "deleted_roots": deleted_roots, "source_revision": source_revision},
+        json={
+            "bundles": bundles,
+            "accepted_at": accepted_at,
+            "deleted_roots": deleted_roots,
+            "source_revision": source_revision,
+        },
     )
 
 
@@ -1960,6 +1970,16 @@ def apply_preflight(adapter_device_id: int, selected: Mapping[str, int]) -> "App
         "POST", f"/api/v1/devices/{adapter_device_id}/actions/apply-preflight", json={"selected": dict(selected)}
     )
     return validate_preflight(body, dict(selected))
+
+
+def apply_candidate_preflight(adapter_device_id: int, candidates: Mapping[str, dict]) -> "CandidatePreflight":
+    """Validate admission and delivery effects for complete candidate ingestion bodies."""
+    from .apply_preflight import validate_candidate_preflight
+
+    body = _request(
+        "POST", f"/api/v1/devices/{adapter_device_id}/actions/apply-preflight", json={"candidates": dict(candidates)}
+    )
+    return validate_candidate_preflight(body, candidates.keys())
 
 
 def trigger_apply(adapter_device_id, apply_attempt_id, selected, preflight_identity: str):

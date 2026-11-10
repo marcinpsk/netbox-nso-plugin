@@ -10,6 +10,7 @@ import json
 import logging
 import threading
 from collections import namedtuple
+from datetime import UTC
 
 from django.db.models import Prefetch, Q
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
@@ -590,6 +591,25 @@ def _send_rendered(rendered, body):
     return result
 
 
+def _accepted_timestamp(row):
+    """Keep one acceptance instant identical before and after PostgreSQL normalizes it."""
+    stamp = row.accepted_at
+    if stamp is None:
+        return None
+    if timezone.is_naive(stamp):
+        raise ValueError("acceptance timestamp must be timezone-aware")
+    return stamp.astimezone(UTC).isoformat()
+
+
+def _snapshot_accepted_timestamp(rows):
+    """Use the latest contributing acceptance time for a snapshot."""
+    stamps = [_accepted_timestamp(row) for row in rows]
+    # An empty snapshot has no acceptance event, so its envelope uses a fixed instant.
+    return (
+        max((stamp for stamp in stamps if stamp is not None), default=None) if stamps else "1970-01-01T00:00:00+00:00"
+    )
+
+
 def interface_intent_item(state):
     """Return one interface attribute in the adapter's exact wire shape."""
     iface = state.interface
@@ -603,7 +623,7 @@ def interface_intent_item(state):
         "interface": iface.name,
         "attribute": state.attribute,
         "intent_value": intent_value,
-        "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
+        "accepted_at": _accepted_timestamp(state),
     }
 
 
@@ -1282,7 +1302,7 @@ def interface_ip_intent_item(row):
         "family": row.family,
         "secondary": bool(row.secondary),
         "vrf": row.vrf,
-        "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+        "accepted_at": _accepted_timestamp(row),
     }
     entry.update(_nokia_routed_binding(row.interface))
     return entry
@@ -1416,6 +1436,7 @@ def snmp_community_intent_item(row):
         "vault_ref": row.vault_ref,
         "access": row.access,
         "acl": row.acl or None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1428,6 +1449,7 @@ def snmp_v3_user_intent_item(row):
         "priv_protocol": row.priv_protocol or None,
         "auth_vault_ref": f"{row.vault_ref}#auth" if row.auth_protocol else None,
         "priv_vault_ref": f"{row.vault_ref}#priv" if row.priv_protocol else None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1444,12 +1466,13 @@ def snmp_host_intent_item(row, ned_id):
     )
     if row.port is not None and not suppress_default_port:
         host["port"] = row.port
+    host["accepted_at"] = _accepted_timestamp(row)
     return host
 
 
 def snmp_system_info_intent_item(row):
     """Return the SNMP system-information singleton in its exact wire shape."""
-    return {"location": row.location or None, "contact": row.contact or None}
+    return {"location": row.location or None, "contact": row.contact or None, "accepted_at": _accepted_timestamp(row)}
 
 
 def _push_snmp_intent_for_device(device_id, adapter_device_id):
@@ -1554,12 +1577,14 @@ def logging_host_intent_item(row, ned_id):
     suppress_default_port = row.port == 514 and ned_id.startswith(("timos", "arcos-"))
     if row.port is not None and not suppress_default_port:
         host["port"] = row.port
+    host["accepted_at"] = _accepted_timestamp(row)
     return host
 
 
 def logging_levels_intent_item(row):
     """Return the local logging singleton, including its explicit null shape."""
-    return row.set_severities() or None
+    severities = row.set_severities()
+    return {**severities, "accepted_at": _accepted_timestamp(row)} if severities else None
 
 
 def _push_logging_intent_for_device(device_id, adapter_device_id):
@@ -1624,6 +1649,7 @@ def svi_intent_item(row):
         "vlan_id": row.vlan.vid if row.vlan else None,
         "type": row.svi_type,
         "vrf": row.vrf or "",
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1698,6 +1724,7 @@ def subinterface_intent_item(row):
         "dot1q_vlan": row.dot1q_vlan,
         "type": "subinterface",
         "vrf": row.vrf or "",
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1773,6 +1800,7 @@ def interface_mtu_intent_item(row):
         "mtu": row.l2_mtu,
         "ip_mtu": row.ip_mtu,
         "mpls_mtu": row.mpls_mtu,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1826,7 +1854,7 @@ def vlan_intent_item(row):
 
     if row.vlan is None:
         return None
-    return {"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row)}
+    return {"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row), "accepted_at": _accepted_timestamp(row)}
 
 
 def _push_vlan_intent_for_device(device_id, adapter_device_id):
@@ -1962,6 +1990,7 @@ def bfd_intent_item(row):
         "min_rx": row.min_rx,
         "multiplier": row.multiplier,
         "micro_bfd": bool(row.micro_bfd),
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2060,6 +2089,7 @@ def static_route_intent_item(row):
     }
     if route.metric is not None:
         item["metric"] = route.metric
+    item["accepted_at"] = _accepted_timestamp(row)
     return item
 
 
@@ -2285,6 +2315,7 @@ def isis_flex_algo_intent_item(row):
         "admin_group_exclude": row.admin_group_exclude or None,
         "admin_group_include_any": row.admin_group_include_any or None,
         "admin_group_include_all": row.admin_group_include_all or None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2344,6 +2375,7 @@ def l2_sap_intent_item(row):
         "port": row.port,
         "outer_tag": row.outer_tag,
         "inner_tag": row.inner_tag,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2428,6 +2460,7 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
     from .models import NSOLACPBundleState, NSOLACPMemberState
 
     bundles = []
+    accepted_rows = []
     member_rows = None
     # NX-P2 belt-and-suspenders: a vPC-protected bundle can never be owned (the Accept view
     # refuses it), but exclude it here too so it can NEVER enter the write intent — the writer
@@ -2444,18 +2477,19 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
                 .order_by("pk"),
                 scope="lacp",
             )
-        members = (
-            lacp_member_intent_item(member)
+        members = tuple(
+            member
             for member in member_rows
             if member.management_id == b.management_id
             and member.interface.device_id == device_id
             and bundle_of(member.interface) == b.interface
         )
-        bundles.append(lacp_bundle_intent_item(b, members))
+        accepted_rows.extend((b, *members))
+        bundles.append(lacp_bundle_intent_item(b, (lacp_member_intent_item(member) for member in members)))
 
     _push_changed(
         (device_id, "lacp"),
-        bundles,
+        {"bundles": bundles, "accepted_at": _snapshot_accepted_timestamp(accepted_rows)},
         lambda body: switching_preparation.send_lag(adapter_device_id, body),
     )
 
@@ -2515,15 +2549,16 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
     from .models import NSOSwitchportState
 
     interfaces = []
-    for st in render_rows(
+    rows = render_rows(
         NSOSwitchportState.objects.filter(management__device_id=device_id).select_related("interface", "untagged_vlan"),
         scope="switchport",
-    ):
+    )
+    for st in rows:
         interfaces.append(switchport_intent_item(st, (v.vid for v in render_related(st, "tagged_vlans"))))
 
     _push_changed(
         (device_id, "switchport"),
-        interfaces,
+        {"interfaces": interfaces, "accepted_at": _snapshot_accepted_timestamp(rows)},
         lambda body: switching_preparation.send_switchport(adapter_device_id, body),
     )
 
@@ -2616,6 +2651,7 @@ def isis_interface_intent_item(row):
         "bfd_enabled": row.bfd_enabled,
         "frr_enabled": row.frr_enabled,
         "frr_protection": row.frr_protection or None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2638,6 +2674,7 @@ def isis_instance_intent_item(row, *, redistribution=(), levels=()):
         entry["redistribution"] = list(redistribution)
     if levels:
         entry["levels"] = list(levels)
+    entry["accepted_at"] = _accepted_timestamp(row)
     return entry
 
 
@@ -2718,7 +2755,7 @@ def bgp_router_intent_item(row):
     """Render only the explicitly owned router aggregate."""
     from .bgp_router_content import router_content
 
-    return {**router_content(row), "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None}
+    return {**router_content(row), "accepted_at": _accepted_timestamp(row)}
 
 
 # Reasons for a snapshot that NetBox refuses before it sends any request.
@@ -2986,6 +3023,7 @@ def route_policy_intent_item(row):
         "entries": _build_route_policy_entries(row.family, obj),
         "accepted": True,
         **({"invert_match": bool(getattr(obj, "invert_match", False))} if row.family == "community_list" else {}),
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -3589,6 +3627,7 @@ def ospf_instance_intent_item(row, redistribution=()):
         entry["enabled"] = row.enabled
     if redistribution:
         entry["redistribution"] = list(redistribution)
+    entry["accepted_at"] = _accepted_timestamp(row)
     return entry
 
 
@@ -3603,6 +3642,7 @@ def ospf_interface_intent_item(row):
         value = getattr(row, field_name)
         if value is not None:
             entry[field_name] = value
+    entry["accepted_at"] = _accepted_timestamp(row)
     return entry
 
 

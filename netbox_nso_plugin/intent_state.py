@@ -727,7 +727,7 @@ def normalize_overlay_lifecycle(instance, update_fields=None):
 def _lacp_bundle_fragment(instance):
     """Use native topology and the nested LACP delivery serializer."""
     from .lacp_topology import is_bundle, member_states
-    from .signals import lacp_bundle_intent_item, lacp_member_intent_item
+    from .signals import _snapshot_accepted_timestamp, lacp_bundle_intent_item, lacp_member_intent_item
     from .status_machine import OWNED_STATES
 
     if (
@@ -736,13 +736,14 @@ def _lacp_bundle_fragment(instance):
         or not is_bundle(instance.interface, instance.management.device_id)
     ):
         return ABSENT
-    members = (lacp_member_intent_item(member) for member in member_states(instance).filter(status__in=OWNED_STATES))
-    return _normal(lacp_bundle_intent_item(instance, members))
+    members = tuple(member_states(instance).filter(status__in=OWNED_STATES))
+    item = lacp_bundle_intent_item(instance, (lacp_member_intent_item(member) for member in members))
+    return _normal({**item, "accepted_at": _snapshot_accepted_timestamp((instance, *members))})
 
 
 def _lacp_member_fragment(instance):
     from .lacp_topology import bundle_of
-    from .signals import lacp_member_intent_item
+    from .signals import _accepted_timestamp, lacp_member_intent_item
     from .status_machine import OWNED_STATES
 
     if instance.status not in OWNED_STATES:
@@ -755,7 +756,7 @@ def _lacp_member_fragment(instance):
         management_id=instance.management_id, interface_id=bundle.pk, status__in=OWNED_STATES, vpc_sensitive=False
     ).exists():
         return ABSENT
-    return _normal(lacp_member_intent_item(instance))
+    return _normal({**lacp_member_intent_item(instance), "accepted_at": _accepted_timestamp(instance)})
 
 
 def _lacp_bundle_dependencies(before, after, spec):
@@ -894,13 +895,13 @@ def _interface_dependencies(before, after, spec):
 
 
 def _switchport_fragment(instance):
-    from .signals import switchport_intent_item
+    from .signals import _accepted_timestamp, switchport_intent_item
     from .status_machine import is_owned
 
     if not is_owned(instance.status):
         return ABSENT
     tagged = instance.tagged_vlans.values_list("vid", flat=True) if instance.pk else ()
-    return _normal(switchport_intent_item(instance, tagged))
+    return _normal({**switchport_intent_item(instance, tagged), "accepted_at": _accepted_timestamp(instance)})
 
 
 def _interface_state_fragment(instance):

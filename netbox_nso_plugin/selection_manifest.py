@@ -320,7 +320,7 @@ def _ospf_emissions(payload):
 
 
 def _lacp_emissions(payload):
-    for item in payload:
+    for item in payload["bundles"]:
         path = (("bundle", (item["name"],)),)
         content = {key: value for key, value in item.items() if key != "members"}
         yield _Emission("lag.bundle", path, (item["name"],), content)
@@ -358,7 +358,8 @@ def _emissions(scope, payload):
         raise RegistryError("blocked renderer output cannot form a selected manifest")
     if scope in _FLAT_SCOPES:
         subject, name, field = _FLAT_SCOPES[scope]
-        for item in payload:
+        items = payload["interfaces"] if scope == "switchport" else payload
+        for item in items:
             identity = (item[field],)
             yield _Emission(subject, ((name, identity),), identity, item)
     else:
