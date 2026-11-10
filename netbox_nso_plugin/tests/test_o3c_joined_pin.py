@@ -813,6 +813,170 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         assert result["delivery_effect"] == {"promotes": False}
         assert admits_intend(result)
 
+    def test_intend_acquires_a_native_vlan_and_delivers_after_commit_without_promotion(self):
+        from django.contrib.auth import get_user_model
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.intent_acquisition import confirm_intend, preview_intend
+        from netbox_nso_plugin.models import (
+            NSOInstance,
+            NSOIntentOutboxEntry,
+            NSOIntentOutboxState,
+            NSOOwnershipManifest,
+            NSOVLANState,
+        )
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        instance = NSOInstance.objects.create(name="o3c-intend", adapter_instance_id="o3c-pin")
+        management = self._link(make_device("intend-vlan"), instance, "intend-vlan")
+        vlan = VLAN.objects.create(group=_device_vlan_group(management.device), vid=101, name="native-intend")
+        user = get_user_model().objects.create_superuser(username="joined-intend-admin", password="test-password")
+        selection = [{"scope": "vlan", "native_model": "ipam.vlan", "native_id": vlan.pk, "options": {}}]
+        _wait_until(
+            lambda: all(
+                job["status"] in _TERMINAL_JOB_STATUSES
+                for job in adapter_client.list_jobs(management.adapter_device_id)
+            ),
+            "Intend fixture jobs did not finish",
+        )
+        jobs_before = adapter_client.list_jobs(management.adapter_device_id)
+        generations_before = adapter_client.list_device_generations(management.adapter_device_id)
+        _AdapterWireSession.reset(self.environment.adapter_port)
+
+        with CaptureQueriesContext(connection) as preview_queries:
+            preview = preview_intend(management, user, selection)
+
+        assert preview.status == "ready", preview
+        assert preview.preflight["status"] == "ready", preview.preflight
+        assert preview.preflight["delivery_effect"] == {"promotes": False}
+        assert preview.confirmation
+        assert not NSOVLANState.objects.filter(management=management, vlan=vlan).exists()
+        assert not [
+            query["sql"]
+            for query in preview_queries
+            if "netbox_nso_plugin_" in query["sql"]
+            and re.match(r"\s*(?:INSERT INTO|UPDATE|DELETE FROM)\b", query["sql"], re.IGNORECASE)
+        ]
+
+        with transaction.atomic():
+            confirmed = confirm_intend(management, user, preview.confirmation)
+
+            assert confirmed.status == "acquired", confirmed
+            owned = NSOVLANState.objects.get(management=management, vlan=vlan)
+            assert owned.status == "accepted"
+            assert owned.accepted_at is not None
+            assert NSOOwnershipManifest.objects.filter(
+                device_id=management.device_id,
+                scope="vlan",
+                native_model_label="ipam.vlan",
+                native_id=vlan.pk,
+                ownership_state="owned",
+                grant_kind="intend",
+            ).exists()
+            assert NSOIntentOutboxEntry.objects.filter(
+                device_id=management.device_id,
+                scope="vlan",
+                kind="ordinary",
+                consumed_by_push_seq__isnull=True,
+            ).exists()
+            assert not [
+                record
+                for record in _AdapterWireSession.snapshot()
+                if record["method"] == "PUT" and urlparse(record["url"]).path.endswith("/vlan-intent")
+            ]
+
+        [push] = [
+            record
+            for record in _AdapterWireSession.snapshot()
+            if record["method"] == "PUT" and urlparse(record["url"]).path.endswith("/vlan-intent")
+        ]
+        assert push["headers"].get("X-Push-Seq")
+        assert "store_only" not in parse_qs(urlparse(push["url"]).query)
+        assert push["body"]["vlans"] == [
+            {"vlan_id": 101, "name": "native-intend", "accepted_at": owned.accepted_at.isoformat()}
+        ]
+        assert self.environment.query_store(
+            "SELECT vlan_id, name, accepted_at FROM vlan_intent WHERE device_id = %s ORDER BY vlan_id",
+            [management.adapter_device_id],
+        ) == [(101, "native-intend", owned.accepted_at)]
+        assert not NSOIntentOutboxEntry.objects.filter(device_id=management.device_id, scope="vlan").exists()
+        state = NSOIntentOutboxState.objects.get(device_id=management.device_id, scope="vlan")
+        assert state.push_seq is None
+        assert state.last_success_at is not None
+        assert adapter_client.list_jobs(management.adapter_device_id) == jobs_before
+        assert adapter_client.list_device_generations(management.adapter_device_id) == generations_before
+
+    def test_intend_refuses_a_retained_vlan_scalar_clear_without_plugin_writes(self):
+        from django.contrib.auth import get_user_model
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin import adapter_client, drain
+        from netbox_nso_plugin.intent_acquisition import preview_intend
+        from netbox_nso_plugin.models import NSOInstance, NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group, save_vlan_content
+
+        from ._ownership_case import acquire_overlay
+
+        instance = NSOInstance.objects.create(name="o3c-intend-clear", adapter_instance_id="o3c-pin")
+        management = self._link(make_device("intend-clear"), instance, "intend-clear")
+        group = _device_vlan_group(management.device)
+        retained = VLAN.objects.create(group=group, vid=100, name="RETAINED")
+        acquire_overlay(NSOVLANState, management=management, vlan=retained, status="accepted")
+        assert drain.drain_key(management.device_id, "vlan", chain=0) == drain.SUCCEEDED
+        assert self.environment.query_store(
+            "SELECT vlan_id, name FROM vlan_intent WHERE device_id = %s ORDER BY vlan_id",
+            [management.adapter_device_id],
+        ) == [(100, "RETAINED")]
+        with without_commit_drain():
+            retained.name = ""
+            save_vlan_content(retained, update_fields=("name",))
+        candidate = VLAN.objects.create(group=group, vid=101, name="new-native")
+        user = get_user_model().objects.create_superuser(username="joined-intend-clear", password="test-password")
+        selection = [{"scope": "vlan", "native_model": "ipam.vlan", "native_id": candidate.pk, "options": {}}]
+        _wait_until(
+            lambda: all(
+                job["status"] in _TERMINAL_JOB_STATUSES
+                for job in adapter_client.list_jobs(management.adapter_device_id)
+            ),
+            "Intend clear fixture jobs did not finish",
+        )
+        jobs_before = adapter_client.list_jobs(management.adapter_device_id)
+        generations_before = adapter_client.list_device_generations(management.adapter_device_id)
+        _AdapterWireSession.reset(self.environment.adapter_port)
+
+        with CaptureQueriesContext(connection) as preview_queries:
+            preview = preview_intend(management, user, selection)
+
+        assert preview.status == "refused", preview
+        assert preview.confirmation is None
+        assert preview.preflight["status"] == "ready", preview.preflight
+        assert preview.preflight["delivery_effect"]["promotes"] is True
+        assert {"stream": "vlan", "kind": "removal"} in preview.preflight["delivery_effect"]["effects"]
+        assert "vlan" in preview.message and "removal" in preview.message
+        assert not [
+            query["sql"]
+            for query in preview_queries
+            if "netbox_nso_plugin_" in query["sql"]
+            and re.match(r"\s*(?:INSERT INTO|UPDATE|DELETE FROM)\b", query["sql"], re.IGNORECASE)
+        ]
+        assert not NSOVLANState.objects.filter(management=management, vlan=candidate).exists()
+        [preflight] = [
+            record
+            for record in _AdapterWireSession.snapshot()
+            if record["method"] == "POST" and urlparse(record["url"]).path.endswith("/apply-preflight")
+        ]
+        assert [item["name"] for item in preflight["body"]["candidates"]["vlan"]["vlans"]] == ["", "new-native"]
+        assert not [record for record in _AdapterWireSession.snapshot() if record["method"] == "PUT"]
+        assert self.environment.query_store(
+            "SELECT vlan_id, name FROM vlan_intent WHERE device_id = %s ORDER BY vlan_id",
+            [management.adapter_device_id],
+        ) == [(100, "RETAINED")]
+        assert adapter_client.list_jobs(management.adapter_device_id) == jobs_before
+        assert adapter_client.list_device_generations(management.adapter_device_id) == generations_before
+
     def test_pinned_adapter_exposes_the_paginated_generation_listing(self):
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.models import NSOInstance

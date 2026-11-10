@@ -945,6 +945,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             {
                 "dcim.interface_tagged_vlans",
                 "ipam.rir",
+                "ipam.prefix",  # Acquisition locks prefix-list targets without native writes.
                 "ipam.vlangroup",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoownershipmanifest",  # Episode locks do not contribute renderer fields.

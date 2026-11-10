@@ -1495,7 +1495,19 @@ def _seed_reowned_state(candidate, native, native_field, manifest):
     candidate.status = "accepted"
     if hasattr(candidate, "accepted_at"):
         candidate.accepted_at = timezone.now()
+    project_native_state(candidate, native, native_field, manifest)
+    if candidate._meta.model_name == "nsostaticroutestate":
+        from .signals import _arm_static_route_generation
+
+        _arm_static_route_generation(candidate)
+
+
+def project_native_state(candidate, native, native_field, manifest):
+    """Project native intent into a candidate without saving or allocating tokens."""
     excluded_fields = NETBOX_BASE_METADATA_FIELDS | {"management", "status", "accepted_at", native_field}
+    if candidate._meta.model_name == "nsolacpmemberstate":
+        # Keep LACP negotiation mode separate from native switching mode.
+        excluded_fields |= {"mode"}
     for field in candidate._meta.concrete_fields:
         if field.primary_key or field.name in excluded_fields:
             continue
@@ -1531,9 +1543,6 @@ def _seed_static_route(candidate, native, manifest):
     candidate.last_acked_triple = (
         copy.deepcopy(manifest.acknowledged_lineage[-1]) if manifest.acknowledged_lineage else None
     )
-    from .signals import _arm_static_route_generation
-
-    _arm_static_route_generation(candidate)
 
 
 def _seed_interface_attribute(candidate, native, _manifest):

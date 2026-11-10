@@ -75,6 +75,16 @@ class Captured:
     selection_id: int
 
 
+def root_deletions(management, scope: str, payload):
+    """Read deletion events and exclude roots restored by the prospective snapshot."""
+    from .models import NSOSwitchingRootDeletion
+
+    rows = tuple(NSOSwitchingRootDeletion.objects.filter(management=management, scope=scope).order_by("root_name"))
+    rendered_names = {item[_ROOT_FIELD[scope]] for item in payload[_ROWS_FIELD[scope]]}
+    versions = {row.root_name: row.event_version for row in rows if row.root_name not in rendered_names}
+    return rows, versions
+
+
 def _capture(device_id: int, scope: str, force: bool):
     """Read one content revision and snapshot under the direct drain's lock order."""
     from . import drain
@@ -103,13 +113,11 @@ def _capture(device_id: int, scope: str, force: bool):
         or revision.verified_fingerprint != delivery.canonical_fingerprint(rendered.payload)
     ):
         raise FingerprintMismatch
-    deletions = list(NSOSwitchingRootDeletion.objects.filter(management=management, scope=scope).order_by("root_name"))
-    rendered_names = {item[_ROOT_FIELD[scope]] for item in rendered.payload[_ROWS_FIELD[scope]]}
+    deletions, versions = root_deletions(management, scope, rendered.payload)
     for row in deletions:
-        if row.root_name in rendered_names:
+        if row.root_name not in versions:
             NSOSwitchingRootDeletion.objects.filter(pk=row.pk, event_version=row.event_version).delete()
-    versions = {row.root_name: row.event_version for row in deletions if row.root_name not in rendered_names}
-    deleted_roots = tuple(sorted(set(versions) - rendered_names))
+    deleted_roots = tuple(sorted(versions))
     selection_id = capture_direct(management, rendered, int(revision.revision), deleted_roots)
     return "sending", Captured(
         rendered,

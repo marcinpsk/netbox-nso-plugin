@@ -35,6 +35,7 @@ SOURCE_MODEL_RANKS = (
     "vpn.l2vpn",
     "vpn.l2vpntermination",
     "ipam.ipaddress",
+    "ipam.prefix",
     "netbox_routing.prefixlist",
     "netbox_routing.customprefix",
     "netbox_routing.prefixlistentry",
