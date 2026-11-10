@@ -85,7 +85,7 @@ dev = [
     "build",
     "packaging",
     "reuse",
-    "ruff==0.17.3",
+    "ruff==0.17.4",
     "pre-commit",
     "pytest",
     "pytest-django",
@@ -93,7 +93,7 @@ dev = [
     "pytest-xdist>=3.8",
     "django>=6.1,<7.0",
     "requests-mock",
-    "zizmor==1.31.1",
+    "zizmor==1.32.0",
 ]
 docs = [
     "mkdocs>=1.6.1,<2",
