@@ -125,6 +125,9 @@ def render_rows(queryset, *, scope):
     candidates = ()
     if context is not None:
         batch, device_id = context
+        # Candidate identities read the device through this relation.
+        lookup = OVERLAYS[queryset.model._meta.label_lower].device_lookup
+        queryset = queryset.select_related(lookup.rsplit("__", 1)[0])
         candidates = tuple(
             row
             for row in batch.overlays

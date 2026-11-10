@@ -2,11 +2,14 @@
 # Copyright (C) 2026 Marcin Zieba
 """Keep refused and empty persisted renders at their original query counts."""
 
+import copy
+
 import pytest
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 
 from netbox_nso_plugin import delivery
+from netbox_nso_plugin.candidate_render import CandidateBatch
 
 from ._candidate_render_case import ACCEPTED_AT, persist_candidates, render_candidates
 from ._outbox_case import make_managed
@@ -57,3 +60,31 @@ def test_lacp_without_qualifying_bundles_keeps_persisted_query_count(vpc_only):
 
     assert rendered.payload["bundles"] == []
     assert len(queries) == 1
+
+
+def _candidate_render_query_counts(name, asn, scope, candidate_index):
+    """Count one candidate render with one and with two persisted graphs."""
+    device, management = make_managed(name, asn)
+    counts = []
+    for index in (1, 2):
+        rows, relations = render_candidates(device, management, index)
+        persist_candidates(rows, relations)
+        if index == 1:
+            candidate = copy.copy(rows[candidate_index])
+            candidate.pk = None
+        with CaptureQueriesContext(connection) as queries:
+            delivery.render(scope, device.pk, management.adapter_device_id, candidates=CandidateBatch((candidate,)))
+        counts.append(len(queries))
+    return counts
+
+
+@pytest.mark.django_db
+def test_candidate_render_does_not_load_management_per_persisted_row():
+    first, second = _candidate_render_query_counts("render-candidate-vlan-queries", 17900, "vlan", 3)
+    assert second == first, "each persisted row loads its identity relation"
+
+
+@pytest.mark.django_db
+def test_related_render_without_a_matching_candidate_does_not_load_management_per_row():
+    first, second = _candidate_render_query_counts("render-related-switchport-queries", 17901, "switchport", 3)
+    assert second - first == 1, "each persisted row loads its identity relation beyond one tagged VLAN read"
