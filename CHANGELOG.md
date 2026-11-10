@@ -2,6 +2,161 @@
 
 <!-- version list -->
 
+## v1.18.0 (2026-11-10)
+
+### Bug Fixes
+
+- **apply**: An unsent preview is not an in-flight manual attempt
+  ([`9bb301d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9bb301d3465c2e6a63124d22c83c252512e302fc))
+
+- **apply**: Ask for a fresh preview when the stored preflight is invalid
+  ([`23df246`](https://github.com/marcinpsk/netbox-nso-plugin/commit/23df246fda05062c1d3b8c23b5f357c54dd91896))
+
+- **apply**: Map only a preflight store failure to the preview refusal
+  ([`0a0c2e2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0a0c2e297e14b6c7160f3d2e1558303db324a738))
+
+- **apply**: Mark pre-ledger attempts so a failed preview preflight does not block
+  ([`1eba456`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1eba4560e92f67f626c17d828f6ab2f1b41a50ca))
+
+- **apply**: Never start the Apply preview from the page URL
+  ([`8a84eac`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8a84eaca4d6a327643788addeffca4f2686d8d96))
+
+- **apply**: Resolve snapshot footprints with one route-policy lookup
+  ([`5dd5a11`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5dd5a1192e419e4170bd09d806ec619378ab145c))
+
+- **apply**: Roll back a confirm whose send claim fails
+  ([`10df9ae`](https://github.com/marcinpsk/netbox-nso-plugin/commit/10df9aee7561b1681afe6698df0aafa9a2804ffe))
+
+- **apply**: Stall settlement when a replay has no valid stored preflight
+  ([`8437122`](https://github.com/marcinpsk/netbox-nso-plugin/commit/84371222fa11879d69935f2675fb4fe54d79c3d5))
+
+- **apply**: Stall settlement when a replayed answer contradicts the stored one
+  ([`cf1a8a3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cf1a8a3e9ef0603e1ce55c8df4620d4d4edf9b40))
+
+- **apply**: Wait for the operator after a stale preflight admission
+  ([`f125024`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f125024ce43a852167deab8b380f1baf113881af))
+
+- **deployment**: Require migration 0043 as the plugin migration head
+  ([`b9f8105`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b9f810597370ee0c866fe99e0c2b36bb0a5b6623))
+
+- **probe**: Promote and claim the probe send in one transaction
+  ([`5b2ba6b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5b2ba6b776cf7ec99633a2cb97d1c7c1efba7c40))
+
+- **retention**: Keep pre-ledger attempts out of the unsent-preview prune
+  ([`1c4ed8a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1c4ed8abe997c181f4f30f104dfc3ef64b9b435b))
+
+- **settlement**: Refuse journal evidence that contradicts its admission
+  ([`c5ea9ed`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c5ea9ed383581b403cdc073ba5465ebb7d98e3ec))
+
+### Chores
+
+- **ci**: Bump astral-sh/setup-uv
+  ([`14608b0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/14608b0ed54965c0f2cd18bb8c870c426e024b7c))
+
+- **ci**: Let dependabot update pre-commit hook revisions
+  ([`5b0562a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5b0562a5d9ef8f24d7212bbcccd03fc18f7eb757))
+
+- **deps**: Bump the python-minor-patch group with 3 updates
+  ([`7b5db58`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7b5db5828791d5f1eead9b3ade8fea228098b074))
+
+### Continuous Integration
+
+- **contract**: Answer the preflight dry-runs in the live adapter job
+  ([`07e9812`](https://github.com/marcinpsk/netbox-nso-plugin/commit/07e9812a58535f3bfd3d88b52c6d6c0c1ab0d761))
+
+- **test**: Pin the joined adapter to 9574dd34
+  ([`64d1cbe`](https://github.com/marcinpsk/netbox-nso-plugin/commit/64d1cbeb201815b0c06f3f900215ad4f07803643))
+
+- **test**: Pin the joined adapter to c8bff0f
+  ([`35291bf`](https://github.com/marcinpsk/netbox-nso-plugin/commit/35291bf6392c7fda46d981ef3dfbd17d03faa752))
+
+- **test**: Pin the joined adapter to d251f51
+  ([`4ed5be4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4ed5be4b0b5adb2f38b385d2fa5b87f633c21e47))
+
+- **test**: Pin the joined adapter to e8ac0e0
+  ([`e014572`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e014572f03b2d659d7e735805c26b55daf23c56a))
+
+- **test**: Pin the joined adapter to f81c91c
+  ([`0a28290`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0a28290bca111c6f86d8508b89c34a8d09f9c26e))
+
+- **test**: Pin the joined adapter to fea813e
+  ([`2e4b9a3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2e4b9a3b27ed3da1d4c93fa37e2b1377c7611d5b))
+
+- **test**: Split each NetBox lane into four shards with current durations
+  ([`df313bf`](https://github.com/marcinpsk/netbox-nso-plugin/commit/df313bfb649942cf21575e60ca50273aaf08016b))
+
+### Documentation
+
+- **copilot**: List the apply-preflight endpoint and the Apply preflight contract
+  ([`4e72868`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4e7286897cc6dcf067cfc8b85fb4a6e9fee1c77b))
+
+### Features
+
+- **apply**: Gate manual Apply on the adapter preflight
+  ([`7639b09`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7639b09195e634a0dcf328c7f6371bf4fc0f3215))
+
+- **apply**: Show preflight verdicts as labelled stream badges
+  ([`3fe4a14`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3fe4a14e065eac93ab7d230fb71d06e995e4e610))
+
+### Performance Improvements
+
+- **retention**: Serve the prune batch from the attempt prune index
+  ([`2c798ce`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2c798cef461a6895dcd1d399a5bb2ad3338c0016))
+
+### Testing
+
+- **apply**: Bind each fixture preflight to its own identity
+  ([`afb782e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/afb782e2ca5c49732258c087b50086aadb51ad1b))
+
+- **apply**: Cover the stream verdict reason rule alone
+  ([`3df62c0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3df62c0cc6ea5cca4bcdfba7386c50542b9a091c))
+
+- **apply**: Drop a schema check that repeats the model declaration
+  ([`3a44f3b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3a44f3bed79716a558a804658ced76aabc79b64e))
+
+- **apply**: Fail loudly when the shared Apply helper meets a refused preview
+  ([`05d68bc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/05d68bc08b61b631ef6af079ed0e77721c80a8d9))
+
+- **apply**: Keep a promoted answer without a chain and stall its settlement
+  ([`afb2b9f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/afb2b9f3de499cc1d7966cca9957daa2b6918d84))
+
+- **apply**: Keep an unexpired preview and an open automatic attempt in the retention check
+  ([`a0474a5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a0474a5cf161f03074dc76460b62e7c7406c5d29))
+
+- **apply**: Make the Apply preview UI tests exercise what they name
+  ([`d1e1ebb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d1e1ebb480875511d1792cc8c7d39d28c62a4fef))
+
+- **apply**: Prove that a non-ready preview cannot confirm
+  ([`94bdab7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/94bdab72eff4d0fe35d9a10703f6b93fdbdfb98c))
+
+- **apply**: Restore the raised transport case for a preparation push
+  ([`25660fc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/25660fcd2016fc9fc28642e2a9058cc6f3c8c5e2))
+
+- **apply**: Return a refused preview from the shared Apply helper
+  ([`ba409d2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ba409d22a8bc5ba3b83fd1ae214b4d6b911e6ee5))
+
+- **ci**: Check only the commands a workflow runs for OpenGrep
+  ([`91a4bde`](https://github.com/marcinpsk/netbox-nso-plugin/commit/91a4bdefb3609be739590888d1270fcfa0057b46))
+
+- **ci**: Pin the joined lane to the adapter 204 dry-run fix
+  ([`aab5434`](https://github.com/marcinpsk/netbox-nso-plugin/commit/aab54342421080a9a7164b939505b17dbaad1a3e))
+
+- **ci**: Pin the joined lane to the adapter review fixes
+  ([`241dee5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/241dee5817d685ac90c7834a6ca0043ab7f9232d))
+
+- **refusal**: Check that a new preflight cause replaces the old one
+  ([`3a53687`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3a536876cd69a95c0149d222008177acd1117622))
+
+- **route-policy**: Count the dependency locks the promotion takes
+  ([`44cde7a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/44cde7a802221aa70ffe419b76d45d5bd327213d))
+
+- **settlement**: Replace snapshot checks that pass without snapshots
+  ([`5670ffd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5670ffde5582b4abc337d8fa03df46d7e638f929))
+
+- **settlement**: Stop the 40 ms stall on each test-double HTTP response
+  ([`bb98da4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bb98da414532abf58b9efaca61c5835d9e39873f))
+
+
 ## v1.17.0 (2026-11-03)
 
 
