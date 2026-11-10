@@ -1973,7 +1973,7 @@ def apply_preflight(adapter_device_id: int, selected: Mapping[str, int]) -> "App
 
 
 def apply_candidate_preflight(adapter_device_id: int, candidates: Mapping[str, dict]) -> "CandidatePreflight":
-    """Validate admission and delivery effects for complete candidate ingestion bodies."""
+    """Validate admission and delivery effects for complete candidate bodies keyed by delivery section."""
     from .apply_preflight import validate_candidate_preflight
 
     body = _request(

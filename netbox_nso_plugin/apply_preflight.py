@@ -184,7 +184,10 @@ def _delivery_effect(raw, streams):
 
 
 def validate_candidate_preflight(body, candidate_streams: Collection[str]) -> CandidatePreflight:
-    """Require exact candidate coverage, both hashes and the adapter's delivery effect."""
+    """Require exact candidate coverage, both hashes and the adapter's delivery effect.
+
+    ``candidate_streams`` names delivery sections (``interface_config``, ``lag``), not delivery keys.
+    """
     from .adapter_client import AdapterError
     from .delivery import delivery_keys
 

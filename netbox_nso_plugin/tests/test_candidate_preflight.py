@@ -115,6 +115,17 @@ def test_non_ready_candidate_admits_nothing_and_carries_no_hash(status):
     assert apply_preflight.validate_candidate_preflight(wire, {"vlan", "ip"}) == wire
 
 
+@pytest.mark.parametrize(("key", "section"), (("interface", "interface_config"), ("lacp", "lag")))
+def test_candidate_streams_are_delivery_sections_not_delivery_keys(key, section):
+    wire = make_apply_preflight({section: 41})
+    wire.pop("preflight_identity")
+    wire.update(candidate_identity="a" * 64, plan_digest="b" * 64, delivery_effect={"promotes": False})
+    assert apply_preflight.validate_candidate_preflight(wire, {section}) == wire
+    with pytest.raises(adapter_client.AdapterError) as raised:
+        apply_preflight.validate_candidate_preflight(wire, {key})
+    assert raised.value.code == "invalid_response"
+
+
 def test_candidate_cannot_admit_the_survivors_of_a_stored_selection_drop():
     wire = make_apply_preflight(
         {"vlan": 41, "ip": 42}, blocked={"ip": {"status": "blocked", "guard": {"interfaces": [["Ethernet1"]]}}}
