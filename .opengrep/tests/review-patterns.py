@@ -3047,6 +3047,52 @@ def overlay_natural_key(model, row):
     # ok: nso-overlay-natural-key-from-unique-together
     together = model._meta.unique_together
     return fields, key, together
+def adapter_error_text_in_intend_result():
+    try:
+        preflight()
+    except (_Refused, adapter_client.AdapterError) as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc), ordinary_delivery=False)
+    try:
+        preflight()
+    except RendererAuditRepairFailed as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(f"The candidate cannot be rendered: {exc}.")
+    except AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return IntendResult("refused", repr(exc))
+    try:
+        preflight()
+    except RendererAuditRepairFailed as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc))
+    except _Refused as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc))
+    except adapter_client.AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return intent_acquisition.IntendResult("refused", exc.args)
+    try:
+        preflight()
+    except adapter_client.AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return _refusal(f"Adapter failed: {exc}")
+    try:
+        preflight()
+    except AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return intent_acquisition._refusal(str(exc))
+    try:
+        preflight()
+    except RendererAuditRepairFailed as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(f"The candidate cannot be rendered: {exc}.")
+    except adapter_client.AdapterError as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(adapter_client.public_error_message(exc))
+    except (_Refused, IntentPlanStaleError) as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc), ordinary_delivery=isinstance(exc, _Refused) and exc.ordinary_delivery)
 
 
 class CaughtExceptionTextForm:
