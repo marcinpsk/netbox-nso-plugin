@@ -170,6 +170,21 @@ class TestIntendAcquisition(IntentPushResetMixin, TestCase):
     def test_confirm_requires_both_adapter_hashes(self):
         self.stale_confirmation(lambda _row: setattr(self.adapter, "identity", "c" * 64))
 
+    def test_confirm_ignores_management_delivery_and_settlement_records(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSOInterfaceMtuState.objects.create(
+            management=self.management, interface=self.interface, status="imported", l2_mtu=1500
+        )
+        preview = preview_intend(self.management, self.user, self.selection)
+        self.assertEqual(preview.status, "ready", preview.message)
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(
+            intent_push_attempts={"vlan": 7}, intent_push_errors={"vlan": "failed"}, settle_cursor_seq=7
+        )
+        with without_commit_drain():
+            result = confirm_intend(self.management, self.user, preview.confirmation)
+        self.assertEqual(result.status, "acquired", result.message)
+
     def test_confirmation_is_signed_and_bound_to_operator_and_management(self):
         from django.core import signing
 

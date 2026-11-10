@@ -71,6 +71,15 @@ def _values(row):
     return {field.attname: getattr(row, field.attname) for field in row._meta.concrete_fields}
 
 
+def _digest_values(row):
+    """Leave out management delivery and settlement records: they change without an acquisition input."""
+    values = _values(row)
+    if row._meta.label_lower == "netbox_nso_plugin.nsodevicemanagement":
+        for name in row._STALE_SAVE_PROTECTED_FIELDS:
+            del values[name]
+    return values
+
+
 def _existing(model, pk):
     from django.core.exceptions import ObjectDoesNotExist
 
@@ -469,9 +478,9 @@ def _plan(management, user, selection, timestamp, correlations):
     persisted, _ = _render(management, keys, None)
     digest = delivery.canonical_fingerprint(
         {
-            "management": _values(management),
+            "management": _digest_values(management),
             "native": [_values(row) for row in natives],
-            "dependencies": [(row._meta.label_lower, _values(row)) for row in dependencies],
+            "dependencies": [(row._meta.label_lower, _digest_values(row)) for row in dependencies],
             "before": [
                 _values(current) if current is not None else None for _scope, _native, current, _row in resolved
             ],
