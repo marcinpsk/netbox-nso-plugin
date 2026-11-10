@@ -27,10 +27,13 @@ class IntendAdapter(ReceiptAdapter):
         self.identity = "a" * 64
         self.plan_digest = "b" * 64
         self.before_response = None
+        self.error_response = None
 
     def _handle(self, method, url, **kwargs):
         if url.endswith("/actions/apply-preflight"):
             assert method == "POST"
+            if self.error_response is not None:
+                return self.error_response
             candidates = deepcopy(kwargs["json"]["candidates"])
             self.candidates.append(candidates)
             wire = make_apply_preflight(dict.fromkeys(candidates, 1))
@@ -184,6 +187,23 @@ class TestIntendAcquisition(IntentPushResetMixin, TestCase):
         with without_commit_drain():
             result = confirm_intend(self.management, self.user, preview.confirmation)
         self.assertEqual(result.status, "acquired", result.message)
+
+    def test_adapter_error_text_does_not_reach_the_refusal(self):
+        from netbox_nso_plugin.adapter_client import _PUBLIC_ERROR_DEFAULT
+
+        marker = "intermediary-body-marker"
+        error = make_response(502, content=f"<html>{marker}</html>".encode())
+        self.adapter.error_response = error
+        refused = preview_intend(self.management, self.user, self.selection)
+        self.adapter.error_response = None
+        preview = preview_intend(self.management, self.user, self.selection)
+        self.assertEqual(preview.status, "ready", preview.message)
+        self.adapter.error_response = error
+        confirmed = confirm_intend(self.management, self.user, preview.confirmation)
+        for result in (refused, confirmed):
+            self.assertEqual(result.status, "refused")
+            self.assertNotIn(marker, result.message)
+            self.assertIn(_PUBLIC_ERROR_DEFAULT, result.message)
 
     def test_confirmation_is_signed_and_bound_to_operator_and_management(self):
         from django.core import signing

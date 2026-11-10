@@ -534,6 +534,15 @@ def _refusal(message, preflight=None, *, ordinary_delivery=False):
     return IntendResult("refused", f"{message} {recovery}", preflight=preflight)
 
 
+def _failure_refusal(exc):
+    """Show authored refusal text, but only the public message of an adapter failure."""
+    from . import adapter_client
+
+    if isinstance(exc, adapter_client.AdapterError):
+        return _refusal(adapter_client.public_error_message(exc))
+    return _refusal(str(exc), ordinary_delivery=isinstance(exc, _Refused) and exc.ordinary_delivery)
+
+
 CONFIRMATION_MAX_AGE = 300
 _SIGNING_SALT = "netbox_nso_plugin.intent_acquisition"
 
@@ -596,7 +605,7 @@ def preview_intend(management, user, selection):
     except RendererAuditRepairFailed as exc:
         return _refusal(f"The candidate cannot be rendered: {exc}.")
     except (_Refused, IntentPlanStaleError, adapter_client.AdapterError) as exc:
-        return _refusal(str(exc), ordinary_delivery=isinstance(exc, _Refused) and exc.ordinary_delivery)
+        return _failure_refusal(exc)
 
 
 def _confirmation(management, user, confirmation):
@@ -679,4 +688,4 @@ def confirm_intend(management, user, confirmation):
     except RendererAuditRepairFailed as exc:
         return _refusal(f"The candidate cannot be rendered: {exc}.")
     except (_Refused, IntentPlanStaleError, adapter_client.AdapterError) as exc:
-        return _refusal(str(exc), ordinary_delivery=isinstance(exc, _Refused) and exc.ordinary_delivery)
+        return _failure_refusal(exc)
