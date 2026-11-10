@@ -58,9 +58,12 @@ def collection_gaps(family, document, *, schema_component=None):
                 for index, item in enumerate(collection):
                     if isinstance(item, dict):
                         walk(item, array["items"], f"{path}[{index}]", schema_path + "[]")
-            elif name == "segment_routing":
-                if not segment_routing_absent(parent) and observed_collection(parent, name) is MISSING:
-                    gaps.append(path)
+            elif (
+                name == "segment_routing"
+                and not segment_routing_absent(parent)
+                and observed_collection(parent, name) is MISSING
+            ):
+                gaps.append(path)
 
     root = definitions[schema_component] if schema_component else resolve(schema)["properties"]["document"]
     walk(document, root, "", "")

@@ -2372,9 +2372,10 @@ def _execute_manifest_lifecycle(device_id, requested, *, qualifying=None):
         elif action is OwnershipAction.DETACH:
             if _detach_manifest(manifest, expected_action=action, requested=requested):
                 completed.append((manifest.scope, manifest.pk))
-        elif action is OwnershipAction.RETIRE:
-            if _retire_manifest(manifest, expected_action=action, requested=requested):
-                completed.append((manifest.scope, manifest.pk))
+        elif action is OwnershipAction.RETIRE and _retire_manifest(
+            manifest, expected_action=action, requested=requested
+        ):
+            completed.append((manifest.scope, manifest.pk))
     return completed
 
 
