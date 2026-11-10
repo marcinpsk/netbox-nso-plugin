@@ -30,7 +30,7 @@ Follow the standard NetBox plugin pattern and keep responsibilities separated:
   - **Phase 2 (M6):** add `auto_apply` to `NSODeviceManagement`; add `NSOInterfaceState` (per-interface, per-attribute status overlay — `(interface, attribute)` unique; status enum matches `api-contract.md`; **intent value lives on `dcim.Interface`**, not on this model — decision C + decision G activated).
 - **`adapter_client.py`** — thin REST wrapper. Resolves URL and non-secret settings from the `AdapterConnection` singleton when present and `enabled`, otherwise from `PLUGINS_CONFIG["netbox_nso_plugin"]` (env). Reads `adapter_token` **only** from `PLUGINS_CONFIG`/env, never from the DB. Resolves per call with a short in-process cache (~30s) so UI edits to `AdapterConnection` take effect without a NetBox restart. Exposes:
   - Phase 1: `onboard_device()`, `set_scope()`, `get_device()`, `get_interfaces()`, `get_compliance()`, `trigger_sync()`, `trigger_check_compliance()`, `trigger_connect()`, `get_job()`, `patch_device()`, `delete_device()`, `notify_sync()`.
-  - Phase 2 (M5+): `put_intent(device_id, payload)`, `get_intent(device_id)`, `trigger_apply(device_id, selected)`.
+  - Phase 2 (M5+): `put_intent(device_id, payload)`, `get_intent(device_id)`, `apply_preflight(device_id, selected)`, `trigger_apply(device_id, attempt_id, selected, preflight_identity)`.
 - **`signals.py`** — `post_save` on `NSODeviceManagement` to onboard/update adapter scope (+ `auto_apply` once Phase 2) and `post_delete` to offboard the device. **Phase 2 (M6):** `post_save` on `NSOInterfaceState` (and on `dcim.Interface` when the interface is managed and `description`/`enabled` changed) pushes the device's full intent snapshot via `put_intent()` and calls `notify_sync()`.
 - **`views.py`, `urls.py`, `tables.py`, `forms.py`, `filters.py`, `navigation.py`** — standard NetBox CRUD/UI plumbing for the two Phase 1 models.
 - **`template_content.py`** — `PluginTemplateExtension` hooks for the device NSO tab and interface badge.
@@ -71,7 +71,8 @@ Expected adapter endpoints (Phase 1 unless noted):
 - **Phase 2 (M5+):**
   - `PUT /api/v1/devices/{id}/intent` — push the device's full intent snapshot
   - `GET /api/v1/devices/{id}/intent`
-  - `POST /api/v1/devices/{id}/actions/apply` — push intent to device (returns `501` until M4)
+  - `POST /api/v1/devices/{id}/actions/apply-preflight` — dry-run admission of an exact stored selection; a `ready` result carries `preflight_identity`
+  - `POST /api/v1/devices/{id}/actions/apply` — promote the selection; requires `apply_attempt_id`, `selected` and the `preflight_identity` of a ready preflight (`409 preflight_stale` when the inputs changed)
 - `GET /api/v1/jobs/{id}`
 
 Use `AdapterError` for transport/API failures and log warnings when signals cannot reach the adapter.
@@ -90,7 +91,7 @@ Use `AdapterError` for transport/API failures and log warnings when signals cann
 - **No Vault client in the plugin.** No `hvac` dependency. The token is env-injected into NetBox by deployment tooling (Ansible / ESO) from the same Vault entry the adapter reads — one secret, two consumers.
 - **No direct NSO calls.** All NSO interaction goes through the adapter.
 - **No reconciler assigns an interface's intent-bearing attributes from device state.** Read-path reconcilers never assign `description`, `enabled` or `mtu` on `dcim.Interface`; what the adapter reports for them lands in the `NSO*State` overlays. They do write native *structure* from device state: they create virtual interface rows (`svi_reconciler.py`, `subinterface_reconciler.py`), set `parent`, and seed L2 `mode`/`untagged_vlan`/`tagged_vlans` (`vlan_reconciler.py`). Those three attributes change only from the NetBox side (operator intent authoring, the accept/adopt views, link-role provisioning, the derived-description signal). Record any new native write here rather than relying on a count.
-- **Push goes through the adapter's intent/apply contract only.** Phase 2 added the push direction: the plugin pushes a full intent snapshot via `put_intent()` on signal, then `trigger_apply()`. It does **not** write device config any other way, and never bypasses the adapter.
+- **Push goes through the adapter's intent/apply contract only.** Phase 2 added the push direction: the plugin pushes a full intent snapshot via `put_intent()` on signal, then `apply_preflight()` and `trigger_apply()`. It does **not** write device config any other way, and never bypasses the adapter.
 - **No file-level `omit` entries in `[tool.coverage.run]`.** The only acceptable file-level exclusions are `*/migrations/*` and `*/tests/*`. Do not add `urls.py`, `tables.py`, `navigation.py`, or any other "purely declarative" file to the omit list — declarative module-scope code already gets 100% line coverage for free at import time, and the exclusion silently swallows any future branching logic added to that file. For genuinely unreachable lines use `# pragma: no cover` at the line. Full rationale in `../nso-adapter/docs/testing-strategy.md` §5.1.
 
 ## Polyrepo layout & cross-cutting docs

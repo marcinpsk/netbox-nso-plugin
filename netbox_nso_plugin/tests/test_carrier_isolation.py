@@ -7,7 +7,6 @@ from uuid import UUID
 
 import requests
 from django.test import SimpleTestCase
-from django.urls import reverse
 
 from netbox_nso_plugin import adapter_client
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
@@ -16,6 +15,7 @@ from netbox_nso_plugin.settlement import consume_static_route_settlements
 
 from ._adapter_http import make_evidence_envelope, make_generation_envelope, make_response
 from ._bgp_settlement import BGPSettlementHelpers
+from ._manual_capture_case import post_apply
 from ._outbox_case import own_vlan
 from ._settlement_wire import generation_wire, job_wire
 from .test_apply_selector import _no_op
@@ -529,10 +529,7 @@ class TestCarrierIsolation(CarrierIsolationHelpers, CoalescedCarrierHelpers, BGP
             raise requests.ConnectionError("The admission response was lost.")
 
         self.adapter.apply_response = lost_answer
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
+        response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 502)
         attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
         self.adapter.apply_response = lambda selected: (200, _no_op(selected))

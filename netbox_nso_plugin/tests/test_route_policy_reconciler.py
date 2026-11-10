@@ -17,7 +17,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
-from ._manual_capture_case import store_apply_selection
+from ._manual_capture_case import promote_preflighted_intent, store_apply_selection
 from ._outbox_case import ReceiptAdapter, make_managed
 from ._ownership_case import save_overlay_fixture
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -1565,7 +1565,6 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         """Apply must not bind an omitted LOCAL row to the MASTER carrier evidence."""
         from uuid import uuid4
 
-        from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
@@ -1598,7 +1597,7 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         registry, pushed, direct_selection = store_apply_selection(management)
         attempt_id = uuid4()
 
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             management,
             registry,
             pushed,
@@ -1657,17 +1656,15 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         )
 
     def _promotion_queries(self, prepared):
-        """Run promote_current_intent for one prepared device and return the SQL it issued."""
+        """Capture and confirm one device and return the SQL it issued."""
         from uuid import uuid4
 
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
 
-        from netbox_nso_plugin import apply_state
-
         direct_selection = prepared.direct_selection
         with CaptureQueriesContext(connection) as captured:
-            apply_state.promote_current_intent(
+            promote_preflighted_intent(
                 prepared.management,
                 prepared.registry,
                 prepared.pushed,
@@ -1706,10 +1703,10 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 self.assertIsNone(row.apply_attempt_id)
 
     def test_promotion_resolves_linked_route_policy_targets_without_per_row_queries(self):
-        """Linked LOCAL rows are promoted, and their target check stays one query per content type."""
+        """Linked LOCAL rows are promoted, and their class and target locks stay one query per content type."""
         from netbox_routing.models import CommunityList
 
-        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyObjectClass
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
 
         one = self._accepted_local_candidates(self.device, ["CL-LINKED-SOLO"], materialized=True)
         many = self._accepted_local_candidates(
@@ -1719,31 +1716,47 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         one_sql = self._promotion_queries(one)
         many_sql = self._promotion_queries(many)
 
-        attempt_table = NSOApplyAttempt._meta.db_table
-        class_table = NSORoutePolicyObjectClass._meta.db_table
-        target_table = CommunityList._meta.db_table
-        counts = []
-        for sqls in (one_sql, many_sql):
-            insert_at = next(index for index, sql in enumerate(sqls) if attempt_table in sql)
-            before_insert = sqls[:insert_at]
-            counts.append(
-                (
-                    sum(class_table in sql for sql in before_insert),
-                    sum(target_table in sql for sql in before_insert),
-                )
-            )
-        self.assertEqual(counts[0], counts[1], f"exclusion queries grew with the candidate count: {counts}")
+        locks = [f'FROM "{model._meta.db_table}"' for model in (NSORoutePolicyObjectClass, CommunityList)]
+        counts = [
+            tuple(sum(lock in sql and "FOR UPDATE" in sql for sql in sqls) for lock in locks)
+            for sqls in (one_sql, many_sql)
+        ]
+        self.assertTrue(all(all(count) for count in counts), f"no route-policy lock queries were captured: {counts}")
+        self.assertEqual(counts[0], counts[1], f"lock queries grew with the candidate count: {counts}")
+        lookups = tuple(sum(locks[0] in sql for sql in sqls) for sqls in (one_sql, many_sql))
+        self.assertEqual(lookups[0], lookups[1], f"class lookups grew with the candidate count: {lookups}")
         for prepared in (one, many):
             for row in prepared.rows:
                 row.refresh_from_db()
                 self.assertEqual(row.status, "deploying")
                 self.assertIsNotNone(row.apply_attempt_id)
 
+    def test_batch_footprint_keeps_the_per_row_lock_set_with_one_class_lookup(self):
+        """Resolving policy rows together locks what per-row resolution locks and reads classes once."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, footprint_for_instances
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+
+        self._accepted_local_candidates(self.device, ["CL-BATCH-SOLO"], materialized=True)
+        self._accepted_local_candidates(self.device2, [f"CL-BATCH-{index}" for index in range(6)], materialized=True)
+        rows = list(NSORoutePolicyState.objects.select_related("management").order_by("pk"))
+        expected = MutationFootprint.merge(*(footprint_for_instance(row) for row in rows))
+
+        with CaptureQueriesContext(connection) as captured:
+            footprint = footprint_for_instances(rows)
+
+        self.assertEqual(footprint, expected)
+        self.assertEqual(
+            {device_id for device_id, _scope in footprint.revision_keys}, {self.device.pk, self.device2.pk}
+        )
+        table = f'FROM "{NSORoutePolicyObjectClass._meta.db_table}"'
+        self.assertEqual(sum(table in query["sql"] for query in captured.captured_queries), 1)
+
     def test_promotion_excludes_a_local_row_whose_materialized_target_is_gone(self):
         """A LOCAL row with both GFK ids set but no target row stays excluded, as it does today."""
         from uuid import uuid4
-
-        from netbox_nso_plugin import apply_state
 
         from ._outbox_case import content_bulk_update
 
@@ -1752,7 +1765,7 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         content_bulk_update(row, object_id=row.object_id + 10_000)
         self._refresh_pushed_snapshot(prepared, self.device)
 
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             prepared.management,
             prepared.registry,
             prepared.pushed,
@@ -1772,7 +1785,6 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         from types import SimpleNamespace
         from uuid import uuid4
 
-        from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
 
@@ -1788,7 +1800,7 @@ class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, Transac
         prepared = SimpleNamespace(management=management, rows=[row])
         self._refresh_pushed_snapshot(prepared, self.device)
 
-        apply_state.promote_current_intent(
+        promote_preflighted_intent(
             prepared.management,
             prepared.registry,
             prepared.pushed,

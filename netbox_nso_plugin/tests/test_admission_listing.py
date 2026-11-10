@@ -39,8 +39,11 @@ class TestAdmissionListing(DeploymentCase):
         self.serve_terminal_evidence(generation, manual=kind == "known")
         original = self.adapter._handle
         changed = None
+        sends = []
 
         def handle(method, url, **kwargs):
+            if method == "POST" and url.endswith("/actions/apply"):
+                sends.append(kwargs["json"])
             answer = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = answer.json()
@@ -71,8 +74,13 @@ class TestAdmissionListing(DeploymentCase):
                 before_attempts = list(NSOApplyAttempt.objects.order_by("pk").values())
                 before_selections = list(NSOAcceptedSelection.objects.order_by("pk").values())
                 before_snapshots = list(self.attempt.overlay_snapshots.order_by("pk").values())
+                before_sends = len(sends)
                 with self.assertRaises(EvidenceInvariantError):
                     load_deployment_evidence(self.management)
+                self.assertEqual(len(sends) - before_sends, int(kind == "replayed"))
+                for attempt in before_attempts:
+                    if attempt["id"] == self.attempt.pk:
+                        attempt["send_seq"] += len(sends) - before_sends
                 self.assertEqual(list(NSOApplyAttempt.objects.order_by("pk").values()), before_attempts)
                 self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before_selections)
                 self.assertEqual(list(self.attempt.overlay_snapshots.order_by("pk").values()), before_snapshots)
@@ -93,8 +101,11 @@ class TestAdmissionListing(DeploymentCase):
         self.serve_terminal_evidence(self.terminal())
         NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=None, http_status=None)
         original = self.adapter._handle
+        sends = []
 
         def handle(method, url, **kwargs):
+            if method == "POST" and url.endswith("/actions/apply"):
+                sends.append(kwargs["json"])
             response = original(method, url, **kwargs)
             if method == "POST" and url.endswith("/deployment-evidence"):
                 document = response.json()
@@ -103,14 +114,19 @@ class TestAdmissionListing(DeploymentCase):
             return response
 
         self.adapter._handle = handle
-        before_attempts = list(NSOApplyAttempt.objects.values())
         before_selections = list(NSOAcceptedSelection.objects.values())
         for result in ("invalid", ["invalid"], 42, False):
             with self.subTest(result=result):
+                before_attempts = list(NSOApplyAttempt.objects.values())
+                before_sends = len(sends)
                 self.adapter.apply_response = lambda selected: (202, result)
                 with self.assertRaises(InvalidJobEvidence) as raised:
                     load_deployment_evidence(self.management)
                 self.assertEqual(raised.exception.reason, "invalid settlement evidence")
+                self.assertEqual(len(sends) - before_sends, 1)
+                for attempt in before_attempts:
+                    if attempt["id"] == self.attempt.pk:
+                        attempt["send_seq"] += 1
                 self.assertEqual(list(NSOApplyAttempt.objects.values()), before_attempts)
                 self.assertEqual(list(NSOAcceptedSelection.objects.values()), before_selections)
                 self.assertFalse(NSOApplyExecution.objects.exists())

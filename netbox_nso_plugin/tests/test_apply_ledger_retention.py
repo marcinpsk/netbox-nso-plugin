@@ -8,7 +8,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.core.management import CommandError, call_command
-from django.test import TransactionTestCase
+from django.db import connection
+from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from netbox_nso_plugin.durable_capture import mapping_epoch
@@ -601,3 +603,68 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
         self.assertFalse(NSOApplyExecution.objects.filter(settlement_issue=issue).exists())
         self.assertEqual(NSOSettlementIssue.objects.get(pk=issue.pk).state, "acknowledged")
+
+    def test_expired_unsent_preview_can_be_pruned_without_losing_a_submitted_attempt(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        from ._adapter_http import make_apply_preflight
+
+        old = timezone.now() - timedelta(days=31)
+        preview = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=1767,
+            preflight={"selected": {"vlan": 41}, "result": make_apply_preflight({"vlan": 41})},
+            selected={"vlan": 41},
+        )
+        NSOApplyAttempt.objects.filter(pk=preview.pk).update(created_at=old)
+        submitted = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=1767,
+            adapter_apply_attempt_id=uuid4(),
+            selected={"vlan": 41},
+        )
+        NSOApplyAttempt.objects.filter(pk=submitted.pk).update(created_at=old)
+        young = NSOApplyAttempt.objects.create(
+            management=self.management, adapter_device_id=1767, selected={"vlan": 41}
+        )
+        automatic = NSOApplyAttempt.objects.create(
+            management=self.management, adapter_device_id=1767, trigger_kind="push", selected={"vlan": 41}
+        )
+        NSOApplyAttempt.objects.filter(pk=automatic.pk).update(created_at=old)
+        result = prune_apply_ledger(execute=True)
+        self.assertEqual(result.deleted, 1)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=preview.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=submitted.pk).exists())
+        # An unexpired preview and an open automatic attempt fall outside the unsent-preview branch.
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=young.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=automatic.pk).exists())
+
+    def test_expired_manual_capture_without_preflight_keeps_its_execution(self):
+        attempt, execution = self.history()
+        NSOApplyAttempt.objects.filter(pk=attempt.pk).update(trigger_kind="manual")
+        self.prune(execute=True)
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertTrue(NSOApplyExecution.objects.filter(pk=execution.pk).exists())
+
+
+class TestApplyLedgerRetentionQueryPlan(TestCase):
+    def test_each_prune_batch_reads_candidates_in_index_order(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        for cursor in (None, f"{timezone.now().isoformat()}|{uuid4()}"):
+            with self.subTest(cursor=cursor):
+                with CaptureQueriesContext(connection) as queries:
+                    prune_apply_ledger(cursor=cursor)
+                candidate_queries = [
+                    query["sql"]
+                    for query in queries
+                    if '"netbox_nso_plugin_nsoapplyattempt"' in query["sql"] and "ORDER BY" in query["sql"]
+                ]
+                self.assertEqual(len(candidate_queries), 1)
+                with connection.cursor() as db:
+                    db.execute("SET LOCAL enable_seqscan = off")
+                    db.execute("SET LOCAL enable_bitmapscan = off")
+                    db.execute("EXPLAIN " + candidate_queries[0])
+                    plan = "\n".join(row[0] for row in db.fetchall())
+                self.assertIn("nso_attempt_prune", plan)
+                self.assertNotIn("Sort", plan)

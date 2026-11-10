@@ -12,10 +12,10 @@ import requests
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
 from django.test import TransactionTestCase
-from django.urls import reverse
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._manual_capture_case import post_apply
 from ._outbox_case import ReceiptAdapter, make_managed, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -76,10 +76,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             lambda selected: (202, {**_promoted(selected), "device_id": self.management.adapter_device_id})
         )
         adapter.preparation_revisions = self.adapter.preparation_revisions
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"])
         config, session = adapter.patches()
         with config, session:
-            response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         assert response.status_code == 200, response.content
         assert response.json()["status"] == "ok", response.content
         return adapter

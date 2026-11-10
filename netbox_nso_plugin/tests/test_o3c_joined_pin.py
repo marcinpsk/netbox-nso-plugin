@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "144504922a076a09df2287e73e4774c1415df72fa1ba5113d9fc8e7b865f752f"
+_ADAPTER_RUNTIME_DIGEST = "d0387e7e497ecde5d713808088a0548548a69c43177a7cf5f1f96b0f1dc2417a"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -203,6 +203,8 @@ class _RestconfState:
 
 class _RestconfHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Send headers and body at once: Nagle plus delayed ACK adds about 40 ms to each keep-alive response.
+    disable_nagle_algorithm = True
 
     @property
     def state(self) -> _RestconfState:

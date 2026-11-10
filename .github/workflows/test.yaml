@@ -16,7 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CI_SHARDS: "3"
+  # A matrix cannot read env, so test_sharding.py checks that the shard list is 1..CI_SHARDS.
+  CI_SHARDS: "4"
 
 jobs:
   test-netbox:
@@ -35,7 +36,7 @@ jobs:
           - python-version: "3.14"
             netbox-version: "v4.7.2"
             netbox-ref: "251458b89a5eb2f5fe0d20ecd1140ba08f141a9c"
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
 
     services:
       redis:
@@ -82,7 +83,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: 14cc8489ed2edf9a23598bfe8d4b498e8b7a9864
+          ref: d251f518e92b59be57d5abeeda09f6e961c1c0a9
           path: .o3c-adapter
           persist-credentials: false
 
@@ -276,7 +277,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: 14cc8489ed2edf9a23598bfe8d4b498e8b7a9864
+          ref: d251f518e92b59be57d5abeeda09f6e961c1c0a9
           path: refusal-adapter
           persist-credentials: false
 
@@ -297,17 +298,17 @@ jobs:
           ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:${{ job.services['adapter-postgres'].ports['5432'] }}/adapter
           ADAPTER_TOKEN: contract-adapter-token
           NETBOX_TOKEN: contract-netbox-token
-        # The instance entry is a name the store validates onboarding against, nothing more:
-        # it points at a closed port and the streams and both scheduler ticks are off, so no
-        # request ever leaves for it. Without it the store-side contract checks cannot create
-        # the throwaway devices they push intent to.
+        # The instance entry is a name the store validates onboarding against. Its port is
+        # closed except while a contract test serves contract_tests/_fake_nso.py there; the
+        # streams and both scheduler ticks are off. Without it the store-side contract checks
+        # cannot create the throwaway devices they push intent to.
         run: |
           cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<EOF
           secrets:
             provider: local
           nso_instances:
             - name: contract
-              base_url: http://127.0.0.1:9
+              base_url: http://127.0.0.1:18009
               username_ref: CONTRACT_NSO_USERNAME
               password_ref: CONTRACT_NSO_PASSWORD
           netbox:

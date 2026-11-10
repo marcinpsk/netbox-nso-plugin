@@ -510,3 +510,39 @@ class TestDeploymentProbeSchema(_CascadeFlushMixin, TransactionTestCase):
         self.assertIn(
             "nso_attempt_prune", {index.name for index in current.get_model(APP, "NSOApplyAttempt")._meta.indexes}
         )
+
+
+class TestPreLedgerMigration(_CascadeFlushMixin, TransactionTestCase):
+    def test_only_a_manual_attempt_without_identity_or_preflight_is_marked_pre_ledger(self):
+        from uuid import uuid4
+
+        from django.db.migrations.executor import MigrationExecutor
+
+        from ._adapter_http import make_stored_preflight
+        from ._outbox_case import make_managed
+
+        _device, management = make_managed("pre-ledger-migration", 1788)
+        executor = MigrationExecutor(connection)
+        leaves = executor.loader.graph.leaf_nodes(APP)
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
+        parent = (APP, "0043_attempt_prune_index")
+        executor.migrate([parent])
+        OldAttempt = executor.loader.project_state([parent]).apps.get_model(APP, "NSOApplyAttempt")
+        promoted_id = uuid4()
+        rows = {
+            "pre_ledger": OldAttempt.objects.create(management_id=management.pk),
+            "preview": OldAttempt.objects.create(
+                management_id=management.pk, preflight=make_stored_preflight({"bgp": 1})
+            ),
+            "promoted": OldAttempt.objects.create(
+                id=promoted_id, management_id=management.pk, adapter_apply_attempt_id=promoted_id
+            ),
+            "push": OldAttempt.objects.create(management_id=management.pk, trigger_kind="push"),
+        }
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaves)
+        Attempt = executor.loader.project_state(leaves).apps.get_model(APP, "NSOApplyAttempt")
+        marked = {name: Attempt.objects.get(pk=row.pk).pre_ledger for name, row in rows.items()}
+        self.assertEqual(marked, {"pre_ledger": True, "preview": False, "promoted": False, "push": False})
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Attempt.objects.filter(pk=rows["promoted"].pk).update(pre_ledger=True)

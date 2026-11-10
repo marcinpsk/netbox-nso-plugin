@@ -2193,8 +2193,8 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
     def test_prepare_apply_pushes_vlan_intent(self):
         """_prepare_apply ships the current owned VLAN through a forced receipt."""
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.views import _prepare_apply
 
+        from ._manual_capture_case import prepare_and_confirm_apply
         from ._outbox_case import content_update
 
         adapter = ReceiptAdapter()
@@ -2210,7 +2210,7 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
             self.assertEqual(
                 len([request for request in adapter.requests if request["url"].endswith("/vlan-intent")]), 2
             )
-            _prepared, selected = _prepare_apply(self.management)
+            _prepared, selected = prepare_and_confirm_apply(self.management)
 
         vlan_pushes = [request for request in adapter.requests if request["url"].endswith("/vlan-intent")]
         self.assertEqual(len(vlan_pushes), 3)

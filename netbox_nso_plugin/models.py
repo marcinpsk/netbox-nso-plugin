@@ -7,7 +7,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
-from django.db.models.functions import Now
+from django.db.models.functions import Coalesce, Now
 from django.urls import reverse
 from django.utils.functional import cached_property
 from netbox.models import NetBoxModel
@@ -3180,6 +3180,13 @@ class NSOSwitchingRootDeletion(models.Model):
         ]
 
 
+# A manual preview that never reached the adapter, also when its preflight call failed.
+UNSENT_MANUAL_PREVIEW = models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, pre_ledger=False)
+# Retention examines terminal attempts and manual previews that never reached the adapter.
+APPLY_ATTEMPT_PRUNABLE = models.Q(lifecycle="terminal") | UNSENT_MANUAL_PREVIEW
+APPLY_ATTEMPT_RETENTION_AT = Coalesce("completed_at", "created_at")
+
+
 class NSOApplyAttempt(models.Model):
     """One local Apply parent and its exact manual request, when present."""
 
@@ -3193,6 +3200,8 @@ class NSOApplyAttempt(models.Model):
     adapter_device_id = models.BigIntegerField(null=True, blank=True)
     scope_revisions = models.JSONField(default=dict, blank=True)
     selected = models.JSONField(default=dict, blank=True)
+    preflight = models.JSONField(null=True, blank=True)
+    send_seq = models.PositiveBigIntegerField(default=0)
     http_status = models.PositiveSmallIntegerField(null=True, blank=True)
     response = models.JSONField(null=True, blank=True)
     trigger_kind = models.CharField(
@@ -3201,6 +3210,8 @@ class NSOApplyAttempt(models.Model):
         choices=(("manual", "Manual"), ("push", "Push"), ("cadence", "Cadence"), ("explicit_retry", "Explicit retry")),
     )
     adapter_apply_attempt_id = models.UUIDField(null=True, blank=True)
+    # Migration 0045 marks a manual attempt that 0034 left without an adapter identity: it may have been sent.
+    pre_ledger = models.BooleanField(default=False)
     source_epoch = models.BigIntegerField(null=True, blank=True)
     lifecycle = models.CharField(max_length=16, default="open", choices=(("open", "Open"), ("terminal", "Terminal")))
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -3215,6 +3226,11 @@ class NSOApplyAttempt(models.Model):
                 condition=models.Q(lifecycle="open") | models.Q(completed_at__isnull=False),
                 name="nso_attempt_terminal_time",
             ),
+            models.CheckConstraint(
+                condition=models.Q(pre_ledger=False)
+                | models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, preflight__isnull=True),
+                name="nso_attempt_pre_ledger",
+            ),
             models.UniqueConstraint(
                 fields=["adapter_apply_attempt_id"],
                 condition=models.Q(adapter_apply_attempt_id__isnull=False),
@@ -3223,9 +3239,7 @@ class NSOApplyAttempt(models.Model):
         ]
         indexes = [
             models.Index(fields=["management", "-created_at"], name="nso_apply_attempt_device"),
-            models.Index(
-                fields=["completed_at", "id"], condition=models.Q(lifecycle="terminal"), name="nso_attempt_prune"
-            ),
+            models.Index(APPLY_ATTEMPT_RETENTION_AT, "id", condition=APPLY_ATTEMPT_PRUNABLE, name="nso_attempt_prune"),
         ]
         ordering = ["-created_at"]
         verbose_name = "NSO Apply Attempt"

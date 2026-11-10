@@ -10,7 +10,6 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.db.models.signals import post_save
 from django.test import TransactionTestCase
-from django.urls import reverse
 from ipam.models import ASN, RIR, IPAddress
 from netbox_routing.models import (
     BGPAddressFamily,
@@ -34,6 +33,7 @@ from netbox_nso_plugin.models import (
     NSORoutePolicyState,
 )
 
+from ._manual_capture_case import post_apply
 from ._outbox_case import ReceiptAdapter, make_managed, mirror_update, without_commit_drain
 from ._ownership_case import acquire_bgp_router, acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -164,10 +164,9 @@ class TestDurableSecretCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
             }
 
         adapter = ManualAdmissionAdapter(no_op)
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"])
         config, session = adapter.patches()
         with config, session:
-            response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+            response = post_apply(self.client, self.management, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(promoted, ["deploying"])

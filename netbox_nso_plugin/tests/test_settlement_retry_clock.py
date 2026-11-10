@@ -426,7 +426,7 @@ class TestTheClockDoesNotJudgeAnOrphanAttempt(_CarrierCase):
     def test_the_tick_does_not_escalate_while_an_apply_is_in_flight(self):
         """The clock the carrier had, which the tick must not be missing.
 
-        ``_prepare_apply`` promotes a row to ``deploying`` without re-stamping its generation
+        Apply confirmation promotes an admitted row to ``deploying`` without re-stamping its generation
         clock, so a route staged long before its Apply looks stuck the instant that Apply
         starts. Failing it there is unrecoverable: the apply's own ``in_sync`` cannot lift a
         row back out of ``apply_failed``.

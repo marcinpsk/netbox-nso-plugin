@@ -3493,6 +3493,23 @@ def carrier_generation_bypass(bound):
     return rows, filtered, collected, terminal
 
 
+def settlement_replay_records_directly(attempt, submission):
+    # ruleid: nso-settlement-record-response-bypass
+    record_response(attempt.pk, http_status=202, response={}, send_seq=attempt.send_seq)
+    # ruleid: nso-settlement-record-response-bypass
+    submission.record_response(attempt.pk, http_status=200, response={})
+
+
+def _record_replayed_response(attempt, *, http_status, response):
+    # ok: nso-settlement-record-response-bypass
+    return record_response(attempt.pk, http_status=http_status, response=response, send_seq=attempt.send_seq)
+
+
+def settlement_replay_records_through_helper(attempt):
+    # ok: nso-settlement-record-response-bypass
+    return _record_replayed_response(attempt, http_status=202, response={})
+
+
 def _carrier_generations(bound):
     # ok: nso-carrier-generations-bypass-helper
     return [generation for attempt in bound["attempts"] for generation in attempt["generations"]]
@@ -3596,3 +3613,59 @@ def scoped_owner_fence(row, management):
     NSOOverlaySettlementFence.objects.filter(management__device_id=OuterRef("device_id"), overlay_pk=OuterRef("pk"))
     # ok: nso-owner-fence-unscoped-lookup
     return NSOOverlaySettlementFence.objects.filter(management_id=management.pk, overlay_pk=row.pk)
+
+
+def copied_unsent_preview(attempt):
+    # ruleid: nso-unsent-preview-predicate-copy
+    prunable = models.Q(lifecycle="terminal") | models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True)
+    # ruleid: nso-unsent-preview-predicate-copy
+    NSOApplyAttempt.objects.filter(adapter_apply_attempt_id__isnull=True, lifecycle="open", trigger_kind="manual")
+    # ruleid: nso-unsent-preview-predicate-copy
+    if attempt.trigger_kind == "manual" and attempt.adapter_apply_attempt_id is None:
+        return prunable
+    # ruleid: nso-unsent-preview-predicate-copy
+    return attempt.adapter_apply_attempt_id is None and attempt.trigger_kind == "manual"
+
+
+def shared_unsent_preview(attempt):
+    # ok: nso-unsent-preview-predicate-copy
+    UNSENT_MANUAL_PREVIEW = models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True, pre_ledger=False)
+    # ok: nso-unsent-preview-predicate-copy
+    models.CheckConstraint(condition=models.Q(trigger_kind="manual", adapter_apply_attempt_id__isnull=True), name="c")
+    # ok: nso-unsent-preview-predicate-copy
+    NSOApplyAttempt.objects.filter(trigger_kind="manual", response__isnull=True).exclude(UNSENT_MANUAL_PREVIEW)
+    # ok: nso-unsent-preview-predicate-copy
+    first = attempt.adapter_apply_attempt_id is None
+    # ok: nso-unsent-preview-predicate-copy
+    return first and attempt.trigger_kind == "cadence" and attempt.adapter_apply_attempt_id is None
+
+
+def per_row_overlay_footprints(snapshots, rows):
+    footprints = []
+    for item in snapshots:
+        row = OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first()
+        if row is not None:
+            # ruleid: nso-per-row-overlay-footprint
+            footprints.append(footprint_for_instance(row))
+    for item in snapshots:
+        row = OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first()
+        # ruleid: nso-per-row-overlay-footprint
+        footprints.append(intent_state.footprint_for_instance(row))
+    # ruleid: nso-per-row-overlay-footprint
+    MutationFootprint.merge(*(intent_state.footprint_for_instance(row) for row in rows))
+    # ruleid: nso-per-row-overlay-footprint
+    return MutationFootprint.merge(*(footprint_for_instance(row) for row in rows))
+
+
+def batched_overlay_footprints(snapshots, rows, stale, spec):
+    loaded = (OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first() for item in snapshots)
+    # ok: nso-per-row-overlay-footprint
+    footprint = footprint_for_instances(row for row in loaded if row is not None)
+    for _attempt in range(2):
+        # ok: nso-per-row-overlay-footprint
+        plan = footprint_for_instance(stale)
+    for row in rows:
+        # ok: nso-per-row-overlay-footprint
+        plan = footprint_for_instance(row, spec)
+    # ok: nso-per-row-overlay-footprint
+    return MutationFootprint.merge(footprint, plan, *(footprint_for_instance(row, spec) for row in rows))
