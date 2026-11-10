@@ -71,7 +71,8 @@ Expected adapter endpoints (Phase 1 unless noted):
 - **Phase 2 (M5+):**
   - `PUT /api/v1/devices/{id}/intent` — push the device's full intent snapshot
   - `GET /api/v1/devices/{id}/intent`
-  - `POST /api/v1/devices/{id}/actions/apply` — push intent to device (returns `501` until M4)
+  - `POST /api/v1/devices/{id}/actions/apply-preflight` — dry-run admission of an exact stored selection; a `ready` result carries `preflight_identity`
+  - `POST /api/v1/devices/{id}/actions/apply` — promote the selection; requires `apply_attempt_id`, `selected` and the `preflight_identity` of a ready preflight (`409 preflight_stale` when the inputs changed)
 - `GET /api/v1/jobs/{id}`
 
 Use `AdapterError` for transport/API failures and log warnings when signals cannot reach the adapter.
