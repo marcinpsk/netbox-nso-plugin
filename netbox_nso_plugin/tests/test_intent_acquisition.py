@@ -188,6 +188,18 @@ class TestIntendAcquisition(IntentPushResetMixin, TestCase):
             result = confirm_intend(self.management, self.user, preview.confirmation)
         self.assertEqual(result.status, "acquired", result.message)
 
+    def test_confirm_ignores_management_records_written_during_its_preflight(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        preview = preview_intend(self.management, self.user, self.selection)
+        self.assertEqual(preview.status, "ready", preview.message)
+        self.adapter.before_response = lambda: NSODeviceManagement.objects.filter(pk=self.management.pk).update(
+            intent_push_attempts={"vlan": 8}, settle_cursor_seq=8
+        )
+        with without_commit_drain():
+            result = confirm_intend(self.management, self.user, preview.confirmation)
+        self.assertEqual(result.status, "acquired", result.message)
+
     def test_adapter_error_text_does_not_reach_the_refusal(self):
         from netbox_nso_plugin.adapter_client import _PUBLIC_ERROR_DEFAULT
 

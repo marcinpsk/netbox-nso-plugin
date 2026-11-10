@@ -658,6 +658,8 @@ def confirm_intend(management, user, confirmation):
             locked = _plan(management, user, selection, timestamp, correlations)
             if locked[5] != digest or locked[4] != bodies or locked[6].lock_footprint != mutation.lock_footprint:
                 raise _Refused("Acquisition inputs changed under the writer locks. Preview again.")
+            # The writer validates the rows that the locked plan read.
+            management, batch, mutation = locked[0], locked[1], locked[6]
             if signals._intent_push_is_silenced():
                 raise _Refused("Ordinary delivery scheduling is suppressed.")
             created_identities = {id(row) for row in batch.overlays if row.pk is None}
