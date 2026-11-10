@@ -2,9 +2,12 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """#1627: every delivery renderer is a pure database read."""
 
+from unittest.mock import patch
+
 from django.db import connection, transaction
 from django.test import TransactionTestCase
 
+from ._candidate_render_case import persist_candidates, render_candidates
 from ._outbox_case import make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -25,6 +28,9 @@ class TestDeliveryRenderPurity(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 vault_ref="network/netbox/snmp/v3/legacy-user",
                 status="accepted",
             )
+        retained, relations = render_candidates(self.device, self.management, 2)
+        persist_candidates(retained, relations)
+        self.candidates, self.relations = render_candidates(self.device, self.management, 1)
 
     def test_every_registered_scope_renders_on_a_read_only_connection(self):
         from netbox_nso_plugin import delivery
@@ -34,3 +40,21 @@ class TestDeliveryRenderPurity(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 cursor.execute("SET TRANSACTION READ ONLY")
             for scope in delivery.delivery_keys():
                 delivery.render(scope, self.device.pk, self.management.adapter_device_id)
+
+    def test_populated_candidates_and_planned_m2m_render_on_a_read_only_connection(self):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.candidate_render import CandidateBatch
+
+        batch = CandidateBatch(self.candidates, self.relations)
+        before = tuple(tuple(row.__dict__.items()) for row in batch.overlays)
+        with patch("netbox_nso_plugin.adapter_client.requests.Session") as transport, transaction.atomic():
+            transport.side_effect = AssertionError("rendering must not open an HTTP session")
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION READ ONLY")
+            for scope in delivery.delivery_keys():
+                rendered = delivery.render(scope, self.device.pk, self.management.adapter_device_id, candidates=batch)
+                repeated = delivery.render(scope, self.device.pk, self.management.adapter_device_id, candidates=batch)
+                self.assertEqual(rendered.payload, repeated.payload)
+            transport.assert_not_called()
+        self.assertTrue(all(row.pk is None for row in batch.overlays))
+        self.assertEqual(tuple(tuple(row.__dict__.items()) for row in batch.overlays), before)

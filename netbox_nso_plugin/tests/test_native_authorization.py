@@ -199,11 +199,12 @@ class TestEndpointEffectCensus(SimpleTestCase):
             self.assertEqual(found[endpoint], {"native_mutation"})
 
 
-# Advisory locks, sequence reads, transaction settings and plugin-table upserts; the two
-# execute-wrapper callbacks forward a statement without writing one.
+# Advisory locks, sequence reads, transaction settings, plugin-table upserts and one read-only
+# collation ranking; the two execute-wrapper callbacks forward a statement without writing one.
 _RAW_SQL_ALLOWLIST = (
     "apply_state.py:lock_device_intent_transaction:execute",
     "apply_state.py:lock_shared_dependencies:execute",
+    "candidate_render.py:_text_value_ranks:execute",
     "deployment.py:_exclusive_transition_pending:execute",
     "deployment.py:lock_mutation:execute",
     "deployment.py:operation:execute",

@@ -28,6 +28,8 @@ import threading
 import time
 from collections.abc import Callable
 
+from .candidate_render import CandidateBatch, bind_candidates
+
 MODE_NORMAL = "normal"
 MODE_STORE_ONLY = "store_only"
 #: Adopt the ids of the rows the body still names and prune the uncorrelated residue; accept
@@ -172,13 +174,14 @@ def capture(rendered: Rendered) -> bool:
     return True
 
 
-def render(key: str, device_id, adapter_device_id) -> Rendered:
+def render(key: str, device_id, adapter_device_id, *, candidates: CandidateBatch | None = None) -> Rendered:
     """Build the key's request body for one device without sending anything."""
     entry = delivery_keys()[key]
     sink: list = []
     token = _CAPTURE.set(sink)
     try:
-        entry.push(device_id, adapter_device_id)
+        with bind_candidates(candidates, device_id):
+            entry.push(device_id, adapter_device_id)
     finally:
         _CAPTURE.reset(token)
     if len(sink) != 1:
