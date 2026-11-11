@@ -126,6 +126,7 @@ def _candidate(management, user, item, timestamp, correlations):
     from django.core.exceptions import ValidationError
 
     from . import status_machine as sm
+    from .candidate_render import natural_key_fields
     from .models import NSOOwnershipManifest
     from .ownership_planner import _state_filters, converted_scope_rules
 
@@ -134,7 +135,7 @@ def _candidate(management, user, item, timestamp, correlations):
     manifest_stub = SimpleNamespace(state_model_label=label, state_key=state_key, acknowledged_lineage=[])
     model, filters = _state_filters(manifest_stub, rule, native, management)
     draft = model(**filters)
-    lookup = {name: getattr(draft, model._meta.get_field(name).attname) for name in model._meta.unique_together[0]}
+    lookup = {name: getattr(draft, model._meta.get_field(name).attname) for name in natural_key_fields(model)}
     current = model.objects.filter(**lookup).first()
     if label.endswith(".nsoredistributionstate"):
         observations = list(model.objects.filter(management=management, redistribution=native))
@@ -417,7 +418,7 @@ def _plan(management, user, selection, timestamp, correlations):
     import copy
 
     from . import delivery
-    from .candidate_render import CandidateBatch, overlay_identity
+    from .candidate_render import CandidateBatch, natural_key_fields, overlay_identity
     from .intent_state import MutationFootprint
     from .models import NSODeviceManagement, NSOIntentRevision, NSOOwnershipManifest, NSOSwitchingRootDeletion
     from .ownership_grants import OwnershipGrant
@@ -500,7 +501,7 @@ def _plan(management, user, selection, timestamp, correlations):
         }
     )
     saves = tuple(
-        planned_save(row, force_insert=row.pk is None, natural_key=row._meta.unique_together[0]) for row in rows
+        planned_save(row, force_insert=row.pk is None, natural_key=natural_key_fields(type(row))) for row in rows
     )
     mutation = RendererMutationPlan.build(
         saves=saves,
