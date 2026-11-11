@@ -258,7 +258,7 @@ class TestAcquisitionQualification(IntentPushResetMixin, TestCase):
                 kinds = inherited.get(kind, {kind})
                 self.assertLessEqual(kinds, GRANTS)
                 exercised.update(kinds)
-        self.assertEqual(exercised, GRANTS - {"intend"})
+        self.assertEqual(exercised, GRANTS)
 
     def test_qualifying_accept_survives_audit_for_every_scope_and_grant(self):
         for rule in converted_scope_rules().values():

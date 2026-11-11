@@ -36,7 +36,9 @@
 <script src="{% static 'netbox_nso_plugin/nso-grid-redistribution.js' %}"></script>
 {# Route-policy compact object links and safe route-map rename. #}
 <script src="{% static 'netbox_nso_plugin/nso-grid-route-policy.js' %}"></script>
+<script src="{% static 'netbox_nso_plugin/nso-device-differences.js' %}"></script>
 {% if mgmt %}
+  {% include 'netbox_nso_plugin/inc/_intend_outcomes.html' %}
 
   {# ── Adapter link/sync failure — managing this device couldn't reach the adapter ─────── #}
   {% if mgmt.adapter_link_error %}
@@ -1396,38 +1398,7 @@
       });
     })();
 
-    (function () {
-      "use strict";
-      function loadDifferences(panel, parameters) {
-        var form = panel.querySelector('[data-differences-filter]');
-        fetch(form.action + '?' + parameters.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-          .then(function (response) { if (!response.ok) throw new Error('HTTP ' + response.status); return response.text(); })
-          .then(function (html) {
-            var container = document.createElement('div'); container.innerHTML = html;
-            var next = container.querySelector('[data-differences-panel]');
-            if (!next) throw new Error('response has no differences panel');  // e.g. the login page after a session expiry
-            panel.replaceWith(next);
-          })
-          .catch(function () {
-            var message = document.createElement('div'); message.className = 'text-danger small';
-            message.textContent = 'Failed to load differences.'; panel.prepend(message);
-          });
-      }
-      document.addEventListener('change', function (event) {
-        var form = event.target.closest('[data-differences-filter]'); if (!form) return;
-        loadDifferences(form.closest('[data-differences-panel]'), new URLSearchParams(new FormData(form)));
-      });
-      document.addEventListener('submit', function (event) {
-        var form = event.target.closest('[data-differences-filter]'); if (!form) return;
-        event.preventDefault();
-        loadDifferences(form.closest('[data-differences-panel]'), new URLSearchParams(new FormData(form)));
-      });
-      document.addEventListener('click', function (event) {
-        var link = event.target.closest('[data-differences-page]'); if (!link) return;
-        event.preventDefault();
-        loadDifferences(link.closest('[data-differences-panel]'), new URLSearchParams(link.search));
-      });
-    })();
+
 
     // ── Generic category pager (read-from-last-synced, paginated) ──────────────
     // Delegated on document so it works for every .nso-cat-pager fragment, even

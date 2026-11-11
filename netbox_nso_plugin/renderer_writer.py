@@ -1292,7 +1292,10 @@ class RendererWriter:
         return (
             write.model_label in OVERLAY_MODEL_RANKS
             and dict(write.values).get("status") in OWNED_STATES
-            and (before.get("status") not in OWNED_STATES or (self.grant is not None and self.grant.kind == "accept"))
+            and (
+                before.get("status") not in OWNED_STATES
+                or (self.grant is not None and self.grant.kind in {"accept", "intend"})
+            )
         )
 
     def queryset_update_is_authorized(self, queryset, values, rows):

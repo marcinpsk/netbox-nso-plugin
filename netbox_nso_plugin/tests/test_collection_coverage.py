@@ -47,6 +47,11 @@ class TestInterfaceCollectionComparison(TestCase):
         self.assertEqual(response.status_code, 200)
         return response, response.context["page_obj"].object_list
 
+    def _table(self, response):
+        # The Intend catalog lists native rows on purpose, so check only the difference rows.
+        content = response.content.decode()
+        return content[content.index("<tbody>") : content.index("</tbody>")]
+
     def test_covered_empty_addresses_offer_native_address_difference(self):
         entry = ip_observation("lag-60")
         entry["addresses"] = []
@@ -60,7 +65,7 @@ class TestInterfaceCollectionComparison(TestCase):
                 response, rows = self._page("interface_ip", observation("interface_ip", interfaces=[entry]))
                 self.assertEqual([row["kind"] for row in rows], ["unavailable"])
                 self.assertContains(response, "addresses")
-                self.assertNotContains(response, "198.18.0.1/24")
+                self.assertNotIn("198.18.0.1/24", self._table(response))
 
     def test_uncovered_interfaces_report_component_gap(self):
         for family in ("interface_ip", "interface_attributes"):
@@ -71,7 +76,7 @@ class TestInterfaceCollectionComparison(TestCase):
                     response, rows = self._page(family, snapshot)
                     self.assertEqual([row["kind"] for row in rows], ["unavailable"])
                     self.assertContains(response, "interfaces")
-                    self.assertNotContains(response, "198.18.0.1/24")
+                    self.assertNotIn("198.18.0.1/24", self._table(response))
 
     def test_address_gap_uses_bound_port_and_keeps_covered_interfaces_comparable(self):
         other = Interface.objects.create(device=self.device, name="Ethernet1", type="virtual")

@@ -2075,15 +2075,20 @@ def stored_static_route_count(response):
     return count
 
 
+def _static_route_triple(route):
+    """Project the native identity shared by content and deletion delivery."""
+    from .outbox import triple_of
+
+    return triple_of(route.vrf.name if route.vrf_id else "", str(route.prefix), str(route.next_hop))
+
+
 def static_route_intent_item(row):
     """Return one owned static-route overlay in the adapter's exact wire shape."""
     route = row.static_route
     item = {
         "route_id": route.pk,
         "generation": row.intent_generation or None,
-        "vrf": route.vrf.name if route.vrf else "",
-        "prefix": str(route.prefix),
-        "next_hop": str(route.next_hop),
+        **_static_route_triple(route),
         "permanent": route.permanent or False,
         "tag": route.tag,
     }
@@ -2258,18 +2263,27 @@ _STATIC_ROUTE_TRANSITION_FIELDS = (
 
 
 def _static_route_delete_transition(row, static_route_id):
-    """Record what is leaving, from the overlay that still mirrors it.
+    """Record the acknowledged and desired identities when ownership ends.
 
-    The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
-    whose push never landed leaves the adapter holding the older one; an id plus the current
-    triple alone would match nothing there, be classified moot and detach the route silently.
+    The acknowledged triple can differ from the native intent that is pending storage.
+    Keep both identities so deletion can match either adapter snapshot.
     """
+    from netbox_routing.models import StaticRoute
+
     from . import outbox
+
+    route = StaticRoute.objects.filter(pk=static_route_id).first()
+    # A completed native cascade leaves only the overlay's observed identity.
+    current = (
+        _static_route_triple(route)
+        if route is not None
+        else outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop)
+    )
 
     return outbox.delete_transition(
         static_route_id,
         last_acked=row.last_acked_triple,
-        current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
+        current=current,
     )
 
 

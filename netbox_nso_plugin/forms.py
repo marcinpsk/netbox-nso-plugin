@@ -29,6 +29,41 @@ from .ownership_grants import OwnershipGrant
 from .vault_refs import VaultRefError, parse_vault_ref, qualify_snmp_ref, secret_fingerprint
 
 
+class IntendSelectionForm(forms.Form):
+    """Resolve posted identity tokens and validate explicit acquisition options."""
+
+    def __init__(self, *args, management, user, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.management = management
+        self.user = user
+
+    def clean(self):
+        from .device_intend import intend_choices
+
+        values = super().clean()
+        selection = []
+        catalog = {
+            choice["token"]: choice["selection"]
+            for choice in intend_choices(self.management, self.user, identities=False)
+        }
+        for token in dict.fromkeys(self.data.getlist("intend_row")):
+            if token not in catalog:
+                raise forms.ValidationError(
+                    "The native selection is no longer visible or has changed. Select the rows again."
+                )
+            options = {}
+            for name, field in (
+                ("lag_id", forms.IntegerField(min_value=1, required=False)),
+                ("restart", forms.ChoiceField(choices=(("true", "Restart"),), required=False)),
+            ):
+                value = field.clean(self.data.get(f"{name}-{token}"))
+                if value is not None and value != "":
+                    options[name] = True if name == "restart" else value
+            selection.append({**catalog[token], "options": options})
+        values["selection"] = selection
+        return values
+
+
 class NSOSubinterfaceCreateForm(forms.Form):
     """Collect an explicit parent, unit, and dot1q tag for one managed device."""
 

@@ -2090,11 +2090,31 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 {
                     "op": "delete",
                     "route_id": route.pk,
-                    "triples": [{"vrf": "", "prefix": "198.18.98.0/24", "next_hop": ""}],
+                    "triples": [{"vrf": "", "prefix": "198.18.98.0/24", "next_hop": "198.18.0.1"}],
                     "unverified": True,
                 }
             ],
         )
+
+    def test_static_route_delete_transition_survives_a_missing_native_route(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.signals import _static_route_delete_transition
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.97.0/24", next_hop="198.18.0.1")
+        state = NSOStaticRouteState.objects.create(
+            management=mgmt, static_route=route, nso_prefix="198.18.97.0/24", nso_next_hop="198.18.0.1"
+        )
+        route_id = route.pk
+        route.delete()
+        state._state.fields_cache.clear()
+
+        transition = _static_route_delete_transition(state, route_id)
+
+        self.assertEqual(transition["route_id"], route_id)
+        self.assertEqual(transition["triples"], [{"vrf": "", "prefix": "198.18.97.0/24", "next_hop": "198.18.0.1"}])
 
     def test_foreign_l2_sap_delete_does_not_push(self):
         from netbox_nso_plugin.models import NSOL2SapState

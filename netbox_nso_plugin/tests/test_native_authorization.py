@@ -220,6 +220,8 @@ _RAW_SQL_ALLOWLIST = (
     "drain.py:_repeatable_read:execute",
     "drain.py:reset_offboard_state:execute",
     "drain.py:_record_capture_refusal:execute",
+    # Candidate proof reads use a repeatable snapshot without native DML.
+    "intent_acquisition.py:_snapshot:execute",
     "intent_generation.py:allocate_intent_generation:execute",
     "intent_state.py:renderer_query_trace.trace:execute",
     "intent_state.py:mirror_transaction:execute",
