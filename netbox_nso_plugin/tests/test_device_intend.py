@@ -537,6 +537,29 @@ class TestIntendDelivery(IntendViewFixture, _CascadeFlushMixin, IntentPushResetM
             self.assertGreater(row.accepted_at, accepted_at)
         self.assertContains(self.client.get(self.url("differences")), "acquired; stored")
 
+    def test_outcome_query_count_does_not_grow_with_acquired_rows(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.device_intend import acquisition_outcomes
+
+        def counted():
+            with CaptureQueriesContext(connection) as queries:
+                outcomes = acquisition_outcomes(self.management)
+            return [outcome["text"] for outcome in outcomes], len(queries)
+
+        self.confirm(self.preview())
+        one = counted()
+        others = [
+            Interface.objects.create(device=self.device, name=f"Ethernet{index}", type="1000base-t", mtu=9000 + index)
+            for index in (2, 3, 4)
+        ]
+        tokens = [self.selection(native=interface)["intend_row"][0] for interface in others]
+        self.assertContains(self.confirm(self.preview({"intend_row": tokens})), "acquired; delivery pending")
+        self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, grant_kind="intend").count(), 4)
+        self.assertEqual(one[0], ["acquired; stored"])
+        self.assertEqual(counted(), one)
+
     def test_acquisition_ordinary_acknowledgement_and_apply_available(self):
         from netbox_nso_plugin import drain
 

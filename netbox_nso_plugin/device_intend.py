@@ -123,6 +123,8 @@ def difference_choices(row, choices):
 
 def acquisition_outcomes(management):
     """Report storage only from ordinary acknowledgements for the current owners."""
+    from django.db.models import Q
+
     from . import delivery
     from .adapter_client import AdapterError, public_error_message
     from .durable_capture import mapping_epoch
@@ -134,26 +136,29 @@ def acquisition_outcomes(management):
     )
     from .ownership_planner import _state_filters_without_native, converted_scope_rules
     from .refusal_registry import OVERLAYS
-    from .selection_manifest import current_content_digest
+    from .selection_manifest import current_content_digest, owner_relations
     from .status_machine import OWNED_STATES
 
     if management is None:
         return []
     owners = defaultdict(dict)
     rules = converted_scope_rules()
+    groups = defaultdict(list)
     for manifest in NSOOwnershipManifest.objects.filter(
         device_id=management.device_id, grant_kind="intend", ownership_state="owned"
     ):
-        spec = OVERLAYS[manifest.state_model_label]
-        rule = rules[
-            "redistribution" if manifest.state_model_label.endswith(".nsoredistributionstate") else manifest.scope
-        ]
-        model, filters = _state_filters_without_native(manifest, rule, management)
-        row = model.objects.filter(
-            **filters, status__in=OWNED_STATES, **{spec.device_lookup: management.device_id}
-        ).first()
-        if row is not None:
-            owners[manifest.scope][(manifest.state_model_label, row.pk)] = row
+        groups[(manifest.state_model_label, manifest.scope)].append(manifest)
+    for (label, scope), manifests in sorted(groups.items()):
+        spec = OVERLAYS[label]
+        rule = rules["redistribution" if label.endswith(".nsoredistributionstate") else scope]
+        query = Q(pk__in=[])
+        for manifest in manifests:
+            model, filters = _state_filters_without_native(manifest, rule, management)
+            query |= Q(**filters)
+        for row in model.objects.select_related(*owner_relations(spec)).filter(
+            query, status__in=OWNED_STATES, **{spec.device_lookup: management.device_id}
+        ):
+            owners[scope][(label, row.pk)] = row
     epoch = mapping_epoch(management)
     outcomes = []
     for key, by_owner in sorted(owners.items()):
@@ -168,21 +173,18 @@ def acquisition_outcomes(management):
             selection__publication_state="sent",
             selection__acknowledged_at__isnull=False,
         ).exclude(selection__binding_state="invalidated")
-        stored = (
-            revision is not None
-            and revision.verified_revision == revision.revision
-            and all(
+        stored = revision is not None and revision.verified_revision == revision.revision
+        if stored:
+            acknowledged = set(
+                snapshots.filter(selection__plugin_revision=revision.revision).values_list(
+                    "model_label", "overlay_pk", "accepted_at", "content_digest"
+                )
+            )
+            stored = all(
                 row.accepted_at is not None
-                and snapshots.filter(
-                    selection__plugin_revision=revision.revision,
-                    model_label=row._meta.label_lower,
-                    overlay_pk=row.pk,
-                    accepted_at=row.accepted_at,
-                    content_digest=current_content_digest(row),
-                ).exists()
+                and (row._meta.label_lower, row.pk, row.accepted_at, current_content_digest(row)) in acknowledged
                 for row in rows
             )
-        )
         error = (management.intent_push_errors or {}).get(key)
         if (
             state
