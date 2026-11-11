@@ -1,0 +1,11 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba #}
+{% if intend_outcomes %}
+<div class="card mb-3" data-intend-outcomes>
+  <h6 class="card-header">Intend acquisition</h6>
+  <div class="card-body">
+    {% for outcome in intend_outcomes %}<div class="mb-1"><strong>{{ outcome.scope }}</strong>: <span class="badge {{ outcome.css }}">{{ outcome.text }}</span></div>{% endfor %}
+    <p class="small text-muted mb-0">Acquisition is not deployment. Storage confirms ordinary delivery to the adapter. Complete or repair ordinary delivery before retrying a refused acquisition.</p>
+  </div>
+</div>
+{% endif %}

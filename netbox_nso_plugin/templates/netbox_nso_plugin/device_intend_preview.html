@@ -1,0 +1,79 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Intend: {{ device }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-xl-10 offset-xl-1">
+    <div class="card mb-3" data-intend-preview>
+      <h5 class="card-header">Intend {% if result.status == 'ready' %}preview{% else %}outcome{% endif %}</h5>
+      <div class="card-body">
+        <p>Intend acquires NetBox intent and schedules ordinary delivery. Acquisition is not deployment.</p>
+        <p class="small text-muted">Later promoting work committed after acquisition carries every acquired row in that stream and has no selective delivery guarantee. A refusal fails the generation. Abandoning it releases ordering but does not repair its authorized baseline.</p>
+        <div class="alert {% if result.status == 'refused' %}alert-danger{% elif result.status == 'acquired' %}alert-warning{% else %}alert-info{% endif %}" role="alert" data-intend-result>{{ result.message }}</div>
+
+        {% if result.details %}
+          <h6>Selected overlays and explicit dependencies</h6>
+          <p class="small text-muted">Select every required unowned dependency explicitly. Existing owners are retained.</p>
+          {% for row in result.details.selected %}
+            <div class="card mb-3" data-intend-selected>
+              <div class="card-header"><strong>{{ row.scope }}</strong>: {{ row.label }} ({{ row.native_model }} #{{ row.native_id }})</div>
+              <div class="card-body">
+                <p class="small mb-2">Overlay: <code>{{ row.model }}</code>. State key: <code>{{ row.state_key }}</code>. Explicit options: <code>{{ row.options }}</code>.</p>
+                <div class="table-responsive">
+                  <table class="table table-sm mb-0">
+                    <thead><tr><th>Affected field</th><th>Before</th><th>After acquisition</th></tr></thead>
+                    <tbody>{% for field in row.fields %}<tr><td>{{ field.name }}</td><td><code>{{ field.before }}</code></td><td><code>{{ field.after }}</code></td></tr>{% endfor %}</tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          {% endfor %}
+          <h6>Retained owners</h6>
+          <ul class="small" data-intend-retained>
+            {% for row in result.details.retained %}<li>{{ row.model }} #{{ row.pk }}</li>{% empty %}<li>No retained owner.</li>{% endfor %}
+          </ul>
+          <details class="mb-3"><summary>Native and overlay dependencies</summary><ul class="small">
+            {% for row in result.details.dependencies %}<li>{{ row.model }} #{{ row.pk }}</li>{% empty %}<li>No persisted dependency.</li>{% endfor %}
+          </ul></details>
+        {% endif %}
+        {% if requested and not result.details %}
+          <h6>Requested native rows</h6>
+          <ul class="small">{% for row in requested %}<li>{{ row.scope }}: {{ row.native_model }} #{{ row.native_id }}. State key: <code>{{ row.state_key }}</code>. Explicit options: <code>{{ row.options }}</code>.</li>{% endfor %}</ul>
+        {% endif %}
+
+        {% if result.preflight %}
+          <h6>Adapter delivery effect</h6>
+          <p data-intend-effect>{% if result.preflight.delivery_effect.promotes == False %}<span class="badge text-bg-success">No promotion</span> Ordinary delivery would store this acquisition.{% elif result.preflight.delivery_effect.promotes %}<span class="badge text-bg-danger">Refused</span> Ordinary delivery would promote configuration.{% else %}<span class="badge text-bg-danger">Unavailable</span> No safe delivery effect was proved.{% endif %}</p>
+          {% if result.preflight.delivery_effect.effects %}<ul class="small">{% for effect in result.preflight.delivery_effect.effects %}<li>{{ effect.stream }}: {{ effect.kind }}</li>{% endfor %}</ul>{% endif %}
+          <div class="table-responsive mb-3"><table class="table table-sm">
+            <thead><tr><th>Stream</th><th>Adapter verdict</th><th>Guard</th></tr></thead>
+            <tbody>{% for stream, verdict in result.preflight.streams.items %}<tr><td>{{ stream }}</td><td>{{ verdict.status }}</td><td>{{ verdict.guard }}</td></tr>{% endfor %}</tbody>
+          </table></div>
+          {% if result.preflight.baseline_refused %}<p class="text-danger small">Baseline refused: {{ result.preflight.baseline_refused|join:", " }}.</p>{% endif %}
+          {% if result.preflight.cross_stream %}<p class="text-danger small">Cross-stream refusal: {{ result.preflight.cross_stream|join:", " }}.</p>{% endif %}
+          {% if result.preflight.context_disturbed %}<p class="text-danger small">Shared context changed: {{ result.preflight.context_disturbed|join:", " }}.</p>{% endif %}
+          <ul class="small" data-intend-refusals>{% for refusal in result.preflight.refusals %}<li>{{ refusal.family }} {{ refusal.row.subject }} {{ refusal.row.key }}, field {{ refusal.field }}: {{ refusal.message }} ({{ refusal.reason }})</li>{% endfor %}</ul>
+          {% for format, diff in result.preflight.diffs.items %}
+            {% if diff %}<div class="card mb-3"><h6 class="card-header">{{ format|title }} diff</h6><div class="card-body overflow-auto"><pre class="mb-0">{{ diff }}</pre></div></div>{% endif %}
+          {% endfor %}
+        {% endif %}
+
+        <div class="d-flex flex-wrap gap-2 align-items-center mt-3">
+          {% if result.confirmation %}
+            <form method="post" action="{% url 'plugins:netbox_nso_plugin:device_nso_intend_confirm' pk=device.pk %}" data-intend-confirm>
+              {% csrf_token %}
+              <input type="hidden" name="confirmation" value="{{ result.confirmation }}">
+              <button type="submit" class="btn btn-primary">Confirm Intend</button>
+            </form>
+          {% endif %}
+          <a href="{% url 'plugins:netbox_nso_plugin:device_nso_differences' pk=device.pk %}" class="btn btn-outline-secondary">Return to Differences</a>
+          <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-outline-secondary">Device NSO tab</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
