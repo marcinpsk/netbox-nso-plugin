@@ -2,8 +2,11 @@
 # Copyright (C) 2026 Marcin Zieba
 """Preview and confirm explicit native intent acquisition."""
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -542,6 +545,12 @@ def _failure_refusal(exc):
     from . import adapter_client
 
     if isinstance(exc, adapter_client.AdapterError):
+        logger.warning("Intend adapter request failed: code %s, HTTP %s", exc.code, exc.status_code)
+        job_id = exc.detail.get("job_id") if exc.status_code == 409 and isinstance(exc.detail, dict) else None
+        if isinstance(job_id, int):
+            return _refusal(
+                f"Adapter job {job_id} is queued or running for this device. Preview again when it finishes."
+            )
         return _refusal(adapter_client.public_error_message(exc))
     return _refusal(str(exc), ordinary_delivery=isinstance(exc, _Refused) and exc.ordinary_delivery)
 

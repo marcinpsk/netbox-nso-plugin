@@ -217,6 +217,18 @@ class TestIntendAcquisition(IntentPushResetMixin, TestCase):
             self.assertNotIn(marker, result.message)
             self.assertIn(_PUBLIC_ERROR_DEFAULT, result.message)
 
+    def test_busy_device_refusal_names_the_adapter_job_and_logs_the_failure(self):
+        busy = {"code": "conflict", "message": "A job is already queued or running", "detail": {"job_id": 4711}}
+        self.adapter.error_response = make_response(409, {"error": busy})
+        before = self.snapshot()
+        with self.assertLogs("netbox_nso_plugin.intent_acquisition", "WARNING") as logs:
+            result = preview_intend(self.management, self.user, self.selection)
+        self.assertEqual(result.status, "refused")
+        self.assertIn("Adapter job 4711 is queued or running for this device.", result.message)
+        self.assertIn("No acquisition occurred", result.message)
+        self.assertIn("conflict", logs.output[0])
+        self.assertEqual(self.snapshot(), before)
+
     def test_confirmation_is_signed_and_bound_to_operator_and_management(self):
         from django.core import signing
 
