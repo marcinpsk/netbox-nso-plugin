@@ -59,6 +59,8 @@ def intend_choices(management, user, *, identities=True):
                 "token": token,
                 "selection": selection,
                 "scope": scope,
+                # Redistribution delivers under its destination scope but compares as its own Differences scope.
+                "difference_scope": "redistribution" if label.endswith(".nsoredistributionstate") else scope,
                 "label": str(native),
                 "native": native,
                 "state_key": state_key,
@@ -78,11 +80,11 @@ def _difference_identities(management, choices):
     from .template_content import _device_ned_id
 
     projections = {}
-    for scope in {choice["scope"] for choice in choices} - {"interface", "ip"}:
+    for scope in {choice["difference_scope"] for choice in choices} - {"interface", "ip"}:
         projections[scope] = native_entries(scope, management, ned_id=_device_ned_id(management.device))
     interfaces = dict(Interface.objects.filter(device_id=management.device_id).values_list("pk", "name"))
     for choice in choices:
-        native, scope = choice["native"], choice["scope"]
+        native, scope = choice["native"], choice["difference_scope"]
         if scope == "interface":
             identities = [native.name]
         elif scope == "ip":
@@ -94,12 +96,17 @@ def _difference_identities(management, choices):
             identities = [
                 entry.identity
                 for entry in projections[scope]
-                if entry.objects
-                and entry.objects[0] is not None
-                and type(entry.objects[0]) is type(native)
-                and entry.objects[0].pk == native.pk
+                if (root := _native_root(entry)) is not None and type(root) is type(native) and root.pk == native.pk
             ]
         choice["difference_identities"] = identities
+
+
+def _native_root(entry):
+    objects = entry.objects
+    # A route-policy root projects as (overlay state, native root).
+    if objects and objects[0] is not None and objects[0]._meta.app_label == "netbox_nso_plugin":
+        objects = objects[1:]
+    return objects[0] if objects else None
 
 
 def difference_choices(row, choices):
@@ -112,7 +119,7 @@ def difference_choices(row, choices):
         identity = (identity[0], identity[1], identity[3] or None)
     matched = []
     for choice in choices:
-        if row.scope != choice["scope"]:
+        if row.scope != choice["difference_scope"]:
             continue
         if identity in choice["difference_identities"] and (
             row.scope != "interface" or not row.attribute or choice["state_key"].get("attribute") == row.attribute

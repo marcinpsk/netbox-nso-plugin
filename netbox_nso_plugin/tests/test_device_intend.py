@@ -475,6 +475,72 @@ class TestIntendDependencies(IntendViewFixture, IntentPushResetMixin, TestCase):
                 (row,) = [row for row in response.context["page_obj"] if row["kind"] == "mismatch"]
                 self.assertEqual([choice["selection"]["native_id"] for choice in row["intend_choices"]], [address.pk])
 
+    def _routing_snapshot(self, family, document, coverage=None):
+        from netbox_nso_plugin.models import NSOFamilyObservation, NSOFamilyReadState
+        from netbox_nso_plugin.observations import observation_defaults
+
+        from ._routing_observation_case import routing_observation
+
+        state, _ = NSOFamilyReadState.objects.get_or_create(management=self.management, family=family)
+        observed = routing_observation(family, document=document, coverage=coverage)
+        NSOFamilyObservation.objects.update_or_create(
+            read_state=state, defaults=observation_defaults(family, 1, 1, observed)
+        )
+
+    def _row_choices(self, scope, kind):
+        response = self.client.get(self.url("differences"), {"scope": scope})
+        (row,) = [row for row in response.context["page_obj"] if row["kind"] == kind]
+        return [
+            (choice["selection"]["native_model"], choice["selection"]["native_id"]) for choice in row["intend_choices"]
+        ]
+
+    def test_route_policy_root_difference_offers_its_native_choice(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        from ._routing_observation_case import route_policy_document
+
+        policy = PrefixList.objects.create(name="INTEND-POLICY", family=4)
+        NSORoutePolicyState.objects.create(
+            management=self.management,
+            family="prefix_list",
+            object_name=policy.name,
+            content_type=ContentType.objects.get_for_model(PrefixList),
+            object_id=policy.pk,
+            status="imported",
+        )
+        self._routing_snapshot("route_policy", route_policy_document({}))
+        self.assertEqual(self._row_choices("route_policy", "netbox_only"), [("netbox_routing.prefixlist", policy.pk)])
+
+    def test_redistribution_difference_offers_its_native_choice(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        process = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(ISISInstance),
+            destination_id=process.pk,
+            source_protocol="static",
+            metric=10,
+        )
+        fields = ("metric", "metric_type", "route_map", "dest_protocol", "dest_ref", "source_protocol", "source_ref")
+        entry = dict(zip(fields, (20, None, None, "isis", "CORE", "static", ""), strict=True), present=list(fields))
+        document = {
+            "entries": [entry],
+            "components": [{"protocol": "isis", "inventory": [], "present": ["inventory"]}],
+            "unprojectable": [],
+        }
+        coverage = {
+            "attributes": ["metric", "metric_type", "route_map"],
+            "components": [{"protocol": "isis", "destinations": [], "sources": []}],
+        }
+        self._routing_snapshot("redistribution", document, coverage)
+        self.assertEqual(
+            self._row_choices("redistribution", "mismatch"), [("netbox_routing.redistribution", native.pk)]
+        )
+
     def test_catalog_shows_state_keys_as_named_fields(self):
         from netbox_routing.models import PrefixList
 
