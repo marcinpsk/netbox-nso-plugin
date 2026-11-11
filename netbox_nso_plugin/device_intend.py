@@ -87,12 +87,7 @@ def _difference_identities(management, choices):
         elif scope == "ip":
             address = ip_interface(str(native.address))
             identities = [
-                (
-                    interfaces[native.assigned_object_id],
-                    str(address.ip),
-                    address.network.prefixlen,
-                    native.vrf.name if native.vrf else None,
-                )
+                (interfaces[native.assigned_object_id], str(address.ip), native.vrf.name if native.vrf else None)
             ]
         else:
             identities = [
@@ -110,11 +105,15 @@ def difference_choices(row, choices):
     """Match projected Differences to their explicit native choices."""
     if row.kind not in {"netbox_only", "mismatch"}:
         return []
+    identity = row.identity
+    if row.scope == "ip" and isinstance(identity, tuple):
+        # A prefix mismatch row names the device prefix, so match interface, host and VRF (global as None).
+        identity = (identity[0], identity[1], identity[3] or None)
     matched = []
     for choice in choices:
         if row.scope != choice["scope"]:
             continue
-        if row.identity in choice["difference_identities"] and (
+        if identity in choice["difference_identities"] and (
             row.scope != "interface" or not row.attribute or choice["state_key"].get("attribute") == row.attribute
         ):
             matched.append(choice)

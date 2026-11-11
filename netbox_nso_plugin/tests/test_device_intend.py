@@ -415,6 +415,28 @@ class TestIntendDependencies(IntendViewFixture, IntentPushResetMixin, TestCase):
         refused = self.preview()
         self.assertContains(refused, f"interface_mtu: Interface #{self.interface.pk}. State key: <code>none</code>")
 
+    def test_ip_prefix_mismatch_row_offers_its_native_choice(self):
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOFamilyObservation, NSOFamilyReadState
+        from netbox_nso_plugin.observations import observation_defaults
+
+        from ._observation_case import ip_observation, observation
+
+        address = IPAddress.objects.create(address="198.18.0.1/24", assigned_object=self.interface)
+        state, _ = NSOFamilyReadState.objects.get_or_create(management=self.management, family="interface_ip")
+        for vrf in (None, ""):
+            with self.subTest(device_vrf=vrf):
+                snapshot = observation(
+                    "interface_ip", interfaces=[ip_observation(address="198.18.0.1/32", prefix_length=32, vrf=vrf)]
+                )
+                NSOFamilyObservation.objects.update_or_create(
+                    read_state=state, defaults=observation_defaults("interface_ip", 1, 1, snapshot)
+                )
+                response = self.client.get(self.url("differences"), {"scope": "ip"})
+                (row,) = [row for row in response.context["page_obj"] if row["kind"] == "mismatch"]
+                self.assertEqual([choice["selection"]["native_id"] for choice in row["intend_choices"]], [address.pk])
+
     def test_catalog_shows_state_keys_as_named_fields(self):
         from netbox_routing.models import PrefixList
 
