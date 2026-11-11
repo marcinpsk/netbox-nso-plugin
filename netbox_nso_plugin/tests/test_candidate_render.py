@@ -177,6 +177,28 @@ def test_duplicate_candidates_refuse_even_when_overlay_pks_differ():
 
 
 @pytest.mark.django_db
+def test_singleton_overlay_candidates_use_their_management_identity():
+    from netbox_nso_plugin.candidate_render import overlay_identity
+    from netbox_nso_plugin.models import NSOLoggingLevelState, NSOSnmpSystemInfoState
+
+    device, management = make_managed("candidate-singletons", 17902)
+    rows, _ = render_candidates(device, management, 1)
+    singletons = (
+        NSOSnmpSystemInfoState(management=management, location="example", status="accepted", accepted_at=ACCEPTED_AT),
+        NSOLoggingLevelState(management=management, console_severity="WARNING", status="accepted"),
+    )
+    for row in singletons:
+        assert overlay_identity(row) == (row._meta.label_lower, device.pk, (management.pk,))
+    payload = delivery.render(
+        "interface_mtu", device.pk, management.adapter_device_id, candidates=CandidateBatch((rows[2], *singletons))
+    ).payload
+    assert [row["interface_name"] for row in payload] == ["Ethernet1"]
+    duplicate = CandidateBatch((singletons[0], copy.copy(singletons[0])))
+    with pytest.raises(ValueError, match="duplicate candidate identity"), bind_candidates(duplicate, device.pk):
+        pass
+
+
+@pytest.mark.django_db
 def test_candidate_order_is_native_order_and_ignores_batch_order():
     device, management = make_managed("candidate-order", 17885)
     first, first_relations = render_candidates(device, management, 10)

@@ -27,13 +27,23 @@ class CandidateBatch:
 _CANDIDATES: ContextVar[tuple[CandidateBatch, int] | None] = ContextVar("nso_render_candidates", default=None)
 
 
+def natural_key_fields(model):
+    """Name the overlay's natural key: its unique_together, or its one unique field such as a one-to-one."""
+    if model._meta.unique_together:
+        return tuple(model._meta.unique_together[0])
+    unique = tuple(field.name for field in model._meta.concrete_fields if field.unique and not field.primary_key)
+    if len(unique) != 1:
+        raise ValueError(f"{model._meta.label_lower} has no single natural key")
+    return unique
+
+
 def overlay_identity(row):
     """Use the model's stable device/native/state uniqueness, without an overlay PK."""
     from .refusal_registry import OVERLAYS
 
     spec = OVERLAYS[row._meta.label_lower]
     device_id = attrgetter(spec.device_lookup.replace("__", "."))(row)
-    fields = row._meta.unique_together[0]
+    fields = natural_key_fields(type(row))
     values = tuple(getattr(row, row._meta.get_field(name).attname) for name in fields)
     if device_id is None or any(value is None for value in values):
         raise ValueError("candidate identity requires persisted device and native anchors")
@@ -155,7 +165,7 @@ def render_related(row, field_name):
                 return tuple(relation.related)
     if row.pk is None:
         identity = overlay_identity(row)
-        fields = row._meta.unique_together[0]
+        fields = natural_key_fields(type(row))
         row = type(row).objects.filter(**dict(zip(fields, identity[2], strict=True))).first()
         if row is None:
             return ()
