@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """The five-minute fleet cadence: rotation, isolation, quiescence, and its backstop sweep."""
 
+import time
 from unittest.mock import patch
 
 from django.conf import settings
@@ -9,7 +10,7 @@ from django.test import TransactionTestCase
 from django.test.utils import override_settings
 
 from ._adapter_http import patch_matching_control_state
-from ._outbox_case import make_managed, own_vlan, reset_renderer_audit_rotation
+from ._outbox_case import make_managed, own_vlan, reset_renderer_audit_rotation, system_job
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -54,7 +55,7 @@ class TestRendererFleetAudit(_FleetCase):
                 },
             }
         ):
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         self.assertEqual((result.devices, result.failed, result.unknown, result.deferred), (3, 0, 0, 0))
         for device_id in self.device_ids:
@@ -71,7 +72,7 @@ class TestRendererFleetAudit(_FleetCase):
 
         audit = self._canned(audited=("vlan",), repaired=("vlan",), deferred=("bgp",), unknown=("isis",))
         with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit):
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         self.assertEqual(
             (result.devices, result.repaired, result.deferred, result.unknown, result.failed),
@@ -87,7 +88,7 @@ class TestRendererFleetAudit(_FleetCase):
         audit = self._canned(audited=("vlan",), record=reached)
 
         with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit):
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         self.assertEqual(reached, [self.device_ids[0], self.device_ids[2]])
         self.assertEqual(result.devices, 2)
@@ -102,7 +103,7 @@ class TestRendererFleetAudit(_FleetCase):
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
             patch("netbox_nso_plugin.renderer_audit._budget_expired", side_effect=[False, True]),
         ):
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         self.assertEqual(len(reached), 1)
         self.assertEqual(result.devices, 1)
@@ -120,7 +121,7 @@ class TestRendererFleetAudit(_FleetCase):
             return RendererAuditResult(("vlan",), ())
 
         with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit):
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         self.assertEqual(reached, self.device_ids)
         self.assertEqual((result.devices, result.failed), (2, 1))
@@ -129,13 +130,14 @@ class TestRendererFleetAudit(_FleetCase):
         from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
 
         reached = []
+        rotation = {}
         audit = self._canned(audited=("vlan",), record=reached)
         for _tick in range(2):
             with (
                 patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
                 patch("netbox_nso_plugin.renderer_audit._budget_expired", side_effect=[False, True]),
             ):
-                audit_renderer_fleet()
+                audit_renderer_fleet(deadline=time.monotonic() + 600, rotation=rotation)
 
         self.assertEqual(reached, self.device_ids[:2])
 
@@ -148,12 +150,13 @@ class TestRendererFleetAudit(_FleetCase):
             reached.append(device_id)
             raise RuntimeError("this device is broken on every tick")
 
+        rotation = {}
         for _tick in range(2):
             with (
                 patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
                 patch("netbox_nso_plugin.renderer_audit._budget_expired", side_effect=[False, True]),
             ):
-                audit_renderer_fleet()
+                audit_renderer_fleet(deadline=time.monotonic() + 600, rotation=rotation)
 
         self.assertEqual(reached, self.device_ids[:2])
 
@@ -164,7 +167,7 @@ class TestRendererFleetAudit(_FleetCase):
         quiesce()
         try:
             with self.assertRaises(DeploymentQuiesced):
-                audit_renderer_fleet()
+                audit_renderer_fleet(deadline=time.monotonic() + 600)
         finally:
             resume()
 
@@ -188,7 +191,7 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
         tombstone = self._tombstone("offboarded")
 
         with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=self._canned()):
-            audit_renderer_fleet()
+            audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         tombstone.refresh_from_db()
         self.assertEqual(tombstone.state, "closed")
@@ -201,7 +204,7 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
             patch("netbox_nso_plugin.provision_lifecycle.sweep_provision_tombstones") as sweep,
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=self._canned()),
         ):
-            audit_renderer_fleet()
+            audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         sweep.assert_called_once_with(deadline=70.0)
 
@@ -229,7 +232,7 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
                 side_effect=self._canned(audited=("vlan",), record=reached),
             ),
         ):
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         self.assertEqual(reached, self.device_ids)
         self.assertEqual((result.devices, result.deferred), (3, 0))
@@ -248,7 +251,7 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
             ),
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
         ):
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=time.monotonic() + 600)
 
         self.assertEqual(reached, self.device_ids)
         self.assertEqual((result.devices, result.failed), (3, 0))
@@ -260,7 +263,7 @@ class TestAuditRendererScopesJob(_FleetCase):
 
         audit = self._canned(audited=("vlan",), repaired=("vlan",))
         with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit):
-            result = AuditRendererScopesJob.run(None)  # self is unused by run()
+            result = system_job(AuditRendererScopesJob).run()
 
         self.assertEqual((result.devices, result.repaired), (3, 3))
 
@@ -271,7 +274,7 @@ class TestAuditRendererScopesJob(_FleetCase):
         quiesce()
         try:
             with self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logs:
-                result = AuditRendererScopesJob.run(None)
+                result = system_job(AuditRendererScopesJob).run()
         finally:
             resume()
 

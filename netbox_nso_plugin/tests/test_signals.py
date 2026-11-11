@@ -1048,32 +1048,20 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(self.mgmt.adapter_source_epoch, 5)
         self.assertTrue(self.mgmt.source_epoch_aware)
 
-    def test_adapter_failure_survives_a_stale_error_mirror_plan(self):
+    def test_adapter_failure_is_recorded_beside_a_concurrent_management_edit(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.models import NSODeviceManagement
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
 
-        original_build = RendererMutationPlan.build
-        plan_staled = False
-
-        def build_then_stale(*args, **kwargs):
-            nonlocal plan_staled
-            plan = original_build(*args, **kwargs)
-            if not plan_staled:
-                plan_staled = True
-                in_thread(
-                    lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent")
-                )
-            return plan
+        def concurrent_edit_then_render(exc):
+            # Between the failed call and the error record, after the push released its locks.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent"))
+            return str(exc)
 
         errors = []
         with (
-            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale),
-            patch(
-                f"{_MOD}.set_scope",
-                side_effect=AdapterError("adapter unavailable", code="nso_unreachable"),
-            ),
+            patch(f"{_MOD}.set_scope", side_effect=AdapterError("adapter unavailable", code="nso_unreachable")),
+            patch(f"{_MOD}.public_error_message", side_effect=concurrent_edit_then_render),
             self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as captured,
         ):
             try:
@@ -1082,11 +1070,11 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 errors.append(exc)
 
         self.assertEqual(errors, [], f"the adapter callback raised {errors!r}")
-        self.assertTrue(any("adapter unavailable" in message for message in captured.output))
-        self.assertTrue(any("Skipped adapter error mirror update" in message for message in captured.output))
+        self.assertTrue(any("adapter unavailable" in message for message in captured.output), captured.output)
         self.mgmt.refresh_from_db()
+        # The error record locks and writes its own field only, so the concurrent edit stands.
         self.assertEqual(self.mgmt.last_sync_status, "concurrent")
-        self.assertEqual(self.mgmt.adapter_link_error, "")
+        self.assertEqual(self.mgmt.adapter_link_error, "adapter unavailable")
 
     def test_new_source_rekey_waits_for_adapter_finalization(self):
         import select

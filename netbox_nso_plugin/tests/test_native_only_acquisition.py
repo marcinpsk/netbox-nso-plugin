@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Passive reads and delivery never acquire NetBox-only native rows."""
 
+import time
 from copy import deepcopy
 from functools import partial
 
@@ -328,7 +329,7 @@ class TestNativeOnlyAcquisition(_CascadeFlushMixin, IntentPushResetMixin, Transa
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk).exists())
 
     def assert_cadence_ran(self):
-        audit = audit_renderer_fleet()
+        audit = audit_renderer_fleet(deadline=time.monotonic() + 600)
         self.assertEqual((audit.failed, audit.deferred, audit.unknown), (0, 0, 0))
         self.assertEqual(audit.devices, NSODeviceManagement.objects.filter(adapter_device_id__isnull=False).count())
         self.assertGreater(audit.devices, 0)

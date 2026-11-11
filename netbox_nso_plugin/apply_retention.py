@@ -3,6 +3,7 @@
 """Bounded retention of terminal Apply history with no remaining authority."""
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
@@ -218,9 +219,33 @@ def _expired_attempts(cutoff):
     ).filter(APPLY_ATTEMPT_PRUNABLE, retention_at__lt=cutoff)
 
 
+def _read_remote(management_id, remote_by_management, deadline) -> str | None:
+    """Read one management row's adapter generations. Return why the batch stops, or None."""
+    # Only after the first read, so that every run makes progress.
+    if remote_by_management and deadline is not None and time.monotonic() >= deadline:
+        return "deadline"
+    try:
+        remote_by_management[management_id] = _remote_generations(management_id)
+    except _AdapterUnavailable:
+        # The shared deployment lock is held: waiting out the timeout per device would block quiesce().
+        logger.warning("Apply ledger retention stops: the adapter is unavailable")
+        return "adapter"
+    return None
+
+
+def _resume_cursor(candidates, examined, cursor):
+    """Return the cursor after the last examined candidate, or the batch's own when it examined none."""
+    last = candidates[examined - 1] if examined else None
+    return f"{last[2].isoformat()}|{last[0]}" if last is not None else cursor
+
+
 @guarded("Apply ledger retention")
-def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=None):
-    """Examine at most one batch and retain all unresolved or referenced records."""
+def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=None, deadline=None):
+    """Examine at most one batch and retain all unresolved or referenced records.
+
+    A monotonic *deadline* stops the batch before its next adapter read (never before the
+    first one), and the returned cursor resumes after the last examined record.
+    """
     if type(batch_size) is not int or not 1 <= batch_size <= 10000:
         raise ValueError("batch size must be between 1 and 10000")
     cutoff = timezone.now() - timedelta(days=RETENTION_DAYS)
@@ -244,14 +269,13 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
     eligible = deleted = 0
     remote_by_management = {}
     examined = len(candidates)
+    expired = False
     for index, (attempt_id, management_id, _completed_at) in enumerate(candidates):
         if management_id not in remote_by_management:
-            try:
-                remote_by_management[management_id] = _remote_generations(management_id)
-            except _AdapterUnavailable:
-                # The shared deployment lock is held: waiting out the timeout per device would block quiesce().
-                logger.warning("Apply ledger retention stops: the adapter is unavailable")
+            stop = _read_remote(management_id, remote_by_management, deadline)
+            if stop is not None:
                 examined = index
+                expired = stop == "deadline"
                 break
         remote = remote_by_management[management_id]
         if remote is None:
@@ -281,8 +305,7 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
                 overlay_snapshots__isnull=True,
             ).delete()
     if examined < len(candidates):
-        last = candidates[examined - 1] if examined else None
-        next_cursor = f"{last[2].isoformat()}|{last[0]}" if last is not None else cursor
-        return PruneResult(examined, eligible, deleted, next_cursor, adapter_unavailable=True)
+        next_cursor = _resume_cursor(candidates, examined, cursor)
+        return PruneResult(examined, eligible, deleted, next_cursor, adapter_unavailable=not expired)
     next_cursor = f"{candidates[-1][2].isoformat()}|{candidates[-1][0]}" if len(candidates) == batch_size else None
     return PruneResult(len(candidates), eligible, deleted, next_cursor)

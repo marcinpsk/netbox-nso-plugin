@@ -15,6 +15,7 @@ push this row's scope, failover addresses and auto-apply flag onto it.
 
 import contextlib
 import logging
+import time
 from datetime import UTC, datetime
 
 from django.utils import timezone
@@ -208,11 +209,12 @@ def _snapshot(rows):
     return candidates, by_id, by_identity
 
 
-def refresh_sync_caches(rows, snapshot=None) -> tuple[int, int]:
+def refresh_sync_caches(rows, snapshot=None, *, deadline: float | None = None) -> tuple[int, int]:
     """Refresh the cached last-sync mirror for *rows* from a single bulk adapter call.
 
     Pass *snapshot* (the ``(mapped, by_id, by_identity)`` triple from :func:`_snapshot`) to
     share one adapter call with :func:`reconcile_device_links`. Returns ``(checked, updated)``.
+    A monotonic *deadline* leaves the remaining rows to the next refresh.
     Only rows whose stored id still resolves to their own device are mirrored — see the module
     docstring on why a bare id match is unsafe. An adapter outage leaves the mirror untouched.
     """
@@ -227,7 +229,10 @@ def refresh_sync_caches(rows, snapshot=None) -> tuple[int, int]:
     if by_id is None:
         return len(mapped), 0
     updated = 0
-    for mgmt in mapped:
+    for index, mgmt in enumerate(mapped):
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.info("last-sync refresh deferred %d rows to the next tick", len(mapped) - index)
+            break
         state, adapter_device = _classify(mgmt, by_id, by_identity)
         if state is _MATCHED:
             if refresh_sync_cache(mgmt, adapter_device):
@@ -290,7 +295,7 @@ def invalidate_delivery_baselines(device_id: int) -> None:
         )
 
 
-def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C901
+def reconcile_device_links(rows, snapshot=None, *, deadline: float | None = None) -> tuple[int, int]:  # noqa: C901
     """Repair rows whose ``adapter_device_id`` no longer resolves to their own adapter device.
 
     An adapter device row can disappear under a live management row — a provision that rolled
@@ -316,6 +321,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
     attempt triggers runs in an ``on_commit`` callback that swallows its own failure, so a
     row that repaired nothing still spends the cap, on every run. With ``B`` broken rows and
     cap ``C`` every one of them is attempted within ``ceil(B / C)`` ticks — five minutes each.
+    A monotonic *deadline* stops the walk; the rows it did not reach sort first next time.
     """
     candidates, by_id, by_identity = snapshot if snapshot is not None else _snapshot(rows)
     if by_id is None:
@@ -330,7 +336,11 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
 
     attempted = 0
     now = timezone.now()
-    for mgmt, state, adapter_device in broken:
+    for index, (mgmt, state, adapter_device) in enumerate(broken):
+        if deadline is not None and time.monotonic() >= deadline:
+            # No further writes. Least-recently-attempted order puts these rows first next tick.
+            logger.info("Link reconcile deferred %d broken rows to the next tick", len(broken) - index)
+            break
         if attempted >= MAX_RELINKS_PER_RUN:
             _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue

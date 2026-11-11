@@ -93,12 +93,20 @@ def mirror_update(instance, **values):
     return update_mirror_fields(instance, **values)
 
 
+def system_job(job_class):
+    """One plugin system job bound to a fresh core Job row, as the worker runs it."""
+    from uuid import uuid4
+
+    from core.models import Job
+
+    return job_class(Job.objects.create(name=job_class.name, job_id=uuid4()))
+
+
 def reset_renderer_audit_rotation(test_case):
     """Reset process-local audit cursors before and after one test case."""
     from netbox_nso_plugin import renderer_audit
 
     def reset():
-        renderer_audit._FLEET_ROTATION["after_device_id"] = 0
         renderer_audit._SCOPE_ROTATION.clear()
 
     reset()

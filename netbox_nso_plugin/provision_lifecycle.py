@@ -143,8 +143,10 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
 
     checked = 0
     closed = 0
-    for tombstone_id in tombstones.values_list("provision_attempt_id", flat=True)[:_FLEET_SWEEP_LIMIT]:
+    attempt_ids = list(tombstones.values_list("provision_attempt_id", flat=True)[:_FLEET_SWEEP_LIMIT])
+    for index, tombstone_id in enumerate(attempt_ids):
         if deadline is not None and _monotonic() >= deadline:
+            logger.info("provision tombstone sweep deferred %d attempts to the next run", len(attempt_ids) - index)
             break
         checked += 1
         try:

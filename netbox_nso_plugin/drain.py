@@ -2026,7 +2026,7 @@ def _compact_intent_outbox(limit=None) -> None:
             logger.exception("intent outbox compaction failed for %s/%s", device_id, scope)
 
 
-def drain_intent_outbox(limit=None) -> tuple[int, int]:
+def drain_intent_outbox(limit=None, *, deadline: float | None = None) -> tuple[int, int]:
     """Appendix O's tick pass. Returns ``(drained, failed)``.
 
     Bounded, candidate-filtered and starvation-free: a key is attempted only when it owes a
@@ -2036,11 +2036,13 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     Compaction runs first, over its OWN candidates: a key whose claim is stuck on a
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
+
+    A monotonic *deadline* stops the pass between keys and bounds each key's send.
     """
-    return _drain_intent_outbox(limit)
+    return _drain_intent_outbox(limit, deadline=deadline)
 
 
-def _drain_intent_outbox(limit=None) -> tuple[int, int]:
+def _drain_intent_outbox(limit=None, *, deadline=None) -> tuple[int, int]:
     """Run one tick with a new deployment admission for each bounded stage."""
     try:
         with _deployment_operation("intent outbox tick"):
@@ -2050,9 +2052,15 @@ def _drain_intent_outbox(limit=None) -> tuple[int, int]:
         return 0, 0
 
     drained = failed = 0
-    for device_id, scope in drain_candidates(limit):
+    candidates = drain_candidates(limit)
+    for index, (device_id, scope) in enumerate(candidates):
+        remaining = None if deadline is None else deadline - _send_clock()
+        if remaining is not None and remaining <= 0:
+            logger.info("the intent outbox tick deferred %d keys to the next tick", len(candidates) - index)
+            break
         try:
-            outcome = drain_key(device_id, scope)
+            budget = None if remaining is None else min(SEND_DEADLINE.total_seconds(), remaining)
+            outcome = drain_key(device_id, scope, deadline=budget)
         except DeploymentQuiesced:
             logger.info("the intent outbox tick stopped because a deployment started")
             break

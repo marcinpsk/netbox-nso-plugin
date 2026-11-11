@@ -6,6 +6,7 @@ The durable provision tombstone owns completion even when the dashboard is close
 NSO tab and the hourly system job both invoke the same fenced tombstone sweep.
 """
 
+import time
 from unittest.mock import patch
 
 from dcim.models import Device
@@ -118,7 +119,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             # The mapping push is an on_commit callback. Execute it inside the test transaction.
             self.captureOnCommitCallbacks(execute=True),
         ):
-            checked, advanced = advance_stale_onboarding_rows()
+            checked, advanced = advance_stale_onboarding_rows(deadline=time.monotonic() + 600)
 
         self.assertEqual((checked, advanced), (2, 1))
         done.refresh_from_db()
@@ -144,7 +145,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             return _SUCCEEDED_OK
 
         with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=fake_get_attempt):
-            checked, advanced = advance_stale_onboarding_rows()
+            checked, advanced = advance_stale_onboarding_rows(deadline=time.monotonic() + 600)
 
         self.assertEqual(checked, 2)
         self.assertEqual(advanced, 1)  # only the good row
