@@ -4,10 +4,24 @@
 
 from __future__ import annotations
 
-from django.db import transaction
+import datetime
 
-from ._outbox_case import delete_vlan_state, entries, rename_vlan, state_of, without_commit_drain
+from django.db import transaction
+from django.db.models import F
+
+from ._outbox_case import (
+    as_per_object,
+    delete_vlan_state,
+    entries,
+    own_route,
+    partition,
+    rename_vlan,
+    state_of,
+    without_commit_drain,
+)
+from ._static_route_case import _edit_owned_route, _touch_owned_route
 from .test_intent_outbox_marking import _MarkCase, vlan_member
+from .test_intent_outbox_outcome import _OutcomeCase
 
 PROVENANCE = {"streams": {"vlan": "outstanding_deletion_provenance"}}
 PROOF = {"streams": ["interface_config", "ip"], "field": "parent_binding"}
@@ -110,6 +124,26 @@ class TestADeliveryConflictDissolvesTheClaim(_MarkCase):
         assert self.adapter.on_device[self.adapter_device_id] == {vlan_member(942)}
         assert state_of(self.device, "vlan").refused_identity == "", "a success lifts the refusal"
 
+    def test_a_marked_refusal_is_resent_after_the_backoff(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        states = self.own(961, 962)
+        with without_commit_drain(), transaction.atomic():
+            delete_vlan_state(states[961])
+        accepted = self.adapter._respond
+        self.adapter._respond = conflict("apply_unexecutable", PROVENANCE)
+        self.assert_refused_without_resend("apply_unexecutable")
+
+        # Apply cannot carry queued deletion authority store-only, so the tick is the recovery path.
+        NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").update(
+            last_error_at=F("last_error_at") - drain.REFUSED_RETRY - datetime.timedelta(seconds=1)
+        )
+        self.adapter._respond = accepted
+        assert self.drain() == drain.SUCCEEDED
+        assert self.marks()[-1] == "true"
+        assert self.adapter.on_device[self.adapter_device_id] == {vlan_member(962)}
+
     def test_a_device_busy_conflict_is_replayed_at_the_same_sequence(self):
         from netbox_nso_plugin import drain
 
@@ -125,6 +159,42 @@ class TestADeliveryConflictDissolvesTheClaim(_MarkCase):
         self.adapter._respond = accepted
         assert self.drain() == drain.SUCCEEDED
         assert self.adapter.sequences[-2:] == [held, held]
+
+
+class TestAChangedDeletionLineageIsANewRequest(_OutcomeCase):
+    tag = "dclin"
+    adapter_device_id = 7719
+
+    def test_a_redeletion_with_a_new_lineage_is_sent_after_a_refusal(self):
+        from netbox_nso_plugin import drain
+
+        route = own_route(self.mgmt, "198.51.100.208/28", "198.51.100.40")
+        with as_per_object("static_route"):
+            assert self.drain() == drain.SUCCEEDED
+            # An unmarked contributor in both folds keeps the request mark equal.
+            with without_commit_drain(), transaction.atomic():
+                _touch_owned_route(route)
+            self.unown(route)
+            self.adapter._respond = conflict(
+                "apply_unexecutable", {"streams": {"static_route": "no_executable_interface"}}
+            )
+            assert self.drain() == drain.REJECTED
+            refused = self.adapter.requests[-1]
+
+            # Same route id and body, but the deletion now carries the edited triple too.
+            self.reown(route)
+            with without_commit_drain(), transaction.atomic():
+                _edit_owned_route(route, next_hop="198.51.100.41")
+            self.unown(route)
+            self.adapter._respond = lambda body: partition(executed=[route.pk])
+            sent = len(self.adapter.requests)
+            assert self.drain() == drain.SUCCEEDED
+
+        assert len(self.adapter.requests) == sent + 1, "a changed deletion record is a different request"
+        resent = self.adapter.requests[-1]
+        assert (resent["params"], resent["body"]["routes"]) == (refused["params"], refused["body"]["routes"])
+        [record] = resent["body"]["deleted_routes"]
+        assert len(record["triples"]) == 2
 
 
 def test_the_interface_proof_conflict_has_fixed_public_text():
