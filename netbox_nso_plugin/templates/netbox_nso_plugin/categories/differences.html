@@ -1,5 +1,6 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com> #}
+{% load nso_intend %}
 <div data-differences-panel>
   {% include 'netbox_nso_plugin/inc/_intend_outcomes.html' %}
   <div class="small mb-3">
@@ -36,12 +37,13 @@
     <details class="mb-3" data-intend-catalog>
       <summary>Dependencies and native rows</summary>
       <p class="small text-muted">Select required rows even when they have no current difference.</p>
+      <input type="search" class="form-control form-control-sm mb-2" placeholder="Filter native rows" aria-label="Filter native rows" data-intend-filter>
       {% for choice in intend_choices %}
-        <div class="d-flex flex-wrap gap-2 align-items-center mb-2" data-intend-choice="{{ choice.token }}">
-          <label class="form-check-label small"><input type="checkbox" class="form-check-input" name="intend_row" value="{{ choice.token }}" data-intend-row> {{ choice.scope }}: {{ choice.label }} <code>{{ choice.state_key }}</code></label>
+        <div data-intend-choice><div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+          <label class="form-check-label small"><input type="checkbox" class="form-check-input" name="intend_row" value="{{ choice.token }}" data-intend-row> {{ choice.scope }}: {{ choice.label }}{% if choice.state_key %} <code>{{ choice.state_key|pairs }}</code>{% endif %}</label>
           {% if choice.bundle %}<label class="small">LACP lag_id <input class="form-control form-control-sm" type="number" min="1" name="lag_id-{{ choice.token }}" data-intend-option></label>{% endif %}
-          <label class="form-check-label small"><input type="checkbox" class="form-check-input" name="restart-{{ choice.token }}" value="true" data-intend-option> Restart ended episode</label>
-        </div>
+          {% if choice.restart %}<label class="form-check-label small"><input type="checkbox" class="form-check-input" name="restart-{{ choice.token }}" value="true" data-intend-option> Restart ended episode</label>{% endif %}
+        </div></div>
       {% endfor %}
     </details>
   </form>

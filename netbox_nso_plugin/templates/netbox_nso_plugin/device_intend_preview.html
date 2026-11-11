@@ -1,6 +1,7 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2026 Marcin Zieba #}
 {% extends 'base/layout.html' %}
+{% load nso_intend %}
 
 {% block title %}Intend: {{ device }}{% endblock %}
 
@@ -19,9 +20,9 @@
           <p class="small text-muted">Select every required unowned dependency explicitly. Existing owners are retained.</p>
           {% for row in result.details.selected %}
             <div class="card mb-3" data-intend-selected>
-              <div class="card-header"><strong>{{ row.scope }}</strong>: {{ row.label }} ({{ row.native_model }} #{{ row.native_id }})</div>
+              <div class="card-header"><strong>{{ row.scope }}</strong>: {{ row.label }} ({{ row.native_model|model_name }} #{{ row.native_id }})</div>
               <div class="card-body">
-                <p class="small mb-2">Overlay: <code>{{ row.model }}</code>. State key: <code>{{ row.state_key }}</code>. Explicit options: <code>{{ row.options }}</code>.</p>
+                <p class="small mb-2">Overlay: {{ row.model|model_name }}. State key: <code>{{ row.state_key|pairs }}</code>. Explicit options: {{ row.options|pairs }}.</p>
                 <div class="table-responsive">
                   <table class="table table-sm mb-0">
                     <thead><tr><th>Affected field</th><th>Before</th><th>After acquisition</th></tr></thead>
@@ -31,17 +32,18 @@
               </div>
             </div>
           {% endfor %}
-          <h6>Retained owners</h6>
-          <ul class="small" data-intend-retained>
-            {% for row in result.details.retained %}<li>{{ row.model }} #{{ row.pk }}</li>{% empty %}<li>No retained owner.</li>{% endfor %}
-          </ul>
+          <details class="mb-3"><summary>Retained owners ({{ result.details.retained|length }})</summary>
+            <ul class="small" data-intend-retained>
+              {% for row in result.details.retained %}<li>{{ row.model|model_name }} #{{ row.pk }}</li>{% empty %}<li>No retained owner.</li>{% endfor %}
+            </ul>
+          </details>
           <details class="mb-3"><summary>Native and overlay dependencies</summary><ul class="small">
-            {% for row in result.details.dependencies %}<li>{{ row.model }} #{{ row.pk }}</li>{% empty %}<li>No persisted dependency.</li>{% endfor %}
+            {% for row in result.details.dependencies %}<li>{{ row.model|model_name }} #{{ row.pk }}</li>{% empty %}<li>No persisted dependency.</li>{% endfor %}
           </ul></details>
         {% endif %}
         {% if requested and not result.details %}
           <h6>Requested native rows</h6>
-          <ul class="small">{% for row in requested %}<li>{{ row.scope }}: {{ row.native_model }} #{{ row.native_id }}. State key: <code>{{ row.state_key }}</code>. Explicit options: <code>{{ row.options }}</code>.</li>{% endfor %}</ul>
+          <ul class="small">{% for row in requested %}<li>{{ row.scope }}: {{ row.native_model|model_name }} #{{ row.native_id }}. State key: <code>{{ row.state_key|pairs }}</code>. Explicit options: {{ row.options|pairs }}.</li>{% endfor %}</ul>
         {% endif %}
 
         {% if result.preflight %}
@@ -57,7 +59,7 @@
           {% if result.preflight.context_disturbed %}<p class="text-danger small">Shared context changed: {{ result.preflight.context_disturbed|join:", " }}.</p>{% endif %}
           <ul class="small" data-intend-refusals>{% for refusal in result.preflight.refusals %}<li>{{ refusal.family }} {{ refusal.row.subject }} {{ refusal.row.key }}, field {{ refusal.field }}: {{ refusal.message }} ({{ refusal.reason }})</li>{% endfor %}</ul>
           {% for format, diff in result.preflight.diffs.items %}
-            {% if diff %}<div class="card mb-3"><h6 class="card-header">{{ format|title }} diff</h6><div class="card-body overflow-auto"><pre class="mb-0">{{ diff }}</pre></div></div>{% endif %}
+            {% if diff %}<div class="card mb-3"><h6 class="card-header">{% if format == 'cli' %}CLI{% else %}{{ format|title }}{% endif %} diff</h6><div class="card-body overflow-auto"><pre class="mb-0">{{ diff }}</pre></div></div>{% endif %}
           {% endfor %}
         {% endif %}
 

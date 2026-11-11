@@ -387,6 +387,43 @@ class TestIntendDependencies(IntendViewFixture, IntentPushResetMixin, TestCase):
         self.assertContains(self.preview(self.selection("lacp", bundle, lag_id=0)), "No acquisition occurred")
         self.assertEqual(self.bookkeeping(), before)
 
+    def test_restart_control_appears_only_for_a_native_row_with_an_ended_episode(self):
+        token = self.selection()["intend_row"][0]
+        catalog = self.client.get(self.url("differences")).content.decode()
+        self.assertNotIn(f'name="restart-{token}"', catalog)
+        self.assertEqual(catalog.count(token), 1)
+        self.confirm(self.preview())
+        NSOOwnershipManifest.objects.filter(device_id=self.device.pk).update(ownership_state="retired")
+        catalog = self.client.get(self.url("differences")).content.decode()
+        self.assertIn(f'name="restart-{token}"', catalog)
+        bundle = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
+        other = self.selection("lacp", bundle)["intend_row"][0]
+        self.assertNotIn(f'name="restart-{other}"', self.client.get(self.url("differences")).content.decode())
+
+    def test_preview_names_overlays_keys_and_diffs_for_operators(self):
+        NSOInterfaceMtuState.objects.create(
+            management=self.management, interface=self.interface, status="error", l2_mtu=1500
+        )
+        ready = self.preview()
+        self.assertContains(ready, "Overlay: NSO Interface MTU State.")
+        self.assertContains(ready, "Explicit options: none.")
+        self.assertContains(ready, "Retained owners (0)")
+        self.assertContains(ready, "CLI diff")
+        self.assertNotContains(ready, "netbox_nso_plugin.nsointerfacemtustate")
+        self.confirm(ready)
+        NSOOwnershipManifest.objects.filter(device_id=self.device.pk).update(ownership_state="retired")
+        refused = self.preview()
+        self.assertContains(refused, f"interface_mtu: Interface #{self.interface.pk}. State key: <code>none</code>")
+
+    def test_catalog_shows_state_keys_as_named_fields(self):
+        from netbox_routing.models import PrefixList
+
+        PrefixList.objects.create(name="INTEND-KEYS", family=4)
+        response = self.client.get(self.url("differences"))
+        self.assertContains(response, "family=prefix_list, object_name=INTEND-KEYS")
+        self.assertNotContains(response, "{&#x27;family&#x27;")
+        self.assertContains(response, "data-intend-filter")
+
     def test_native_policy_roots_are_selectable_without_observations(self):
         from netbox_routing.models import PrefixList
 

@@ -15,6 +15,8 @@ SELECTION_SALT = "netbox_nso_plugin.intend_selection"
 
 def intend_choices(management, user):
     """List native identities independently of Differences filters and pagination."""
+    from .models import NSOOwnershipManifest
+
     bindings = list(_native_bindings(management, set(_NATIVE_BINDING_BUILDERS)))
     for family, label in ROUTE_POLICY_NATIVE_MODEL_LABELS.items():
         bindings.extend(
@@ -33,6 +35,12 @@ def intend_choices(management, user):
         model: set(model.objects.restrict(user, "view").filter(pk__in=pks).values_list("pk", flat=True))
         for model, pks in grouped.items()
     }
+    # A superset of the acquisition's per-state-key ended rule, so the control is never missing when required.
+    ended = set(
+        NSOOwnershipManifest.objects.filter(device_id=management.device_id)
+        .exclude(ownership_state="owned")
+        .values_list("native_model_label", "native_id", "state_model_label")
+    )
     choices = []
     for scope, native, label, state_key in bindings:
         if native.pk not in visible[type(native)]:
@@ -55,6 +63,7 @@ def intend_choices(management, user):
                 "native": native,
                 "state_key": state_key,
                 "bundle": label.endswith(".nsolacpbundlestate"),
+                "restart": (native._meta.label_lower, native.pk, label) in ended,
             }
         )
     _difference_identities(management, choices)

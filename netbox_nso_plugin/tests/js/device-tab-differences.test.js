@@ -121,3 +121,24 @@ describe('differences panel filter', () => {
     expect(document.body.textContent).not.toContain('null');
   });
 });
+
+describe('intend catalog filter', () => {
+  it('hides native rows that do not match and never submits on Enter', () => {
+    document.body.innerHTML = panel('').replace('</div>', '<form data-intend-form><details data-intend-catalog>' +
+      '<input type="search" data-intend-filter>' +
+      '<div data-intend-choice><label><input type="checkbox" name="intend_row" value="a" data-intend-row> interface_mtu: Ethernet1</label></div>' +
+      '<div data-intend-choice><label><input type="checkbox" name="intend_row" value="b" data-intend-row> bgp: 64500</label></div>' +
+      '</details></form></div>');
+    const filter = document.querySelector('[data-intend-filter]');
+    const [ethernet, bgp] = document.querySelectorAll('[data-intend-choice]');
+    filter.value = 'ETHERNET';
+    filter.dispatchEvent(new Event('input', { bubbles: true }));
+    expect([ethernet.hidden, bgp.hidden]).toEqual([false, true]);
+    filter.value = '';
+    filter.dispatchEvent(new Event('input', { bubbles: true }));
+    expect([ethernet.hidden, bgp.hidden]).toEqual([false, false]);
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    filter.dispatchEvent(enter);
+    expect(enter.defaultPrevented).toBe(true);
+  });
+});
