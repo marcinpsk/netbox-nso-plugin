@@ -548,16 +548,25 @@ class TestIntendDelivery(IntendViewFixture, _CascadeFlushMixin, IntentPushResetM
                 outcomes = acquisition_outcomes(self.management)
             return [outcome["text"] for outcome in outcomes], len(queries)
 
-        self.confirm(self.preview())
+        from ipam.models import VRF, IPAddress
+
+        vrf = VRF.objects.create(name="INTEND-OUTCOMES")
+        addresses = [
+            IPAddress.objects.create(address=f"198.18.0.{index}/24", vrf=vrf, assigned_object=self.interface)
+            for index in (1, 2, 3, 4)
+        ]
+        data = {"intend_row": [*self.selection()["intend_row"], *self.selection("ip", addresses[0])["intend_row"]]}
+        self.assertContains(self.confirm(self.preview(data)), "acquired; delivery pending")
         one = counted()
         others = [
             Interface.objects.create(device=self.device, name=f"Ethernet{index}", type="1000base-t", mtu=9000 + index)
             for index in (2, 3, 4)
         ]
         tokens = [self.selection(native=interface)["intend_row"][0] for interface in others]
+        tokens += [self.selection("ip", address)["intend_row"][0] for address in addresses[1:]]
         self.assertContains(self.confirm(self.preview({"intend_row": tokens})), "acquired; delivery pending")
-        self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, grant_kind="intend").count(), 4)
-        self.assertEqual(one[0], ["acquired; stored"])
+        self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, grant_kind="intend").count(), 8)
+        self.assertEqual(one[0], ["acquired; stored", "acquired; stored"])
         self.assertEqual(counted(), one)
 
     def test_acquisition_ordinary_acknowledgement_and_apply_available(self):
