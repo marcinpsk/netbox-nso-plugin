@@ -13,7 +13,7 @@ from .ownership_planner import _NATIVE_BINDING_BUILDERS, ROUTE_POLICY_NATIVE_MOD
 SELECTION_SALT = "netbox_nso_plugin.intend_selection"
 
 
-def intend_choices(management, user):
+def intend_choices(management, user, *, identities=True):
     """List native identities independently of Differences filters and pagination."""
     from .models import NSOOwnershipManifest
 
@@ -66,7 +66,8 @@ def intend_choices(management, user):
                 "restart": (native._meta.label_lower, native.pk, label) in ended,
             }
         )
-    _difference_identities(management, choices)
+    if identities:
+        _difference_identities(management, choices)
     return choices
 
 

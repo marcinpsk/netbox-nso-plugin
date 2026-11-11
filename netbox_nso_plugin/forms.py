@@ -42,7 +42,10 @@ class IntendSelectionForm(forms.Form):
 
         values = super().clean()
         selection = []
-        catalog = {choice["token"]: choice["selection"] for choice in intend_choices(self.management, self.user)}
+        catalog = {
+            choice["token"]: choice["selection"]
+            for choice in intend_choices(self.management, self.user, identities=False)
+        }
         for token in dict.fromkeys(self.data.getlist("intend_row")):
             if token not in catalog:
                 raise forms.ValidationError(

@@ -415,6 +415,18 @@ class TestIntendDependencies(IntendViewFixture, IntentPushResetMixin, TestCase):
         refused = self.preview()
         self.assertContains(refused, f"interface_mtu: Interface #{self.interface.pk}. State key: <code>none</code>")
 
+    def test_preview_validates_tokens_without_difference_projections(self):
+        from unittest import mock
+
+        from netbox_nso_plugin import difference_projection
+
+        data = self.selection()
+        real = difference_projection.native_entries
+        with mock.patch.object(difference_projection, "native_entries", autospec=True, side_effect=real) as spy:
+            response = self.preview(data)
+        self.assertEqual(response.context["result"].status, "ready")
+        spy.assert_not_called()
+
     def test_ip_prefix_mismatch_row_offers_its_native_choice(self):
         from ipam.models import IPAddress
 
