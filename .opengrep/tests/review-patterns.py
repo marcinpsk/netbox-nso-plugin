@@ -3037,6 +3037,18 @@ def caught_exception_text_in_responses(request):
         return Response({"detail": exc.message}, status=403)
 
 
+def overlay_natural_key(model, row):
+    # ruleid: nso-overlay-natural-key-from-unique-together
+    fields = model._meta.unique_together[0]
+    # ruleid: nso-overlay-natural-key-from-unique-together
+    key = tuple(row._meta.unique_together[0])
+    # ok: nso-overlay-natural-key-from-unique-together
+    fields = natural_key_fields(model)
+    # ok: nso-overlay-natural-key-from-unique-together
+    together = model._meta.unique_together
+    return fields, key, together
+
+
 class CaughtExceptionTextForm:
     def clean(self, ref):
         try:
