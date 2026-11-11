@@ -18,6 +18,7 @@ class IntendResult:
     confirmation: str | None = None
     preflight: dict | None = None
     keys: tuple[str, ...] = ()
+    details: dict | None = None
 
 
 class _Refused(Exception):
@@ -559,6 +560,91 @@ CONFIRMATION_MAX_AGE = 300
 _SIGNING_SALT = "netbox_nso_plugin.intent_acquisition"
 
 
+def _preview_details(batch, mutation, selection, user):
+    from .durable_capture import _SECRET_FIELDS
+    from .intent_state import renderer_input_specs
+    from .ownership_planner import _manifest_state_key, converted_scope_rules
+    from .refusal_registry import OVERLAYS
+    from .status_machine import OWNED_STATES
+
+    selected = []
+    for row, item in zip(batch.overlays, selection, strict=True):
+        rule = converted_scope_rules()[
+            "redistribution" if row._meta.model_name == "nsoredistributionstate" else item["scope"]
+        ]
+        native_field = dict(rule.overlay_native_fields)[row._meta.label_lower]
+        field_names = renderer_input_specs()[row._meta.label_lower].content_fields | {"status", "accepted_at"}
+        before = type(row).objects.filter(pk=row.pk).values().first() if row.pk is not None else None
+        fields = [
+            {
+                "name": field.name,
+                "before": before.get(field.attname) if before else None,
+                "after": getattr(row, field.attname),
+            }
+            for field in row._meta.concrete_fields
+            if not field.primary_key
+            and field.name in field_names
+            and field.name not in _SECRET_FIELDS
+            and (before is None or before.get(field.attname) != getattr(row, field.attname))
+        ]
+        for relation in batch.m2m:
+            if relation.instance is not row:
+                continue
+            after = sorted(related.pk for related in relation.related)
+            current = (
+                sorted(getattr(row, relation.field_name).values_list("pk", flat=True)) if row.pk is not None else []
+            )
+            if current != after:
+                fields.append({"name": relation.field_name, "before": current, "after": after})
+        selected.append(
+            {
+                "model": row._meta.label_lower,
+                "label": str(row),
+                "native_model": item["native_model"],
+                "native_id": item["native_id"],
+                "scope": item["scope"],
+                "state_key": _manifest_state_key(row, native_field),
+                "options": item["options"],
+                "fields": fields,
+            }
+        )
+    replaced = {(row._meta.label_lower, row.pk) for row in batch.overlays}
+    retained = [
+        {"model": read.model_label, "pk": read.pk}
+        for read in mutation.read_set
+        if read.model_label in OVERLAYS
+        and (read.model_label, read.pk) not in replaced
+        and dict(read.values).get("status") in OWNED_STATES
+    ]
+    dependencies = [{"model": read.model_label, "pk": read.pk} for read in mutation.read_set]
+    visible = _visible_identities(dependencies, user)
+    return {
+        "selected": selected,
+        "retained": [row for row in retained if (row["model"], row["pk"]) in visible],
+        "hidden_retained": sum((row["model"], row["pk"]) not in visible for row in retained),
+        "dependencies": [row for row in dependencies if (row["model"], row["pk"]) in visible],
+        "hidden_dependencies": sum((row["model"], row["pk"]) not in visible for row in dependencies),
+    }
+
+
+def _visible_identities(rows, user):
+    """Return the (model, pk) identities the user may view; planning still reads the complete set."""
+    from collections import defaultdict
+
+    from django.apps import apps
+
+    from .native_authorization import _restricted
+
+    by_model = defaultdict(set)
+    for row in rows:
+        by_model[row["model"]].add(row["pk"])
+    return {
+        (label, pk)
+        for label, pks in by_model.items()
+        for pk in _restricted(apps.get_model(label), user, "view").filter(pk__in=pks).values_list("pk", flat=True)
+    }
+
+
 @contextmanager
 def _snapshot():
     from django.db import connection, transaction
@@ -591,12 +677,17 @@ def preview_intend(management, user, selection):
         selection = _selection(selection)
         timestamp, correlations = timezone.now(), {}
         with _snapshot():
-            management, _batch, keys, _payloads, bodies, digest, _mutation = _plan(
+            management, batch, keys, _payloads, bodies, digest, mutation = _plan(
                 management, user, selection, timestamp, correlations
             )
+            details = _preview_details(batch, mutation, selection, user)
         preflight = adapter_client.apply_candidate_preflight(management.adapter_device_id, bodies)
         if not admits_intend(preflight):
-            return _refusal(candidate_refusal_message(preflight), preflight, ordinary_delivery=True)
+            return replace(
+                _refusal(candidate_refusal_message(preflight), preflight, ordinary_delivery=True),
+                keys=keys,
+                details=details,
+            )
         evidence = {
             "operator": user.pk,
             "management": management.pk,
@@ -613,6 +704,7 @@ def preview_intend(management, user, selection):
             signing.dumps(evidence, salt=_SIGNING_SALT, compress=True),
             preflight,
             keys,
+            details,
         )
     except RendererAuditRepairFailed as exc:
         return _refusal(f"The candidate cannot be rendered: {exc}.")

@@ -1467,14 +1467,17 @@ def _state_filters_without_native(manifest, rule, management):
     if native_field == "__self__":
         filters["pk"] = manifest.native_id
     elif native_field == "__ip_address__":
+        from django.db.models import Subquery, Value
+        from django.db.models.functions import Coalesce
         from ipam.models import VRF
 
         vrf_id = manifest.native_key.get("vrf_id")
-        vrf = VRF.objects.filter(pk=vrf_id).values_list("name", flat=True).first() if vrf_id else ""
+        # A subquery keeps the VRF name lookup inside the caller's one overlay query.
+        vrf = Coalesce(Subquery(VRF.objects.filter(pk=vrf_id).values("name")[:1]), Value("")) if vrf_id else ""
         filters.update(
             interface_id=manifest.native_key.get("assigned_object_id"),
             address=manifest.native_key.get("address"),
-            vrf=vrf or "",
+            vrf=vrf,
         )
     elif native_field == "__ospf_interface__":
         filters["interface_id"] = manifest.native_key.get("interface_id")
