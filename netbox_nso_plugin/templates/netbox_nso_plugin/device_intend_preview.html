@@ -32,13 +32,15 @@
               </div>
             </div>
           {% endfor %}
-          <details class="mb-3"><summary>Retained owners ({{ result.details.retained|length }})</summary>
+          <details class="mb-3"><summary>Retained owners ({{ result.details.retained|length|add:result.details.hidden_retained }})</summary>
             <ul class="small" data-intend-retained>
-              {% for row in result.details.retained %}<li>{{ row.model|model_name }} #{{ row.pk }}</li>{% empty %}<li>No retained owner.</li>{% endfor %}
+              {% for row in result.details.retained %}<li>{{ row.model|model_name }} #{{ row.pk }}</li>{% empty %}{% if not result.details.hidden_retained %}<li>No retained owner.</li>{% endif %}{% endfor %}
+              {% if result.details.hidden_retained %}<li data-intend-hidden>{{ result.details.hidden_retained }} not visible to you.</li>{% endif %}
             </ul>
           </details>
           <details class="mb-3"><summary>Native and overlay dependencies</summary><ul class="small">
-            {% for row in result.details.dependencies %}<li>{{ row.model|model_name }} #{{ row.pk }}</li>{% empty %}<li>No persisted dependency.</li>{% endfor %}
+            {% for row in result.details.dependencies %}<li>{{ row.model|model_name }} #{{ row.pk }}</li>{% empty %}{% if not result.details.hidden_dependencies %}<li>No persisted dependency.</li>{% endif %}{% endfor %}
+            {% if result.details.hidden_dependencies %}<li data-intend-hidden>{{ result.details.hidden_dependencies }} not visible to you.</li>{% endif %}
           </ul></details>
         {% endif %}
         {% if requested and not result.details %}

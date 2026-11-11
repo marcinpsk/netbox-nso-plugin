@@ -560,7 +560,7 @@ CONFIRMATION_MAX_AGE = 300
 _SIGNING_SALT = "netbox_nso_plugin.intent_acquisition"
 
 
-def _preview_details(batch, mutation, selection):
+def _preview_details(batch, mutation, selection, user):
     from .durable_capture import _SECRET_FIELDS
     from .intent_state import renderer_input_specs
     from .ownership_planner import _manifest_state_key, converted_scope_rules
@@ -616,10 +616,32 @@ def _preview_details(batch, mutation, selection):
         and (read.model_label, read.pk) not in replaced
         and dict(read.values).get("status") in OWNED_STATES
     ]
+    dependencies = [{"model": read.model_label, "pk": read.pk} for read in mutation.read_set]
+    visible = _visible_identities(dependencies, user)
     return {
         "selected": selected,
-        "retained": retained,
-        "dependencies": [{"model": read.model_label, "pk": read.pk} for read in mutation.read_set],
+        "retained": [row for row in retained if (row["model"], row["pk"]) in visible],
+        "hidden_retained": sum((row["model"], row["pk"]) not in visible for row in retained),
+        "dependencies": [row for row in dependencies if (row["model"], row["pk"]) in visible],
+        "hidden_dependencies": sum((row["model"], row["pk"]) not in visible for row in dependencies),
+    }
+
+
+def _visible_identities(rows, user):
+    """Return the (model, pk) identities the user may view; planning still reads the complete set."""
+    from collections import defaultdict
+
+    from django.apps import apps
+
+    from .native_authorization import _restricted
+
+    by_model = defaultdict(set)
+    for row in rows:
+        by_model[row["model"]].add(row["pk"])
+    return {
+        (label, pk)
+        for label, pks in by_model.items()
+        for pk in _restricted(apps.get_model(label), user, "view").filter(pk__in=pks).values_list("pk", flat=True)
     }
 
 
@@ -658,7 +680,7 @@ def preview_intend(management, user, selection):
             management, batch, keys, _payloads, bodies, digest, mutation = _plan(
                 management, user, selection, timestamp, correlations
             )
-            details = _preview_details(batch, mutation, selection)
+            details = _preview_details(batch, mutation, selection, user)
         preflight = adapter_client.apply_candidate_preflight(management.adapter_device_id, bodies)
         if not admits_intend(preflight):
             return replace(

@@ -415,6 +415,32 @@ class TestIntendDependencies(IntendViewFixture, IntentPushResetMixin, TestCase):
         refused = self.preview()
         self.assertContains(refused, f"interface_mtu: Interface #{self.interface.pk}. State key: <code>none</code>")
 
+    def test_preview_lists_only_dependencies_the_operator_can_view(self):
+        self.confirm(self.preview())
+        owner = NSOInterfaceMtuState.objects.get(interface=self.interface)
+        other = Interface.objects.create(device=self.device, name="Ethernet2", type="1000base-t", mtu=9100)
+        data = self.selection(native=other)
+        self.client.force_login(
+            operator((("view",), Interface, {"pk": other.pk}), (("add",), NSOInterfaceMtuState, None))
+        )
+        response = self.preview(data)
+        details = response.context["result"].details
+        self.assertEqual(response.context["result"].status, "ready")
+        self.assertEqual((details["retained"], details["hidden_retained"]), ([], 1))
+        self.assertEqual(
+            {(row["model"], row["pk"]) for row in details["dependencies"]},
+            {
+                ("dcim.device", self.device.pk),
+                ("dcim.interface", other.pk),
+                ("netbox_nso_plugin.nsodevicemanagement", self.management.pk),
+            },
+        )
+        self.assertEqual(details["hidden_dependencies"], 3)
+        self.assertContains(response, "Retained owners (1)")
+        self.assertContains(response, "3 not visible to you.")
+        self.assertNotContains(response, f"Interface #{self.interface.pk}<")
+        self.assertNotContains(response, f"NSO Interface MTU State #{owner.pk}")
+
     def test_preview_validates_tokens_without_difference_projections(self):
         from unittest import mock
 
