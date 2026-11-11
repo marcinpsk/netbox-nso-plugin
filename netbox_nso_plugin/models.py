@@ -3388,6 +3388,8 @@ class NSOIntentOutboxState(models.Model):
     lineage_carry = models.JSONField(default=dict, blank=True)
     last_success_identity = models.CharField(max_length=64, blank=True, default="")
     last_success_at = models.DateTimeField(null=True, blank=True)
+    # The identity of a request the adapter refused deterministically. The same request is not resent.
+    refused_identity = models.CharField(max_length=64, blank=True, default="")
     attempts = models.IntegerField(default=0)
     # Stamped on EVERY drain attempt, success or failure: the fair-selection cursor.
     last_drain_attempted_at = models.DateTimeField(null=True, blank=True, db_index=True)
