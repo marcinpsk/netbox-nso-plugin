@@ -61,10 +61,10 @@ def _permission(model, user, action, row=None):
 
     if not user.is_authenticated or not user.has_perm(permission_name(model, action)):
         raise _Refused(
-            f"Permission denied: {model._meta.label_lower} {action}. Check your permissions and preview again."
+            f"Permission denied: {action} {model._meta.verbose_name}. Check your permissions and preview again."
         )
     if row is not None and not _restricted(model, user, action).filter(pk=row.pk).exists():
-        raise _Refused(f"Row is not visible: {model._meta.label_lower} {row.pk}.")
+        raise _Refused(f"Row is not visible: {model._meta.verbose_name} {row.pk}.")
 
 
 def _values(row):
@@ -86,7 +86,7 @@ def _existing(model, pk):
     try:
         return model.objects.get(pk=pk)
     except ObjectDoesNotExist as exc:
-        raise _Refused(f"{model._meta.label_lower} row {pk} no longer exists. Preview again.") from exc
+        raise _Refused(f"{model._meta.verbose_name} row {pk} no longer exists. Preview again.") from exc
 
 
 def _binding(management, item):
@@ -160,9 +160,11 @@ def _candidate(management, user, item, timestamp, correlations):
     ended = [] if any(episode.ownership_state == "owned" for episode in episodes) else episodes
     restart = item["options"].get("restart", False)
     if ended and not restart:
-        raise _Refused(f"Explicit restart is required for {label} {native.pk}.")
+        raise _Refused(f"Explicit restart is required for {model._meta.verbose_name} on {native}.")
     if current is not None and sm.is_owned(current.status) and not (ended and restart):
-        raise _Refused(f"{label} row {current.pk} is already owned. Preview again after an ordinary edit.")
+        raise _Refused(
+            f"{model._meta.verbose_name} row {current.pk} is already owned. Preview again after an ordinary edit."
+        )
     candidate = copy.copy(current) if current is not None else draft
     _project_candidate(candidate, current, native, dict(rule.overlay_native_fields)[label], manifest_stub)
     candidate.status = sm.advance(
@@ -276,7 +278,7 @@ def _retained(management, keys, replaced):
         rows.extend(query.order_by("pk"))
     for row in rows:
         if overlay_identity(row) not in replaced and row.accepted_at is None:
-            raise _Refused(f"Owned {row._meta.label_lower} row {row.pk} ({row}) has no acceptance timestamp.")
+            raise _Refused(f"Owned {row._meta.verbose_name} row {row.pk} ({row}) has no acceptance timestamp.")
     return rows
 
 
@@ -347,7 +349,7 @@ def _dependencies(management, rows, natives):
             management=management, content_type=ct, object_id=policy.pk, status__in=OWNED_STATES
         ).first()
         if owner is None:
-            raise _Refused(f"Select the required policy dependency {policy._meta.label_lower} {policy.pk} ({policy}).")
+            raise _Refused(f"Select the required policy dependency {policy._meta.verbose_name} {policy.pk} ({policy}).")
         if owner.accepted_at is None:
             raise _Refused(f"Owned policy dependency {policy} row {owner.pk} has no acceptance timestamp.")
         try:
@@ -458,7 +460,7 @@ def _plan(management, user, selection, timestamp, correlations):
         }
         if delivery.canonical_fingerprint(masked_payloads) == delivery.canonical_fingerprint(payloads):
             raise _Refused(
-                f"{row._meta.label_lower} ({row}) requires a renderable dependency, bundle or destination. "
+                f"{row._meta.verbose_name} ({row}) requires a renderable dependency, bundle or destination. "
                 "Select the missing dependency explicitly."
             )
     revisions = {

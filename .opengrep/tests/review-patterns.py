@@ -3727,3 +3727,22 @@ def batched_overlay_footprints(snapshots, rows, stale, spec):
         plan = footprint_for_instance(row, spec)
     # ok: nso-per-row-overlay-footprint
     return MutationFootprint.merge(footprint, plan, *(footprint_for_instance(row, spec) for row in rows))
+def model_label_in_intend_refusal(model, row, read, label, native):
+    # ruleid: nso-model-label-in-intend-refusal
+    raise _Refused(f"Row is not visible: {model._meta.label_lower} {row.pk}.")
+    # ruleid: nso-model-label-in-intend-refusal
+    raise _Refused(f"{model._meta.label} row {row.pk} is owned.")
+    # ruleid: nso-model-label-in-intend-refusal
+    raise _Refused(f"{read.model_label} row {read.pk} changed.")
+    # ruleid: nso-model-label-in-intend-refusal
+    return _refusal(f"{row.state_model_label} is owned.", ordinary_delivery=False)
+    # ruleid: nso-model-label-in-intend-refusal
+    return intent_acquisition._refusal(f"Explicit restart is required for {label} {native.pk}.")
+    # ruleid: nso-model-label-in-intend-refusal
+    raise intent_acquisition._Refused(f"{model._meta.label_lower} row {row.pk} is owned.")
+    # ok: nso-model-label-in-intend-refusal
+    raise _Refused(f"{model._meta.verbose_name} row {row.pk} is already owned.")
+    # ok: nso-model-label-in-intend-refusal
+    return _refusal(f"Explicit restart is required for {model._meta.verbose_name} on {native}.")
+    # ok: nso-model-label-in-intend-refusal
+    return IntendResult("refused", "No acquisition occurred.")

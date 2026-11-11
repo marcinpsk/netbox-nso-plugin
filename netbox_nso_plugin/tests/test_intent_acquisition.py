@@ -286,6 +286,19 @@ class TestIntendAcquisition(IntentPushResetMixin, TestCase):
         self.assertIn("permissions", result.message)
         self.assertEqual(self.snapshot(), before)
 
+    def test_ownership_refusals_name_the_overlay_for_operators(self):
+        preview = preview_intend(self.management, self.user, self.selection)
+        with without_commit_drain():
+            self.assertEqual(confirm_intend(self.management, self.user, preview.confirmation).status, "acquired")
+        owned = preview_intend(self.management, self.user, self.selection)
+        self.assertEqual(owned.status, "refused")
+        self.assertIn("NSO Interface MTU State row", owned.message)
+        NSOOwnershipManifest.objects.filter(device_id=self.device.pk).update(ownership_state="retired")
+        ended = preview_intend(self.management, self.user, self.selection)
+        self.assertIn("Explicit restart is required for NSO Interface MTU State on Ethernet1.", ended.message)
+        for result in (owned, ended):
+            self.assertNotIn("netbox_nso_plugin.", result.message)
+
     def test_duplicate_confirmation_does_not_create_another_episode(self):
         preview = preview_intend(self.management, self.user, self.selection)
         self.assertEqual(preview.status, "ready", preview.message)
