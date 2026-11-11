@@ -229,6 +229,15 @@ class TestIntendAcquisition(IntentPushResetMixin, TestCase):
         self.assertIn("conflict", logs.output[0])
         self.assertEqual(self.snapshot(), before)
 
+    def test_logged_adapter_code_cannot_forge_a_log_line(self):
+        forged = {"code": "conflict\nWARNING forged entry", "message": "placeholder refusal"}
+        self.adapter.error_response = make_response(409, {"error": forged})
+        with self.assertLogs("netbox_nso_plugin.intent_acquisition", "WARNING") as logs:
+            result = preview_intend(self.management, self.user, self.selection)
+        self.assertEqual(result.status, "refused")
+        self.assertNotIn("\n", logs.output[0])
+        self.assertIn("conflict\\nWARNING forged entry", logs.output[0])
+
     def test_confirmation_is_signed_and_bound_to_operator_and_management(self):
         from django.core import signing
 

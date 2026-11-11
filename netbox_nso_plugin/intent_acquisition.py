@@ -545,7 +545,7 @@ def _failure_refusal(exc):
     from . import adapter_client
 
     if isinstance(exc, adapter_client.AdapterError):
-        logger.warning("Intend adapter request failed: code %s, HTTP %s", exc.code, exc.status_code)
+        logger.warning("Intend adapter request failed: code %r, HTTP %s", exc.code, exc.status_code)
         job_id = exc.detail.get("job_id") if exc.status_code == 409 and isinstance(exc.detail, dict) else None
         if isinstance(job_id, int):
             return _refusal(
