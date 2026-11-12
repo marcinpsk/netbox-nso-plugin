@@ -15,7 +15,7 @@ from .models import (
     NSODeviceManagement,
 )
 
-PLUGIN_MIGRATION_HEAD = "0046_attempt_prune_index_pre_ledger"
+PLUGIN_MIGRATION_HEAD = "0048_outbox_refused_identity"
 
 
 def check_contracts():

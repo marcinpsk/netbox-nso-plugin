@@ -51,8 +51,8 @@ PRODUCERS = {
     ("link_role.py", "apply_description_for_role"): ("link_role", 1),
     ("link_role.py", "enable_igp_for_role"): ("link_role", 1),
     ("management/commands/nso_intent_deployment_gate.py", "Command._accept_routers"): ("accept", 1),
-    ("ownership_planner.py", "_seed_reowned_state"): ("manifest_reown", 1),
-    ("ownership_planner.py", "_seed_static_route"): ("manifest_reown", 1),
+    ("ownership_planner.py", "_seed_reowned_state"): ("manifest_reown", 2),
+    ("intent_acquisition.py", "_candidate"): ("intend", 2),
     ("signals.py", "_route_policy_acquisition_plan"): ("enclosing_accept_or_create", 2),
     ("subinterface_create.py", "create_subinterface"): ("create", 1),
     ("svi_create.py", "create_svi"): ("create", 1),
@@ -95,7 +95,8 @@ PRODUCERS = {
 }
 
 CONTINUATIONS = {
-    ("apply_preflight.py", "ApplyPreflight"): (1, "Wire verdict declarations do not acquire overlay ownership."),
+    ("intent_acquisition.py", "IntendResult"): (1, "Reports acquisition outcome without mutating overlays."),
+    ("apply_preflight.py", "_PreflightEvidence"): (1, "Wire verdict declarations do not acquire overlay ownership."),
     ("apply_preflight.py", "StreamVerdict"): (1, "Wire verdict declarations do not acquire overlay ownership."),
     ("durable_capture.py", "_snapshot"): (3, "Snapshot values do not acquire overlay ownership."),
     ("durable_capture.py", "record_preflight"): (2, "Only repends blocked rows that already have ownership."),
@@ -715,7 +716,7 @@ def acquire(row, model):
         inherited = {
             ("forms.py", "NSOSnmpV3UserStateForm.save"),
             ("ownership_planner.py", "_seed_reowned_state"),
-            ("ownership_planner.py", "_seed_static_route"),
+            ("intent_acquisition.py", "_candidate"),
             ("signals.py", "_route_policy_acquisition_plan"),
             ("views.py", "NSOStaticRouteStateAcceptView._arm_accept"),
             # Router and peer hooks stage Accept under the enclosing routing view's grant.

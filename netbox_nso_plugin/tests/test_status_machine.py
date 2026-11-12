@@ -422,3 +422,10 @@ class TestFinaliseStaleOverlay(SimpleTestCase):
         row = _FakeRow(sm.CHANGED)
         sm.finalise_stale_overlay(row, vestigial=False)
         self.assertIsNone(row.saved_fields)
+
+
+class TestIntendAcquisition(SimpleTestCase):
+    def test_validated_native_intent_acquires_every_unowned_state(self):
+        for status in (sm.IMPORTED, sm.CHANGED, sm.CONFLICT, sm.UNKNOWN, sm.ERROR):
+            with self.subTest(status=status):
+                self.assertEqual(sm.advance(status, "acquire"), sm.ACCEPTED)

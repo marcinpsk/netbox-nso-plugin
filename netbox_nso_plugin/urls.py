@@ -23,6 +23,16 @@ urlpatterns = [
     path(
         "devices/<int:pk>/nso-sync/confirm/", views.NSODeviceSyncConfirmView.as_view(), name="device_nso_sync_confirm"
     ),
+    path(
+        "devices/<int:pk>/nso-intend/preview/",
+        views.NSODeviceIntendPreviewView.as_view(),
+        name="device_nso_intend_preview",
+    ),
+    path(
+        "devices/<int:pk>/nso-intend/confirm/",
+        views.NSODeviceIntendConfirmView.as_view(),
+        name="device_nso_intend_confirm",
+    ),
     # Adapter Connection (singleton)
     path("adapter-connection/", views.AdapterConnectionEditView.as_view(), name="adapterconnection"),
     # Failover Settings (singleton)

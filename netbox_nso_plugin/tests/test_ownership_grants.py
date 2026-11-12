@@ -23,6 +23,7 @@ from netbox_nso_plugin.renderer_writer import (
     renderer_writes,
 )
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import make_managed, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -187,13 +188,14 @@ class TestOwnershipGrants(IntentPushResetMixin, TestCase):
 
         state = self.state()
         state.status = "accepted"
+        state.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            saves=(planned_save(state, update_fields=("status",)),), grant=OwnershipGrant("accept")
+            saves=(planned_save(state, update_fields=("status", "accepted_at")),), grant=OwnershipGrant("accept")
         )
         mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
         with self.assertRaises(IntentMutationProtocolError), mutation(plan) as writer:
             writer.grant = None
-            writer.save(state, update_fields=("status",))
+            writer.save(state, update_fields=("status", "accepted_at"))
 
     def test_queryset_owned_update_without_writer_is_refused(self):
         state = self.state()

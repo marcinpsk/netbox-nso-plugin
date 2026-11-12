@@ -72,7 +72,7 @@ Expected adapter endpoints (Phase 1 unless noted):
   - `PUT /api/v1/devices/{id}/intent` — push the device's full intent snapshot
   - `GET /api/v1/devices/{id}/intent`
   - `POST /api/v1/devices/{id}/actions/apply-preflight` — dry-run admission of an exact stored selection; a `ready` result carries `preflight_identity`
-  - `POST /api/v1/devices/{id}/actions/apply` — promote the selection; requires `apply_attempt_id`, `selected` and the `preflight_identity` of a ready preflight (`409 preflight_stale` when the inputs changed)
+  - `POST /api/v1/devices/{id}/actions/apply` — promote the selection; requires `apply_attempt_id`, `selected` and the `preflight_identity` of a ready preflight (`409 preflight_stale` when the inputs changed). On confirm, `selected` is the original selection without the streams that the ready preflight blocked, and with its skipped entries kept (`apply_preflight.confirm_selection`). The original selection may differ from this selector when the preflight blocked streams, and `admitted_selection` may differ from it when the preflight skipped entries: the identity binds the skip reasons.
 - `GET /api/v1/jobs/{id}`
 
 Use `AdapterError` for transport/API failures and log warnings when signals cannot reach the adapter.

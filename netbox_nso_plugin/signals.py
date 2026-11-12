@@ -10,12 +10,14 @@ import json
 import logging
 import threading
 from collections import namedtuple
+from datetime import UTC
 
 from django.db.models import Prefetch, Q
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 
+from .candidate_render import render_related, render_rows
 from .renderer_audit import RendererAuditRepairFailed
 from .snmp_versions import canonical_snmp_version
 from .status_machine import OWNED_STATES as _OWNED_PUSH_STATUSES
@@ -589,6 +591,25 @@ def _send_rendered(rendered, body):
     return result
 
 
+def _accepted_timestamp(row):
+    """Keep one acceptance instant identical before and after PostgreSQL normalizes it."""
+    stamp = row.accepted_at
+    if stamp is None:
+        return None
+    if timezone.is_naive(stamp):
+        raise ValueError("acceptance timestamp must be timezone-aware")
+    return stamp.astimezone(UTC).isoformat()
+
+
+def _snapshot_accepted_timestamp(rows):
+    """Use the latest contributing acceptance time for a snapshot."""
+    stamps = [_accepted_timestamp(row) for row in rows]
+    # An empty snapshot has no acceptance event, so its envelope uses a fixed instant.
+    return (
+        max((stamp for stamp in stamps if stamp is not None), default=None) if stamps else "1970-01-01T00:00:00+00:00"
+    )
+
+
 def interface_intent_item(state):
     """Return one interface attribute in the adapter's exact wire shape."""
     iface = state.interface
@@ -602,7 +623,7 @@ def interface_intent_item(state):
         "interface": iface.name,
         "attribute": state.attribute,
         "intent_value": intent_value,
-        "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
+        "accepted_at": _accepted_timestamp(state),
     }
 
 
@@ -623,10 +644,9 @@ def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
     from . import adapter_client as client
     from .models import NSOInterfaceState
 
-    states = NSOInterfaceState.objects.filter(
-        interface__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface")
+    states = render_rows(
+        NSOInterfaceState.objects.filter(interface__device_id=device_id).select_related("interface"), scope="interface"
+    )
 
     attributes = []
     for state in states:
@@ -1282,7 +1302,7 @@ def interface_ip_intent_item(row):
         "family": row.family,
         "secondary": bool(row.secondary),
         "vrf": row.vrf,
-        "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+        "accepted_at": _accepted_timestamp(row),
     }
     entry.update(_nokia_routed_binding(row.interface))
     return entry
@@ -1293,10 +1313,12 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
     from . import adapter_client as client
     from .models import NSOInterfaceIPState
 
-    ip_states = NSOInterfaceIPState.objects.filter(
-        interface__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface", "interface__parent")
+    ip_states = render_rows(
+        NSOInterfaceIPState.objects.filter(interface__device_id=device_id).select_related(
+            "interface", "interface__parent"
+        ),
+        scope="ip",
+    )
 
     addresses = [interface_ip_intent_item(ip_state) for ip_state in ip_states]
 
@@ -1414,6 +1436,7 @@ def snmp_community_intent_item(row):
         "vault_ref": row.vault_ref,
         "access": row.access,
         "acl": row.acl or None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1426,6 +1449,7 @@ def snmp_v3_user_intent_item(row):
         "priv_protocol": row.priv_protocol or None,
         "auth_vault_ref": f"{row.vault_ref}#auth" if row.auth_protocol else None,
         "priv_vault_ref": f"{row.vault_ref}#priv" if row.priv_protocol else None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1442,12 +1466,13 @@ def snmp_host_intent_item(row, ned_id):
     )
     if row.port is not None and not suppress_default_port:
         host["port"] = row.port
+    host["accepted_at"] = _accepted_timestamp(row)
     return host
 
 
 def snmp_system_info_intent_item(row):
     """Return the SNMP system-information singleton in its exact wire shape."""
-    return {"location": row.location or None, "contact": row.contact or None}
+    return {"location": row.location or None, "contact": row.contact or None, "accepted_at": _accepted_timestamp(row)}
 
 
 def _push_snmp_intent_for_device(device_id, adapter_device_id):
@@ -1552,12 +1577,14 @@ def logging_host_intent_item(row, ned_id):
     suppress_default_port = row.port == 514 and ned_id.startswith(("timos", "arcos-"))
     if row.port is not None and not suppress_default_port:
         host["port"] = row.port
+    host["accepted_at"] = _accepted_timestamp(row)
     return host
 
 
 def logging_levels_intent_item(row):
     """Return the local logging singleton, including its explicit null shape."""
-    return row.set_severities() or None
+    severities = row.set_severities()
+    return {**severities, "accepted_at": _accepted_timestamp(row)} if severities else None
 
 
 def _push_logging_intent_for_device(device_id, adapter_device_id):
@@ -1622,6 +1649,7 @@ def svi_intent_item(row):
         "vlan_id": row.vlan.vid if row.vlan else None,
         "type": row.svi_type,
         "vrf": row.vrf or "",
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1696,6 +1724,7 @@ def subinterface_intent_item(row):
         "dot1q_vlan": row.dot1q_vlan,
         "type": "subinterface",
         "vrf": row.vrf or "",
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1771,6 +1800,7 @@ def interface_mtu_intent_item(row):
         "mtu": row.l2_mtu,
         "ip_mtu": row.ip_mtu,
         "mpls_mtu": row.mpls_mtu,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -1784,10 +1814,10 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
     from .models import NSOInterfaceMtuState
 
     interfaces = []
-    for row in NSOInterfaceMtuState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface"):
+    for row in render_rows(
+        NSOInterfaceMtuState.objects.filter(management__device_id=device_id).select_related("interface"),
+        scope="interface_mtu",
+    ):
         if item := interface_mtu_intent_item(row):
             interfaces.append(item)
 
@@ -1824,7 +1854,7 @@ def vlan_intent_item(row):
 
     if row.vlan is None:
         return None
-    return {"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row)}
+    return {"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row), "accepted_at": _accepted_timestamp(row)}
 
 
 def _push_vlan_intent_for_device(device_id, adapter_device_id):
@@ -1838,10 +1868,9 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
     from .models import NSOVLANState
 
     vlans = []
-    for row in NSOVLANState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("vlan"):
+    for row in render_rows(
+        NSOVLANState.objects.filter(management__device_id=device_id).select_related("vlan"), scope="vlan"
+    ):
         if item := vlan_intent_item(row):
             vlans.append(item)
 
@@ -1961,6 +1990,7 @@ def bfd_intent_item(row):
         "min_rx": row.min_rx,
         "multiplier": row.multiplier,
         "micro_bfd": bool(row.micro_bfd),
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2045,20 +2075,26 @@ def stored_static_route_count(response):
     return count
 
 
+def _static_route_triple(route):
+    """Project the native identity shared by content and deletion delivery."""
+    from .outbox import triple_of
+
+    return triple_of(route.vrf.name if route.vrf_id else "", str(route.prefix), str(route.next_hop))
+
+
 def static_route_intent_item(row):
     """Return one owned static-route overlay in the adapter's exact wire shape."""
     route = row.static_route
     item = {
         "route_id": route.pk,
         "generation": row.intent_generation or None,
-        "vrf": route.vrf.name if route.vrf else "",
-        "prefix": str(route.prefix),
-        "next_hop": str(route.next_hop),
+        **_static_route_triple(route),
         "permanent": route.permanent or False,
         "tag": route.tag,
     }
     if route.metric is not None:
         item["metric"] = route.metric
+    item["accepted_at"] = _accepted_timestamp(row)
     return item
 
 
@@ -2080,9 +2116,14 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
 
     routes = []
     generations: dict[int, int] = {}
-    for row in NSOStaticRouteState.objects.filter(
-        PUSHED_STATIC_ROUTE_FILTER, management__device_id=device_id
-    ).select_related("static_route", "static_route__vrf"):
+    for row in render_rows(
+        NSOStaticRouteState.objects.filter(management__device_id=device_id).select_related(
+            "static_route", "static_route__vrf"
+        ),
+        scope="static_route",
+    ):
+        if row.static_route.next_hop is None:
+            continue
         generation = row.intent_generation or None
         routes.append(static_route_intent_item(row))
         if generation is not None:
@@ -2222,18 +2263,27 @@ _STATIC_ROUTE_TRANSITION_FIELDS = (
 
 
 def _static_route_delete_transition(row, static_route_id):
-    """Record what is leaving, from the overlay that still mirrors it.
+    """Record the acknowledged and desired identities when ownership ends.
 
-    The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
-    whose push never landed leaves the adapter holding the older one; an id plus the current
-    triple alone would match nothing there, be classified moot and detach the route silently.
+    The acknowledged triple can differ from the native intent that is pending storage.
+    Keep both identities so deletion can match either adapter snapshot.
     """
+    from netbox_routing.models import StaticRoute
+
     from . import outbox
+
+    route = StaticRoute.objects.filter(pk=static_route_id).first()
+    # A completed native cascade leaves only the overlay's observed identity.
+    current = (
+        _static_route_triple(route)
+        if route is not None
+        else outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop)
+    )
 
     return outbox.delete_transition(
         static_route_id,
         last_acked=row.last_acked_triple,
-        current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
+        current=current,
     )
 
 
@@ -2279,6 +2329,7 @@ def isis_flex_algo_intent_item(row):
         "admin_group_exclude": row.admin_group_exclude or None,
         "admin_group_include_any": row.admin_group_include_any or None,
         "admin_group_include_all": row.admin_group_include_all or None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2288,9 +2339,8 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
     from .models import NSOISISFlexAlgoState
 
     flex_algos = []
-    for row in NSOISISFlexAlgoState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
+    for row in render_rows(
+        NSOISISFlexAlgoState.objects.filter(management__device_id=device_id), scope="isis_flex_algo"
     ):
         flex_algos.append(isis_flex_algo_intent_item(row))
 
@@ -2339,6 +2389,7 @@ def l2_sap_intent_item(row):
         "port": row.port,
         "outer_tag": row.outer_tag,
         "inner_tag": row.inner_tag,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2419,23 +2470,40 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
     owned snapshot out as part of the one Apply.
     """
     from . import switching_preparation
-    from .lacp_topology import member_states
-    from .models import NSOLACPBundleState
-    from .status_machine import OWNED_STATES
+    from .lacp_topology import bundle_of, is_bundle
+    from .models import NSOLACPBundleState, NSOLACPMemberState
 
     bundles = []
+    accepted_rows = []
+    member_rows = None
     # NX-P2 belt-and-suspenders: a vPC-protected bundle can never be owned (the Accept view
     # refuses it), but exclude it here too so it can NEVER enter the write intent — the writer
     # refuses the whole service on a vPC bundle, which would block the legitimate bundles.
-    for b in NSOLACPBundleState.objects.filter(
-        lacp_renderable_bundle_filter(), management__device_id=device_id
-    ).select_related("interface"):
-        members = (lacp_member_intent_item(member) for member in member_states(b).filter(status__in=OWNED_STATES))
-        bundles.append(lacp_bundle_intent_item(b, members))
+    for b in render_rows(
+        NSOLACPBundleState.objects.filter(management__device_id=device_id).select_related("interface"), scope="lacp"
+    ):
+        if b.vpc_sensitive or not is_bundle(b.interface, device_id):
+            continue
+        if member_rows is None:
+            member_rows = render_rows(
+                NSOLACPMemberState.objects.filter(management__device_id=device_id)
+                .select_related("interface", "interface__lag")
+                .order_by("pk"),
+                scope="lacp",
+            )
+        members = tuple(
+            member
+            for member in member_rows
+            if member.management_id == b.management_id
+            and member.interface.device_id == device_id
+            and bundle_of(member.interface) == b.interface
+        )
+        accepted_rows.extend((b, *members))
+        bundles.append(lacp_bundle_intent_item(b, (lacp_member_intent_item(member) for member in members)))
 
     _push_changed(
         (device_id, "lacp"),
-        bundles,
+        {"bundles": bundles, "accepted_at": _snapshot_accepted_timestamp(accepted_rows)},
         lambda body: switching_preparation.send_lag(adapter_device_id, body),
     )
 
@@ -2493,17 +2561,18 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
     """
     from . import switching_preparation
     from .models import NSOSwitchportState
-    from .status_machine import OWNED_STATES
 
     interfaces = []
-    for st in NSOSwitchportState.objects.filter(
-        management__device_id=device_id, status__in=OWNED_STATES
-    ).select_related("interface", "untagged_vlan"):
-        interfaces.append(switchport_intent_item(st, (v.vid for v in st.tagged_vlans.all())))
+    rows = render_rows(
+        NSOSwitchportState.objects.filter(management__device_id=device_id).select_related("interface", "untagged_vlan"),
+        scope="switchport",
+    )
+    for st in rows:
+        interfaces.append(switchport_intent_item(st, (v.vid for v in render_related(st, "tagged_vlans"))))
 
     _push_changed(
         (device_id, "switchport"),
-        interfaces,
+        {"interfaces": interfaces, "accepted_at": _snapshot_accepted_timestamp(rows)},
         lambda body: switching_preparation.send_switchport(adapter_device_id, body),
     )
 
@@ -2596,6 +2665,7 @@ def isis_interface_intent_item(row):
         "bfd_enabled": row.bfd_enabled,
         "frr_enabled": row.frr_enabled,
         "frr_protection": row.frr_protection or None,
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2618,6 +2688,7 @@ def isis_instance_intent_item(row, *, redistribution=(), levels=()):
         entry["redistribution"] = list(redistribution)
     if levels:
         entry["levels"] = list(levels)
+    entry["accepted_at"] = _accepted_timestamp(row)
     return entry
 
 
@@ -2629,17 +2700,13 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
     redist_by_proc = _collect_redistribution_by_dest_ref(device_id, "isis")
 
     interfaces = []
-    for row in NSOISISInterfaceState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface"):
+    for row in render_rows(
+        NSOISISInterfaceState.objects.filter(management__device_id=device_id).select_related("interface"), scope="isis"
+    ):
         interfaces.append(isis_interface_intent_item(row))
 
     processes = []
-    for row in NSOISISInstanceState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ):
+    for row in render_rows(NSOISISInstanceState.objects.filter(management__device_id=device_id), scope="isis"):
         proc_redist = redist_by_proc.get(row.process_tag or "", [])
         levels = _isis_levels_for_state(row)
         processes.append(isis_instance_intent_item(row, redistribution=proc_redist, levels=levels))
@@ -2702,7 +2769,7 @@ def bgp_router_intent_item(row):
     """Render only the explicitly owned router aggregate."""
     from .bgp_router_content import router_content
 
-    return {**router_content(row), "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None}
+    return {**router_content(row), "accepted_at": _accepted_timestamp(row)}
 
 
 # Reasons for a snapshot that NetBox refuses before it sends any request.
@@ -2730,9 +2797,12 @@ def _bgp_owned_router_entries(device_id):
     from .models import NSOBGPRouterState
 
     entries = {}
-    for row in NSOBGPRouterState.objects.filter(
-        management__device_id=device_id, status__in=_OWNED_PUSH_STATUSES
-    ).select_related("management", "bgp_router__asn"):
+    for row in render_rows(
+        NSOBGPRouterState.objects.filter(management__device_id=device_id).select_related(
+            "management", "bgp_router__asn"
+        ),
+        scope="bgp",
+    ):
         try:
             qualified_router(row, device_id=device_id)
             entry = bgp_router_intent_item(row)
@@ -2771,15 +2841,20 @@ def _bgp_redistribution_members(entries, device_id):
     from .redistribution_reconciler import bgp_destination_parts, bgp_observation_only_destination
 
     rows = list(
-        NSORedistributionState.objects.filter(
-            management__device_id=device_id, dest_protocol="bgp", status__in=_OWNED_PUSH_STATUSES
-        ).select_related("management", "redistribution", "redistribution__route_map")
+        render_rows(
+            NSORedistributionState.objects.filter(management__device_id=device_id, dest_protocol="bgp").select_related(
+                "management", "redistribution", "redistribution__route_map"
+            ),
+            scope="bgp",
+        )
     )
-    observations = [
-        row for row in rows if row.redistribution_id is None and bgp_observation_only_destination(row.dest_ref)
-    ]
-    observation_ids = {row.pk for row in observations}
-    intent = [row for row in rows if row.pk not in observation_ids]
+    observations = []
+    intent = []
+    for row in rows:
+        if row.redistribution_id is None and bgp_observation_only_destination(row.dest_ref):
+            observations.append(row)
+        else:
+            intent.append(row)
     if observations:
 
         def identity(native_id, native_key, state_key):
@@ -2821,28 +2896,29 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     from .models import NSOBGPPeerState
     from .ownership_planner import OwnershipNotQualified, require_qualifying_ownership
 
-    families = BGPPeerAddressFamily.objects.select_related(
-        "address_family", "prefixlist_in", "prefixlist_out", "routemap_in", "routemap_out"
-    )
-    peers = (
-        NSOBGPPeerState.objects.filter(management__device_id=device_id, status__in=_OWNED_PUSH_STATUSES)
-        .select_related(
-            "management",
-            "bgp_peer",
-            "bgp_peer__scope__router__asn",
-            "bgp_peer__scope__vrf",
-            "bgp_peer__peer",
-            "bgp_peer__remote_as",
-            "bgp_peer__local_as",
-            "bgp_peer__peer_group",
-            "bgp_peer__source",
-            "bgp_peer__update_source",
-        )
-        .prefetch_related(Prefetch("bgp_peer__address_families", queryset=families))
-    )
     entries, blocked = _bgp_owned_router_entries(device_id)
     signatures = {}
     if blocked is None:
+        families = BGPPeerAddressFamily.objects.select_related(
+            "address_family", "prefixlist_in", "prefixlist_out", "routemap_in", "routemap_out"
+        )
+        peers = render_rows(
+            NSOBGPPeerState.objects.filter(management__device_id=device_id)
+            .select_related(
+                "management",
+                "bgp_peer",
+                "bgp_peer__scope__router__asn",
+                "bgp_peer__scope__vrf",
+                "bgp_peer__peer",
+                "bgp_peer__remote_as",
+                "bgp_peer__local_as",
+                "bgp_peer__peer_group",
+                "bgp_peer__source",
+                "bgp_peer__update_source",
+            )
+            .prefetch_related(Prefetch("bgp_peer__address_families", queryset=families)),
+            scope="bgp",
+        )
         for row in peers:
             if row.bgp_peer_id is None:
                 blocked = {
@@ -2961,6 +3037,7 @@ def route_policy_intent_item(row):
         "entries": _build_route_policy_entries(row.family, obj),
         "accepted": True,
         **({"invert_match": bool(getattr(obj, "invert_match", False))} if row.family == "community_list" else {}),
+        "accepted_at": _accepted_timestamp(row),
     }
 
 
@@ -2995,10 +3072,10 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
     from .models import NSORoutePolicyState
 
     owned_rows = list(
-        NSORoutePolicyState.objects.filter(
-            management__device_id=device_id,
-            status__in=_OWNED_PUSH_STATUSES,
-        ).select_related("management")
+        render_rows(
+            NSORoutePolicyState.objects.filter(management__device_id=device_id).select_related("management"),
+            scope="route_policy",
+        )
     )
 
     objects = []
@@ -3545,11 +3622,12 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
     from .models import NSORedistributionState
 
     by_ref: dict[str, list[dict]] = {}
-    for row in NSORedistributionState.objects.filter(
-        management__device_id=device_id,
-        dest_protocol=dest_protocol,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("redistribution", "redistribution__route_map"):
+    for row in render_rows(
+        NSORedistributionState.objects.filter(
+            management__device_id=device_id, dest_protocol=dest_protocol
+        ).select_related("redistribution", "redistribution__route_map"),
+        scope=dest_protocol,
+    ):
         by_ref.setdefault(row.dest_ref, []).append(redistribution_intent_item(row))
     return by_ref
 
@@ -3563,6 +3641,7 @@ def ospf_instance_intent_item(row, redistribution=()):
         entry["enabled"] = row.enabled
     if redistribution:
         entry["redistribution"] = list(redistribution)
+    entry["accepted_at"] = _accepted_timestamp(row)
     return entry
 
 
@@ -3577,6 +3656,7 @@ def ospf_interface_intent_item(row):
         value = getattr(row, field_name)
         if value is not None:
             entry[field_name] = value
+    entry["accepted_at"] = _accepted_timestamp(row)
     return entry
 
 
@@ -3588,18 +3668,16 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
     redist_by_proc = _collect_redistribution_by_dest_ref(device_id, "ospf")
 
     instances = []
-    for row in NSOOSPFInstanceState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management"):
+    for row in render_rows(
+        NSOOSPFInstanceState.objects.filter(management__device_id=device_id).select_related("management"), scope="ospf"
+    ):
         proc_redist = redist_by_proc.get(str(row.process_id), [])
         instances.append(ospf_instance_intent_item(row, proc_redist))
 
     interfaces = []
-    for row in NSOOSPFInterfaceState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management"):
+    for row in render_rows(
+        NSOOSPFInterfaceState.objects.filter(management__device_id=device_id).select_related("management"), scope="ospf"
+    ):
         interfaces.append(ospf_interface_intent_item(row))
 
     payload = {"instances": instances, "interfaces": interfaces}

@@ -90,7 +90,16 @@ class TestLagContractConsumer(TestCase):
         adapter = ReceiptAdapter()
         config, session = adapter.patches()
         with config, session:
-            response = apply_lag_config(self.mgmt.adapter_device_id, [], deleted_roots=[], source_revision=0)
+            response = apply_lag_config(
+                self.mgmt.adapter_device_id,
+                [],
+                accepted_at="1970-01-01T00:00:00+00:00",
+                deleted_roots=[],
+                source_revision=0,
+            )
 
         self.assertEqual(response["status"], "prepared")
-        self.assertEqual(adapter.requests[-1]["body"], {"bundles": [], "deleted_roots": [], "source_revision": 0})
+        self.assertEqual(
+            adapter.requests[-1]["body"],
+            {"bundles": [], "accepted_at": "1970-01-01T00:00:00+00:00", "deleted_roots": [], "source_revision": 0},
+        )

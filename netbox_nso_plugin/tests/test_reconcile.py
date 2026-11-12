@@ -1018,8 +1018,7 @@ class TestApplyPreviewInterfaceScope(APITestCase):
 
         device = _make_device("ifprev")
         iface = Interface.objects.create(device=device, name="ae2.0", type="virtual", description="UPLINK")
-        # Owned status (accepted) and the device description is empty → value differs →
-        # genuinely pending, must show + apply. accepted_at=None proves it's status-driven.
+        # Owned intent with a different device value remains pending.
         acquire_overlay(NSOInterfaceState, interface=iface, attribute="description", status="accepted", nso_value="")
         changes = _apply_preview_interface_changes(device.pk)
         self.assertEqual([(c["interface"], c["attribute"]) for c in changes], [("ae2.0", "description")])

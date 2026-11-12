@@ -226,6 +226,7 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
         connection / last-sync banner and is the only adapter touch here.
         """
         from .adapter_client import AdapterError
+        from .device_intend import acquisition_outcomes
         from .refusal_display import settlement_stall_projection
         from .settlement_display import acknowledgement_history, stall_exit
         from .summary import category_summaries, execution_summaries
@@ -310,6 +311,7 @@ class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
         stall = settlement_stall_projection(mgmt)
         return {
             "mgmt": mgmt,
+            "intend_outcomes": acquisition_outcomes(mgmt),
             "nso_categories": category_summaries(device, mgmt),
             "execution_summaries": execution_summaries(mgmt),
             "settlement_stall": stall,
@@ -943,6 +945,7 @@ class NSODeviceDifferencesView(AuthorizedView):
             identity_label,
             observation_snapshots,
         )
+        from .device_intend import acquisition_outcomes, difference_choices, difference_index, intend_choices
         from .device_sync import NOT_SUPPORTED as SYNC_NOT_SUPPORTED
         from .device_sync import SYNC_SCOPES, SYNCABLE_KINDS, row_token
         from .ownership_planner import converted_scope_rules
@@ -963,7 +966,10 @@ class NSODeviceDifferencesView(AuthorizedView):
             "unavailable": "text-bg-dark",
         }
 
+        can_sync = self.target.allows("change")
+        choices = intend_choices(management, request.user) if can_sync else []
         page = Paginator(filtered, 50).get_page(request.GET.get("page"))
+        index = difference_index(choices)
         page.object_list = [
             {
                 "scope": row.scope,
@@ -978,19 +984,19 @@ class NSODeviceDifferencesView(AuthorizedView):
                 "token": row_token(row),
                 "syncable": row.scope in SYNC_SCOPES and row.kind in SYNCABLE_KINDS,
                 "sync_note": "" if row.scope in SYNC_SCOPES else SYNC_NOT_SUPPORTED,
+                "intend_choices": difference_choices(row, index),
             }
             for row in page.object_list
         ]
         compared = sorted(converted_scope_rules())
-        can_sync = (
-            request.user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
-            and NSODeviceManagement.objects.restrict(request.user, "change").filter(pk=management.pk).exists()
-        )
         return render(
             request,
-            "netbox_nso_plugin/categories/differences.html",
+            "netbox_nso_plugin/categories/differences.html"
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest"
+            else "netbox_nso_plugin/device_differences.html",
             {
                 "device": device,
+                "object": device,
                 "page_obj": page,
                 "scope": scope,
                 "kind": kind,
@@ -999,12 +1005,59 @@ class NSODeviceDifferencesView(AuthorizedView):
                 "snapshots": [snapshots[family] for family in sorted(snapshots)],
                 "can_sync": can_sync,
                 "sync_scopes": [value for value in compared if value in SYNC_SCOPES],
+                "intend_choices": choices,
+                "intend_outcomes": acquisition_outcomes(management),
             },
         )
 
 
 _SYNC_TARGET = Management("change", by="device", device_view=True)
 _MALFORMED_SYNC_SELECTION = "The Sync from NSO selection is malformed."
+
+
+class NSODeviceIntendPreviewView(AuthorizedView):
+    """Preview explicit native intent acquisition."""
+
+    policy = EndpointPolicy(_SYNC_TARGET, "adapter_action")
+
+    def post(self, request, pk):
+        from .forms import IntendSelectionForm
+        from .intent_acquisition import IntendResult, preview_intend
+
+        device, management = self.target.device, self.target.management
+        form = IntendSelectionForm(request.POST, management=management, user=request.user)
+        selection = ()
+        if form.is_valid():
+            selection = form.cleaned_data["selection"]
+            result = preview_intend(management, request.user, selection)
+        else:
+            result = IntendResult("refused", "No acquisition occurred. " + " ".join(form.non_field_errors()))
+        response = render(
+            request,
+            "netbox_nso_plugin/device_intend_preview.html",
+            {"object": device, "device": device, "result": result, "requested": selection},
+        )
+        response["Cache-Control"] = "no-store"
+        return response
+
+
+class NSODeviceIntendConfirmView(AuthorizedView):
+    """Confirm the signed acquisition preview."""
+
+    policy = EndpointPolicy(_SYNC_TARGET, "adapter_action")
+
+    def post(self, request, pk):
+        from .intent_acquisition import confirm_intend
+
+        device, management = self.target.device, self.target.management
+        result = confirm_intend(management, request.user, request.POST.get("confirmation", ""))
+        response = render(
+            request,
+            "netbox_nso_plugin/device_intend_preview.html",
+            {"object": device, "device": device, "result": result},
+        )
+        response["Cache-Control"] = "no-store"
+        return response
 
 
 class NSODeviceSyncPreviewView(AuthorizedView):

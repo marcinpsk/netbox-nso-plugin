@@ -31,6 +31,7 @@ from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_response, make_session
 from ._authority_case import concurrent_writer
+from ._candidate_render_case import ACCEPTED_AT
 from ._manual_capture_case import post_apply
 from ._outbox_case import (
     ReceiptAdapter,
@@ -4268,7 +4269,7 @@ class TestInterfaceIntentDelivery(ViewTestBase):
                 "interface": self.interface.name,
                 "attribute": "description",
                 "intent_value": self.interface.description,
-                "accepted_at": None,
+                "accepted_at": self.iface_state.accepted_at.isoformat(),
             }
         ]
 
@@ -4313,7 +4314,7 @@ class TestInterfaceIntentDelivery(ViewTestBase):
                 "interface": self.interface.name,
                 "attribute": "enabled",
                 "intent_value": str(self.interface.enabled).lower(),
-                "accepted_at": None,
+                "accepted_at": enabled_state.accepted_at.isoformat(),
             }
         ]
 
@@ -4362,7 +4363,7 @@ class TestInterfaceIntentDelivery(ViewTestBase):
                 "interface": self.interface.name,
                 "attribute": "description",
                 "intent_value": self.interface.description,
-                "accepted_at": None,
+                "accepted_at": self.iface_state.accepted_at.isoformat(),
             }
         ]
 
@@ -4402,12 +4403,13 @@ class TestInterfaceIntentDelivery(ViewTestBase):
                 from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
                 self.iface_state.status = "accepted"
+                self.iface_state.accepted_at = ACCEPTED_AT
                 plan = RendererMutationPlan.build(
                     grant=OwnershipGrant("create"),
-                    saves=(planned_save(self.iface_state, update_fields=("status",)),),
+                    saves=(planned_save(self.iface_state, update_fields=("status", "accepted_at")),),
                 )
                 with renderer_writes(plan) as writer:
-                    writer.save(self.iface_state, update_fields=("status",))
+                    writer.save(self.iface_state, update_fields=("status", "accepted_at"))
 
         assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists()
         assert session.request.called, "the test did not reach the transport failure"

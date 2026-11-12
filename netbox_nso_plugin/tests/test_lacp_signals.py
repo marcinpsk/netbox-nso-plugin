@@ -10,6 +10,7 @@ from django.test import TestCase, TransactionTestCase
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import ReceiptAdapter
 from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
@@ -184,7 +185,9 @@ class TestOnLacpStateSave(_LacpBase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         mgmt = self._make_mgmt(auto_apply=True)
-        bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
+        bundle = NSOLACPBundleState(
+            management=mgmt, interface=self.lag, lag_id=1, status="accepted", accepted_at=ACCEPTED_AT
+        )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
             saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),),
@@ -201,7 +204,9 @@ class TestOnLacpStateSave(_LacpBase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         mgmt = self._make_mgmt(auto_apply=False)
-        bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
+        bundle = NSOLACPBundleState(
+            management=mgmt, interface=self.lag, lag_id=1, status="accepted", accepted_at=ACCEPTED_AT
+        )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
             saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),),
@@ -218,7 +223,9 @@ class TestOnLacpStateSave(_LacpBase):
         from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._make_mgmt(auto_apply=True)
-        bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
+        bundle = NSOLACPBundleState(
+            management=mgmt, interface=self.lag, lag_id=1, status="accepted", accepted_at=ACCEPTED_AT
+        )
 
         with suppress_intent_push():
             save_overlay_fixture(bundle)
@@ -246,7 +253,9 @@ class TestOnLacpStateSave(_LacpBase):
             adapter_device_id=None,
             auto_apply=True,
         )
-        bundle = NSOLACPBundleState(management=mgmt, interface=lag, lag_id=1, status="accepted")
+        bundle = NSOLACPBundleState(
+            management=mgmt, interface=lag, lag_id=1, status="accepted", accepted_at=ACCEPTED_AT
+        )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
             saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),),

@@ -1185,7 +1185,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
             deliver("vlan", self.device.pk, 42)
 
-        self.assertEqual(mock_put.call_args[0][1], [{"vlan_id": 5, "name": "STORAGE"}])
+        self.assertEqual(
+            mock_put.call_args[0][1], [{"vlan_id": 5, "name": "STORAGE", "accepted_at": row.accepted_at.isoformat()}]
+        )
 
     def test_plan_uses_the_shared_name_match_for_a_nameless_vlan(self):
         from unittest.mock import patch
@@ -1396,7 +1398,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             save_vlan_content(state.vlan, update_fields=("vid",))
 
         state.refresh_from_db()
-        self.assertEqual(vlan_intent_item(state), {"vlan_id": 5, "name": ""})
+        self.assertEqual(
+            vlan_intent_item(state), {"vlan_id": 5, "name": "", "accepted_at": state.accepted_at.isoformat()}
+        )
 
     def test_rescope_move_to_empty_group(self):
         """Re-scoping into a group with no collision just moves the VLAN (stays synced)."""
@@ -1520,9 +1524,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 42, "name": "MGMT"}]})
         source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=42)
+        from ._candidate_render_case import ACCEPTED_AT
         from ._outbox_case import content_update
 
-        content_update(source_state, status="deploying", apply_attempt_id=uuid4())
+        content_update(source_state, status="deploying", apply_attempt_id=uuid4(), accepted_at=ACCEPTED_AT)
         target_group = VLANGroup.objects.create(name="Same Name Target", slug="same-name-target")
         target_vlan = VLAN.objects.create(group=target_group, vid=42, name="MGMT")
         surviving_state = NSOVLANState.objects.create(
@@ -1538,7 +1543,23 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         surviving_state.refresh_from_db()
         self.assertTrue(is_owned(surviving_state.status))
         self.assertEqual(surviving_state.status, "accepted")
+        self.assertEqual(surviving_state.accepted_at, ACCEPTED_AT)
         self.assertFalse(NSOVLANState.objects.filter(pk=source_state.pk).exists())
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.candidate_render import CandidateBatch
+
+        other = VLAN.objects.create(group=target_group, vid=43, name="OTHER")
+        candidate = NSOVLANState(management=self.management, vlan=other, status="accepted", accepted_at=ACCEPTED_AT)
+        rendered = delivery.render(
+            "vlan", self.device.pk, self.management.adapter_device_id, candidates=CandidateBatch((candidate,))
+        )
+        self.assertEqual(
+            rendered.payload,
+            [
+                {"vlan_id": 42, "name": "MGMT", "accepted_at": ACCEPTED_AT.isoformat()},
+                {"vlan_id": 43, "name": "OTHER", "accepted_at": ACCEPTED_AT.isoformat()},
+            ],
+        )
 
     def test_rescope_merge_deduplicates_existing_target_memberships(self):
         from netbox_nso_plugin.models import NSOSwitchportState
@@ -2102,14 +2123,17 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.signals import reset_intent_push_state
 
-        self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
+        state = self._state(vid=2213, name="RENAMED", status="accepted", device_name="OLD")
+        assert state.accepted_at is not None
         self._state(vid=10, name="MGMT", status="imported")  # not owned → excluded
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
             deliver("vlan", self.device.pk, 77)
         mock_put.assert_called_once()
         vlans = mock_put.call_args[0][1]
-        assert vlans == [{"vlan_id": 2213, "name": "RENAMED"}]  # live NetBox name, owned only
+        assert vlans == [
+            {"vlan_id": 2213, "name": "RENAMED", "accepted_at": state.accepted_at.isoformat()}
+        ]  # live NetBox name, owned only
 
     def test_foreign_overlay_save_does_not_schedule_vlan_behavior(self):
         from unittest.mock import patch
@@ -2214,7 +2238,10 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
 
         vlan_pushes = [request for request in adapter.requests if request["url"].endswith("/vlan-intent")]
         self.assertEqual(len(vlan_pushes), 3)
-        self.assertEqual(vlan_pushes[-1]["body"]["vlans"], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])
+        self.assertEqual(
+            vlan_pushes[-1]["body"]["vlans"],
+            [{"vlan_id": 2213, "name": "LIVE_RENAMED", "accepted_at": self.state.accepted_at.isoformat()}],
+        )
         self.assertEqual(vlan_pushes[-1]["params"].get("store_only"), "true")
         self.assertEqual(vlan_pushes[-1]["push_seq"], selected["vlan"])
 

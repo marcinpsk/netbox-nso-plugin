@@ -17,6 +17,7 @@ from django.utils import timezone
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -284,6 +285,7 @@ class TestIntentGenerationAllocator(TestCase):
             management=replacement,
             static_route=route,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
             intent_generation=second,
         )
         state_plan = RendererMutationPlan.build(

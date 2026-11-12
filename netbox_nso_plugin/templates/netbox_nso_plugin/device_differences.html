@@ -1,0 +1,12 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba #}
+{% extends 'base/layout.html' %}
+{% load static %}
+{% block title %}Differences: {{ device }}{% endblock %}
+{% block content %}
+<div class="card mb-3">
+  <h5 class="card-header">Differences: {{ device }}</h5>
+  <div class="card-body">{% include 'netbox_nso_plugin/categories/differences.html' %}</div>
+</div>
+<script src="{% static 'netbox_nso_plugin/nso-device-differences.js' %}"></script>
+{% endblock %}

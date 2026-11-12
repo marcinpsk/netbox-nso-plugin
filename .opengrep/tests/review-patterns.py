@@ -3037,6 +3037,64 @@ def caught_exception_text_in_responses(request):
         return Response({"detail": exc.message}, status=403)
 
 
+def overlay_natural_key(model, row):
+    # ruleid: nso-overlay-natural-key-from-unique-together
+    fields = model._meta.unique_together[0]
+    # ruleid: nso-overlay-natural-key-from-unique-together
+    key = tuple(row._meta.unique_together[0])
+    # ok: nso-overlay-natural-key-from-unique-together
+    fields = natural_key_fields(model)
+    # ok: nso-overlay-natural-key-from-unique-together
+    together = model._meta.unique_together
+    return fields, key, together
+def adapter_error_text_in_intend_result():
+    try:
+        preflight()
+    except (_Refused, adapter_client.AdapterError) as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc), ordinary_delivery=False)
+    try:
+        preflight()
+    except RendererAuditRepairFailed as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(f"The candidate cannot be rendered: {exc}.")
+    except AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return IntendResult("refused", repr(exc))
+    try:
+        preflight()
+    except RendererAuditRepairFailed as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc))
+    except _Refused as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc))
+    except adapter_client.AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return intent_acquisition.IntendResult("refused", exc.args)
+    try:
+        preflight()
+    except adapter_client.AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return _refusal(f"Adapter failed: {exc}")
+    try:
+        preflight()
+    except AdapterError as exc:
+        # ruleid: nso-adapter-error-text-in-intend-result
+        return intent_acquisition._refusal(str(exc))
+    try:
+        preflight()
+    except RendererAuditRepairFailed as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(f"The candidate cannot be rendered: {exc}.")
+    except adapter_client.AdapterError as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(adapter_client.public_error_message(exc))
+    except (_Refused, IntentPlanStaleError) as exc:
+        # ok: nso-adapter-error-text-in-intend-result
+        return _refusal(str(exc), ordinary_delivery=isinstance(exc, _Refused) and exc.ordinary_delivery)
+
+
 class CaughtExceptionTextForm:
     def clean(self, ref):
         try:
@@ -3669,3 +3727,22 @@ def batched_overlay_footprints(snapshots, rows, stale, spec):
         plan = footprint_for_instance(row, spec)
     # ok: nso-per-row-overlay-footprint
     return MutationFootprint.merge(footprint, plan, *(footprint_for_instance(row, spec) for row in rows))
+def model_label_in_intend_refusal(model, row, read, label, native):
+    # ruleid: nso-model-label-in-intend-refusal
+    raise _Refused(f"Row is not visible: {model._meta.label_lower} {row.pk}.")
+    # ruleid: nso-model-label-in-intend-refusal
+    raise _Refused(f"{model._meta.label} row {row.pk} is owned.")
+    # ruleid: nso-model-label-in-intend-refusal
+    raise _Refused(f"{read.model_label} row {read.pk} changed.")
+    # ruleid: nso-model-label-in-intend-refusal
+    return _refusal(f"{row.state_model_label} is owned.", ordinary_delivery=False)
+    # ruleid: nso-model-label-in-intend-refusal
+    return intent_acquisition._refusal(f"Explicit restart is required for {label} {native.pk}.")
+    # ruleid: nso-model-label-in-intend-refusal
+    raise intent_acquisition._Refused(f"{model._meta.label_lower} row {row.pk} is owned.")
+    # ok: nso-model-label-in-intend-refusal
+    raise _Refused(f"{model._meta.verbose_name} row {row.pk} is already owned.")
+    # ok: nso-model-label-in-intend-refusal
+    return _refusal(f"Explicit restart is required for {model._meta.verbose_name} on {native}.")
+    # ok: nso-model-label-in-intend-refusal
+    return IntendResult("refused", "No acquisition occurred.")

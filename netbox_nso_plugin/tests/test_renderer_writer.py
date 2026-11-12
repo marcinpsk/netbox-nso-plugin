@@ -21,6 +21,7 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import content_update, make_managed, mirror_update, own_vlan, without_commit_drain
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
@@ -57,6 +58,7 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
                 planned_set_update(
                     NSOVLANState.objects.filter(management=first_management),
                     status="accepted",
+                    accepted_at=ACCEPTED_AT,
                 ),
             ),
         )
@@ -64,7 +66,7 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
             NSOVLANState.objects.filter(pk=state.pk).update(management_id=second_management.pk)
 
         with self.assertRaises(IntentPlanStaleError), renderer_writes(plan) as writer:
-            writer.set_update(NSOVLANState, plan.write_set[0], status="accepted")
+            writer.set_update(NSOVLANState, plan.write_set[0], status="accepted", accepted_at=ACCEPTED_AT)
 
         state.refresh_from_db()
         self.assertEqual(state.management_id, second_management.pk)
@@ -87,6 +89,7 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         proposed = planned_set_update(
             NSOVLANState.objects.filter(management=first_management),
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         with transaction.atomic(), offline_mutation():
             NSOVLANState.objects.filter(pk=state.pk).update(management_id=second_management.pk)
@@ -103,7 +106,7 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
         _device, management = make_managed("writer-unsaved-preimage", 16271)
         row = own_vlan(management, 1627, "writer-unsaved-preimage")
-        candidate = NSOVLANState(management=management, vlan=row.vlan, status="accepted")
+        candidate = NSOVLANState(management=management, vlan=row.vlan, status="accepted", accepted_at=ACCEPTED_AT)
         expected = copy.copy(candidate)
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "persisted update target"):
@@ -147,7 +150,9 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
         group = VLANGroup.objects.create(name="Writer raced overlay", slug="writer-raced-overlay")
         vlan = VLAN.objects.create(group=group, vid=1627, name="Writer raced overlay")
-        planned = NSOVLANState(management=management, vlan=vlan, device_name=vlan.name, status="accepted")
+        planned = NSOVLANState(
+            management=management, vlan=vlan, device_name=vlan.name, status="accepted", accepted_at=ACCEPTED_AT
+        )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
             saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),),
@@ -488,12 +493,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         candidate = copy.copy(state)
         candidate.status = "accepted"
+        candidate.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status", "accepted_at")),)
         )
 
         with renderer_writes(plan) as writer:
-            writer.save(candidate, update_fields=("status",))
+            writer.save(candidate, update_fields=("status", "accepted_at"))
 
         manifest = NSOOwnershipManifest.objects.get(device_id=device.pk, scope="static_route")
         assert manifest.acknowledged_lineage == [acknowledged]
@@ -538,7 +544,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         for model, scope, identity_fields, values in cases:
             with self.subTest(model=model._meta.label_lower):
                 natural_key = ("management", *identity_fields)
-                original = model(management=management, status="accepted", **values)
+                original = model(management=management, status="accepted", accepted_at=ACCEPTED_AT, **values)
                 plan = RendererMutationPlan.build(
                     grant=OwnershipGrant("create"),
                     saves=(planned_save(original, force_insert=True, natural_key=natural_key),),
@@ -548,7 +554,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(original),))
                 execute(plan, lambda writer: writer.delete(original))
 
-                replacement = model(management=management, status="accepted", **values)
+                replacement = model(management=management, status="accepted", accepted_at=ACCEPTED_AT, **values)
                 plan = RendererMutationPlan.build(
                     grant=OwnershipGrant("create"),
                     saves=(planned_save(replacement, force_insert=True, natural_key=natural_key),),
@@ -608,12 +614,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         candidate = copy.copy(state)
         candidate.status = "accepted"
+        candidate.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status", "accepted_at")),)
         )
 
         with renderer_writes(plan) as writer:
-            writer.save(candidate, update_fields=("status",))
+            writer.save(candidate, update_fields=("status", "accepted_at"))
 
         retired.refresh_from_db()
         self.assertEqual(retired.ownership_state, "retired")
@@ -1141,11 +1148,12 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         candidate = copy.copy(target)
         candidate.status = "accepted"
+        candidate.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status", "accepted_at")),)
         )
         with without_commit_drain(), renderer_writes(plan) as writer:
-            writer.save(candidate, update_fields=("status",))
+            writer.save(candidate, update_fields=("status", "accepted_at"))
 
         target.refresh_from_db()
         deploying.refresh_from_db()
@@ -1804,12 +1812,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         outbox_before = list(NSOIntentOutboxEntry.objects.filter(device=device).order_by("scope", "pk").values())
         other_candidate = copy.copy(other)
         other_candidate.status = "accepted"
+        other_candidate.accepted_at = ACCEPTED_AT
         malformed_candidate = copy.copy(malformed)
         malformed_candidate.last_apply_error = "planned"
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
             saves=(
-                planned_save(other_candidate, update_fields=("status",)),
+                planned_save(other_candidate, update_fields=("status", "accepted_at")),
                 planned_save(malformed_candidate, update_fields=("last_apply_error",)),
             ),
         )
@@ -1820,7 +1829,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         with self.assertRaisesRegex(ValueError, "save callback failed"), without_commit_drain():
             with renderer_writes(plan) as writer:
-                writer.save(other_candidate, update_fields=("status",))
+                writer.save(other_candidate, update_fields=("status", "accepted_at"))
                 writer.save_via(malformed_candidate, save_then_fail, update_fields=("last_apply_error",))
 
         malformed.refresh_from_db()
@@ -1859,13 +1868,14 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         before = (revision.revision, revision.verified_revision, revision.verified_fingerprint)
         candidate = copy.copy(target)
         candidate.status = "accepted"
+        candidate.accepted_at = ACCEPTED_AT
         plan = RendererMutationPlan.build(
-            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status", "accepted_at")),)
         )
 
         with self.assertRaisesRegex(RuntimeError, "rollback"), without_commit_drain():
             with renderer_writes(plan) as writer:
-                writer.save(candidate, update_fields=("status",))
+                writer.save(candidate, update_fields=("status", "accepted_at"))
                 raise RuntimeError("rollback writer")
 
         target.refresh_from_db()

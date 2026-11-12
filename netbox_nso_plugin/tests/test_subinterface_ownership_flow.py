@@ -287,6 +287,7 @@ class TestOwnedSubinterfaceDelivery(_CascadeFlushMixin, IntentPushResetMixin, Tr
                     "dot1q_vlan": 1724,
                     "type": "subinterface",
                     "vrf": "",
+                    "accepted_at": rows[0].accepted_at.isoformat(),
                 }
             ],
         )

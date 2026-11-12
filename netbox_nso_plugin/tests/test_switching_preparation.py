@@ -15,6 +15,7 @@ from django.test import TransactionTestCase
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._manual_capture_case import post_apply
 from ._outbox_case import ReceiptAdapter, make_managed, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -37,6 +38,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 interface=interface,
                 lag_id=int("".join(character for character in name if character.isdigit())),
                 status="accepted",
+                accepted_at=ACCEPTED_AT,
             )
             plan = RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),
@@ -53,7 +55,11 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         with without_commit_drain():
             interface = Interface.objects.create(device=self.device, name=name, type="1000base-t", mode="tagged-all")
             state = NSOSwitchportState(
-                management=self.management, interface=interface, mode="tagged-all", status="accepted"
+                management=self.management,
+                interface=interface,
+                mode="tagged-all",
+                status="accepted",
+                accepted_at=ACCEPTED_AT,
             )
             plan = RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),
@@ -500,6 +506,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                                         management=self.management,
                                         interface=member,
                                         status="accepted",
+                                        accepted_at=ACCEPTED_AT,
                                     )
                                     with renderer_writes(
                                         RendererMutationPlan.build(
@@ -555,6 +562,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             management=self.management,
             interface=member_interface,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
             mode="",
         )
         with (
@@ -615,7 +623,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             interface = Interface.objects.create(
                 device=self.device, name="Ethernet35", type="1000base-t", lag=bundle.interface
             )
-        member = NSOLACPMemberState(management=self.management, interface=interface, status="accepted")
+        member = NSOLACPMemberState(
+            management=self.management, interface=interface, status="accepted", accepted_at=ACCEPTED_AT
+        )
         with renderer_writes(
             RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),
@@ -628,7 +638,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             sibling_interface = Interface.objects.create(
                 device=self.device, name="Ethernet36", type="1000base-t", lag=bundle.interface
             )
-        sibling = NSOLACPMemberState(management=self.management, interface=sibling_interface, status="accepted")
+        sibling = NSOLACPMemberState(
+            management=self.management, interface=sibling_interface, status="accepted", accepted_at=ACCEPTED_AT
+        )
         with renderer_writes(
             RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),
@@ -758,7 +770,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             interface = Interface.objects.create(
                 device=self.device, name="Ethernet37", type="1000base-t", lag=excluded_bundle.interface
             )
-        member = NSOLACPMemberState(management=self.management, interface=interface, status="accepted")
+        member = NSOLACPMemberState(
+            management=self.management, interface=interface, status="accepted", accepted_at=ACCEPTED_AT
+        )
         with renderer_writes(
             RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),
@@ -932,12 +946,13 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             writer.save(unowned, force_insert=True)
         restored = copy.copy(unowned)
         restored.status = "accepted"
+        restored.accepted_at = ACCEPTED_AT
         with renderer_writes(
             RendererMutationPlan.build(
-                grant=OwnershipGrant("create"), saves=(planned_save(restored, update_fields=("status",)),)
+                grant=OwnershipGrant("create"), saves=(planned_save(restored, update_fields=("status", "accepted_at")),)
             )
         ) as writer:
-            writer.save(restored, update_fields=("status",))
+            writer.save(restored, update_fields=("status", "accepted_at"))
         config, session = self.adapter.patches()
         with config, session:
             assert drain.push_now(self.device.pk, "switchport", force=True) is not None
@@ -964,6 +979,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             interface=interface,
             mode="active",
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         with renderer_writes(
             RendererMutationPlan.build(
@@ -1092,6 +1108,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             interface=deleted.interface,
             lag_id=deleted.lag_id,
             status="accepted",
+            accepted_at=ACCEPTED_AT,
         )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
@@ -1454,6 +1471,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 interface=deleted.interface,
                 lag_id=deleted.lag_id,
                 status="accepted",
+                accepted_at=ACCEPTED_AT,
             )
             plan = RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),

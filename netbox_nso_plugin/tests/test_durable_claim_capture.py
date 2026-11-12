@@ -32,6 +32,7 @@ from netbox_nso_plugin.refusal_registry import RegistryError
 
 from ._outbox_case import (
     ReceiptAdapter,
+    content_update,
     entries,
     expire_claim,
     make_managed,
@@ -101,10 +102,10 @@ class TestDurableClaimCapture(_CascadeFlushMixin, IntentPushResetMixin, Transact
     def _vlan(self, vid, *, status="accepted"):
         state = own_vlan(self.management, vid, "durable-capture")
         prior = NSOApplyAttempt.objects.create(management=self.management)
+        content_update(state, accepted_at=self.accepted_at)
         mirror_update(
             state,
             status=status,
-            accepted_at=self.accepted_at,
             last_apply_at=self.applied_at,
             last_apply_error="placeholder prior apply error",
             apply_attempt_id=prior.pk,

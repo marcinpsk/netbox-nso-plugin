@@ -305,6 +305,7 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(state.router_id, "198.18.0.1")
         self.assertEqual(state.vrf, "operator-vrf")
         self.assertEqual(state.areas, operator_areas)
+        self.assertIsNotNone(state.accepted_at)
         self.assertEqual(
             ospf_instance_intent_item(state),
             {
@@ -313,6 +314,7 @@ class TestReconcileOspfFill(TestCase):
                 "areas": operator_areas,
                 "router_id": "198.18.0.1",
                 "enabled": True,
+                "accepted_at": state.accepted_at.isoformat(),
             },
         )
 

@@ -442,14 +442,16 @@ class TestSymmetricOwnershipExecutor(TestCase):
                 reconcile_scope_ownership(device.pk, [scope])
 
                 manifest = NSOOwnershipManifest.objects.get(device_id=device.pk, scope=scope)
-                self.assertNotEqual(delivery.render(scope, device.pk, management.adapter_device_id).payload, [])
+                payload = delivery.render(scope, device.pk, management.adapter_device_id).payload
+                self.assertNotEqual(payload["interfaces"] if scope == "switchport" else payload, [])
 
                 disqualify()
                 reconcile_scope_ownership(device.pk, [scope])
 
                 manifest.refresh_from_db()
                 self.assertEqual(manifest.ownership_state, "retired")
-                self.assertEqual(delivery.render(scope, device.pk, management.adapter_device_id).payload, [])
+                payload = delivery.render(scope, device.pk, management.adapter_device_id).payload
+                self.assertEqual(payload["interfaces"] if scope == "switchport" else payload, [])
 
     def test_owned_svi_with_native_anchor_is_not_demoted_for_missing_vlan(self):
         from dcim.models import Interface
@@ -895,7 +897,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         completed = reconcile_scope_ownership(self.device.pk, ["lacp"])
 
-        payload = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload
+        payload = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload["bundles"]
         self.assertFalse(NSOLACPMemberState.objects.filter(interface=member).exists())
         self.assertEqual(completed, ())
         self.assertEqual(payload, [])
@@ -930,7 +932,9 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(manifest.grant_kind, "create")
         self.assertEqual(bundle_state.status, "imported")
         self.assertIn(("lacp", manifest.pk), completed)
-        self.assertEqual(delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload, [])
+        self.assertEqual(
+            delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload["bundles"], []
+        )
 
     def test_native_flex_algo_does_not_acquire_an_overlay(self):
         from netbox_routing.models import ISISFlexAlgo, ISISInstance
@@ -1826,6 +1830,7 @@ class TestOwnershipActionRecheck(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "mtu": 9216,
                 "ip_mtu": None,
                 "mpls_mtu": None,
+                "accepted_at": state.accepted_at.isoformat(),
             },
             delivery.render("interface_mtu", self.device.pk, self.management.adapter_device_id).payload,
         )
@@ -1946,6 +1951,7 @@ class TestOwnershipActionRecheck(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "min_rx": 300,
                 "multiplier": 3,
                 "micro_bfd": False,
+                "accepted_at": current.accepted_at.isoformat(),
             },
             delivery.render("bfd", self.device.pk, self.management.adapter_device_id).payload,
         )

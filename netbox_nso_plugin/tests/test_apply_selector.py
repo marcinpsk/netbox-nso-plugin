@@ -16,6 +16,7 @@ from requests.exceptions import ConnectionError
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_apply_preflight, make_response
+from ._candidate_render_case import ACCEPTED_AT
 from ._manual_capture_case import promote_preflighted_intent, store_apply_selection
 from ._outbox_case import (
     ReceiptAdapter,
@@ -2540,7 +2541,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "accepted")
         self.assertEqual(self.vlan_state.vlan.name, placeholder_vlan_name(old_vid + 1))
         rendered = delivery.render("vlan", self.device.pk, self.mgmt.adapter_device_id)
-        self.assertEqual(rendered.payload, [{"vlan_id": old_vid + 1, "name": ""}])
+        self.assertEqual(
+            rendered.payload,
+            [{"vlan_id": old_vid + 1, "name": "", "accepted_at": self.vlan_state.accepted_at.isoformat()}],
+        )
 
     def test_a_vlan_id_change_rejects_a_conflicting_placeholder_name(self):
         from ipam.models import VLAN
@@ -2831,7 +2835,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             vlan = VLAN.objects.create(vid=1559, name="promotion-new-owned-vlan")
         self.assertFalse(NSOVLANState.objects.filter(management=self.mgmt, vlan=vlan).exists())
         registry, pushed = self._promotion_snapshot()
-        state = NSOVLANState(management=self.mgmt, vlan=vlan, status="accepted")
+        state = NSOVLANState(management=self.mgmt, vlan=vlan, status="accepted", accepted_at=ACCEPTED_AT)
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
             saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),),

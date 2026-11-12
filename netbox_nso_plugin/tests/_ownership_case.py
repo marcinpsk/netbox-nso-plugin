@@ -32,9 +32,27 @@ def acquire_bgp_router(management, router, **values):
     )[0]
 
 
+def stamp_owned_fixture(instance, update_fields=None):
+    from django.utils import timezone
+
+    from netbox_nso_plugin.intent_state import OVERLAY_MODEL_RANKS
+    from netbox_nso_plugin.status_machine import OWNED_STATES
+
+    if (
+        instance._meta.label_lower in OVERLAY_MODEL_RANKS
+        and instance.status in OWNED_STATES
+        and instance.accepted_at is None
+    ):
+        instance.accepted_at = timezone.now()
+        if update_fields is not None:
+            update_fields = (*update_fields, "accepted_at")
+    return update_fields
+
+
 def save_overlay_fixture(instance, *, update_fields=None):
     from ._outbox_case import without_commit_drain
 
+    update_fields = stamp_owned_fixture(instance, update_fields)
     created = instance.pk is None or instance._state.adding
     natural_key = next(iter(instance._meta.unique_together), ())
     if not natural_key:
