@@ -945,7 +945,7 @@ class NSODeviceDifferencesView(AuthorizedView):
             identity_label,
             observation_snapshots,
         )
-        from .device_intend import acquisition_outcomes, difference_choices, intend_choices
+        from .device_intend import acquisition_outcomes, difference_choices, difference_index, intend_choices
         from .device_sync import NOT_SUPPORTED as SYNC_NOT_SUPPORTED
         from .device_sync import SYNC_SCOPES, SYNCABLE_KINDS, row_token
         from .ownership_planner import converted_scope_rules
@@ -969,6 +969,7 @@ class NSODeviceDifferencesView(AuthorizedView):
         can_sync = self.target.allows("change")
         choices = intend_choices(management, request.user) if can_sync else []
         page = Paginator(filtered, 50).get_page(request.GET.get("page"))
+        index = difference_index(choices)
         page.object_list = [
             {
                 "scope": row.scope,
@@ -983,7 +984,7 @@ class NSODeviceDifferencesView(AuthorizedView):
                 "token": row_token(row),
                 "syncable": row.scope in SYNC_SCOPES and row.kind in SYNCABLE_KINDS,
                 "sync_note": "" if row.scope in SYNC_SCOPES else SYNC_NOT_SUPPORTED,
-                "intend_choices": difference_choices(row, choices),
+                "intend_choices": difference_choices(row, index),
             }
             for row in page.object_list
         ]

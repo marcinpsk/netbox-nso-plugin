@@ -806,3 +806,37 @@ class TestIntendDelivery(IntendViewFixture, _CascadeFlushMixin, IntentPushResetM
         self.assertContains(self.client.get(self.url("differences")), "acquired; delivery pending")
         NSODeviceManagement.objects.filter(pk=self.management.pk).update(adapter_device_id=1789)
         self.assertNotContains(self.client.get(self.url("differences")), "acquired; stored")
+
+
+class TestDifferenceChoiceIndex(SimpleTestCase):
+    def test_each_row_reads_its_choices_from_the_index(self):
+        from types import SimpleNamespace
+
+        from netbox_nso_plugin.device_intend import difference_choices, difference_index
+
+        def choice(token, scope, identities, attribute=None):
+            state_key = {"attribute": attribute} if attribute else {}
+            return {
+                "token": token,
+                "difference_scope": scope,
+                "difference_identities": identities,
+                "state_key": state_key,
+            }
+
+        choices = [
+            choice("mtu", "interface", ["et-0/0/1", "et-0/0/1"], "mtu"),
+            choice("description", "interface", ["et-0/0/1"], "description"),
+            choice("vlan", "vlan", ["et-0/0/1"]),
+            choice("ip", "ip", [("et-0/0/1", "198.18.0.1", None)]),
+        ]
+        index = difference_index(choices)
+
+        def tokens(scope, identity, attribute=""):
+            row = SimpleNamespace(kind="mismatch", scope=scope, identity=identity, attribute=attribute)
+            return [item["token"] for item in difference_choices(row, index)]
+
+        self.assertEqual(tokens("interface", "et-0/0/1", "mtu"), ["mtu"])
+        self.assertEqual(tokens("interface", "et-0/0/1"), ["mtu", "description"])
+        self.assertEqual(tokens("vlan", "et-0/0/1"), ["vlan"])
+        self.assertEqual(tokens("ip", ("et-0/0/1", "198.18.0.1", 24, "")), ["ip"])
+        self.assertEqual(tokens("interface", "et-0/0/2"), [])

@@ -110,7 +110,16 @@ def _native_root(entry):
     return objects[0] if objects else None
 
 
-def difference_choices(row, choices):
+def difference_index(choices):
+    """Index the native choices by ``(difference scope, identity)`` for the per-row lookup."""
+    index = defaultdict(list)
+    for choice in choices:
+        for identity in dict.fromkeys(choice["difference_identities"]):
+            index[(choice["difference_scope"], identity)].append(choice)
+    return index
+
+
+def difference_choices(row, index):
     """Match projected Differences to their explicit native choices."""
     if row.kind not in {"netbox_only", "mismatch"}:
         return []
@@ -118,15 +127,11 @@ def difference_choices(row, choices):
     if row.scope == "ip" and isinstance(identity, tuple):
         # A prefix mismatch row names the device prefix, so match interface, host and VRF (global as None).
         identity = (identity[0], identity[1], identity[3] or None)
-    matched = []
-    for choice in choices:
-        if row.scope != choice["difference_scope"]:
-            continue
-        if identity in choice["difference_identities"] and (
-            row.scope != "interface" or not row.attribute or choice["state_key"].get("attribute") == row.attribute
-        ):
-            matched.append(choice)
-    return matched
+    return [
+        choice
+        for choice in index.get((row.scope, identity), ())
+        if row.scope != "interface" or not row.attribute or choice["state_key"].get("attribute") == row.attribute
+    ]
 
 
 def _superseded(error, state):
