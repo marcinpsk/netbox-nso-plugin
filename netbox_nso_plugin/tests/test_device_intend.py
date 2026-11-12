@@ -745,6 +745,30 @@ class TestIntendDelivery(IntendViewFixture, _CascadeFlushMixin, IntentPushResetM
         self.assertEqual(len(self.adapter.applied), 1)
         self.assertContains(self.client.get(self.url("differences")), "acquired; stored")
 
+    def test_a_switching_push_error_older_than_its_acknowledgement_is_not_reported(self):
+        import requests
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        group = VLANGroup.objects.create(name="Intend VLANs", slug=f"nso-{self.device.pk}")
+        self.interface.mode = "access"
+        self.interface.untagged_vlan = VLAN.objects.create(group=group, vid=100, name="UNTAGGED")
+        self.interface.save(update_fields=("mode", "untagged_vlan"))
+        preview = self.preview(self.selection("switchport"))
+        self.adapter.fail_with = requests.ConnectionError("placeholder transport failure")
+        self.confirm(preview)
+        stale = NSODeviceManagement.objects.get(pk=self.management.pk).intent_push_errors
+        self.assertIn("switchport", stale)
+        self.adapter.fail_with = None
+        drain.drain_intent_outbox()
+        # The preparation succeeded but could not clear the management record.
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(intent_push_errors=stale)
+        response = self.client.get(self.url("differences"))
+        self.assertNotContains(response, "ordinary delivery failed")
+        self.assertContains(response, "acquired; stored")
+
     def test_switchport_preview_shows_replaced_and_unchanged_vlan_membership(self):
         from ipam.models import VLAN, VLANGroup
 

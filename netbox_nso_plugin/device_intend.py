@@ -134,16 +134,17 @@ def difference_choices(row, index):
     ]
 
 
-def _superseded(error, state):
+def _superseded(error, *successes):
     """Tell whether a later acknowledged delivery supersedes a recorded push error."""
-    if not isinstance(error, dict) or state is None or state.last_success_at is None:
+    successes = [moment for moment in successes if moment is not None]
+    if not isinstance(error, dict) or not successes:
         return False
-    return datetime.fromisoformat(error["at"]) < state.last_success_at
+    return datetime.fromisoformat(error["at"]) < max(successes)
 
 
 def acquisition_outcomes(management):
     """Report storage only from ordinary acknowledgements for the current owners."""
-    from django.db.models import Q
+    from django.db.models import Max, Q
 
     from . import delivery
     from .adapter_client import AdapterError, public_error_message
@@ -206,7 +207,9 @@ def acquisition_outcomes(management):
                 for row in rows
             )
         error = (management.intent_push_errors or {}).get(key)
-        if _superseded(error, state):
+        # A direct-delivery key records its success on the selection, not on the outbox state.
+        acknowledged_at = snapshots.aggregate(latest=Max("selection__acknowledged_at"))["latest"]
+        if _superseded(error, state.last_success_at if state else None, acknowledged_at):
             error = None
         if (
             state
