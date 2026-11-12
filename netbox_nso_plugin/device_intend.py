@@ -3,6 +3,7 @@
 """Present stable native choices for explicit acquisition."""
 
 from collections import defaultdict
+from datetime import datetime
 from ipaddress import ip_interface
 
 from django.apps import apps
@@ -128,6 +129,13 @@ def difference_choices(row, choices):
     return matched
 
 
+def _superseded(error, state):
+    """Tell whether a later acknowledged delivery supersedes a recorded push error."""
+    if not isinstance(error, dict) or state is None or state.last_success_at is None:
+        return False
+    return datetime.fromisoformat(error["at"]) < state.last_success_at
+
+
 def acquisition_outcomes(management):
     """Report storage only from ordinary acknowledgements for the current owners."""
     from django.db.models import Q
@@ -193,6 +201,8 @@ def acquisition_outcomes(management):
                 for row in rows
             )
         error = (management.intent_push_errors or {}).get(key)
+        if _superseded(error, state):
+            error = None
         if (
             state
             and state.last_error_at

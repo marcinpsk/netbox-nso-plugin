@@ -674,6 +674,29 @@ class TestIntendDelivery(IntendViewFixture, _CascadeFlushMixin, IntentPushResetM
         self.assertEqual(drain.drain_intent_outbox(), (1, 0))
         self.assertContains(self.client.get(self.url("differences")), "acquired; stored")
 
+    def test_a_push_error_older_than_the_last_success_is_not_reported(self):
+        import datetime
+
+        import requests
+
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxState
+
+        self.adapter.fail_with = requests.ConnectionError("placeholder transport failure")
+        self.confirm(self.preview())
+        stale = NSODeviceManagement.objects.get(pk=self.management.pk).intent_push_errors
+        self.adapter.fail_with = None
+        self.assertEqual(drain.drain_intent_outbox(), (1, 0))
+        # The success could not clear the management record, as when its bookkeeping write fails.
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(intent_push_errors=stale)
+        self.assertContains(self.client.get(self.url("differences")), "acquired; stored")
+
+        [(scope, entry)] = stale.items()
+        success = NSOIntentOutboxState.objects.get(device=self.device, scope=scope).last_success_at
+        newer = {scope: {**entry, "at": (success + datetime.timedelta(seconds=1)).isoformat()}}
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(intent_push_errors=newer)
+        self.assertContains(self.client.get(self.url("differences")), "acquired; ordinary delivery failed")
+
     def test_switchport_preserves_native_vlans_and_is_stored_after_ordinary_preparation(self):
         from ipam.models import VLAN, VLANGroup
 
