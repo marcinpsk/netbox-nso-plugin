@@ -2008,18 +2008,21 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
     return [key for _stamped, _at, key in ordered[:limit]]
 
 
-def compact_intent_outbox(limit=None) -> None:
+def compact_intent_outbox(limit=None, *, deadline: float | None = None) -> None:
     """Compact the bounded candidate set unless a deployment has paused it."""
     try:
         with _deployment_operation("intent outbox compaction"):
-            _compact_intent_outbox(limit)
+            _compact_intent_outbox(limit, deadline=deadline)
     except DeploymentQuiesced:
         logger.info("intent outbox compaction is paused for a deployment")
 
 
-def _compact_intent_outbox(limit=None) -> None:
-    """Compact an admitted candidate set without contacting the adapter."""
+def _compact_intent_outbox(limit=None, *, deadline=None) -> None:
+    """Compact an admitted candidate set without contacting the adapter, stopping between keys at *deadline*."""
     for device_id, scope in compaction_candidates(limit):
+        if deadline is not None and _send_clock() >= deadline:
+            logger.info("intent outbox compaction deferred the remaining keys to the next tick")
+            break
         try:
             compact(device_id, scope)
         except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
@@ -2046,7 +2049,7 @@ def _drain_intent_outbox(limit=None, *, deadline=None) -> tuple[int, int]:
     """Run one tick with a new deployment admission for each bounded stage."""
     try:
         with _deployment_operation("intent outbox tick"):
-            _compact_intent_outbox(limit)
+            _compact_intent_outbox(limit, deadline=deadline)
     except DeploymentQuiesced:
         logger.info("the intent outbox tick is paused for a deployment")
         return 0, 0

@@ -187,7 +187,8 @@ class TestTheTickDrainsTheTail(_DrainCase):
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
-        compact.assert_called_once_with()
+        compact.assert_called_once()
+        assert compact.call_args.kwargs["deadline"] is not None, "outage compaction keeps the sweep's share"
         drain_all.assert_not_called()
 
     def test_an_adapter_outage_reports_compaction_and_settlement_durations_separately(self):
@@ -227,7 +228,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             result = drain._drain_intent_outbox()
 
         assert result == (0, 0)
-        compact.assert_called_once_with(None)
+        compact.assert_called_once_with(None, deadline=None)
         guarded_compact.assert_not_called()
         drain_key.assert_called_once_with(1, "vlan", deadline=None)
         restamp.assert_not_called()

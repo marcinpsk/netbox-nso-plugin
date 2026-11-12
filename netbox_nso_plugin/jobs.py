@@ -193,7 +193,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         # abort the tick before the sweep — the one pass that must always run.
         if by_id is None:
             try:
-                compact_intent_outbox()
+                compact_intent_outbox(deadline=before_sweep)
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox compaction failed")
             settle_started = time.monotonic()

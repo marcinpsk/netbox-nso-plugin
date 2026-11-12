@@ -236,6 +236,45 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertGreater(swept[0] - (started + self.BUDGET * (1 - jobs.SETTLEMENT_SWEEP_SHARE)), -0.5)
 
 
+class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """Compaction runs one transaction per key, so a large backlog must not use the sweep's share."""
+
+    def setUp(self):
+        super().setUp()
+        self.device, _management = make_managed("job-deadline-compact", 19163)
+        with without_commit_drain():
+            for _ in range(2):
+                with transaction.atomic():
+                    enqueue(self.device, "vlan")
+
+    def _rows(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        return NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").count()
+
+    def test_the_tick_leaves_compaction_to_the_next_tick_after_the_deadline(self):
+        from netbox_nso_plugin import drain
+
+        with self.assertLogs("netbox_nso_plugin.drain", level="INFO") as logs:
+            drain.drain_intent_outbox(deadline=time.monotonic() - 1)
+        self.assertEqual(self._rows(), 2)
+        self.assertTrue(any("compaction deferred" in line for line in logs.output), logs.output)
+        drain.compact_intent_outbox()
+        self.assertEqual(self._rows(), 1)
+
+    def test_the_outage_branch_compacts_inside_the_drain_share(self):
+        from netbox_nso_plugin import jobs
+
+        with (
+            patch.object(jobs, "SETTLEMENT_SWEEP_SHARE", 1.0),
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], None, {})),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+        self.assertEqual(self._rows(), 2)
+
+
 class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """RQ runs each job in a forked work horse, so a cut pass resumes from the Job row, not memory."""
 
