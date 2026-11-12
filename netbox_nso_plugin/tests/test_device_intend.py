@@ -674,6 +674,27 @@ class TestIntendDelivery(IntendViewFixture, _CascadeFlushMixin, IntentPushResetM
         self.assertEqual(drain.drain_intent_outbox(), (1, 0))
         self.assertContains(self.client.get(self.url("differences")), "acquired; stored")
 
+    def test_the_contribution_check_renders_each_row_s_own_key_first(self):
+        from unittest.mock import patch
+
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import delivery
+
+        address = IPAddress.objects.create(address="198.18.0.9/24", assigned_object=self.interface)
+        data = {"intend_row": [*self.selection()["intend_row"], *self.selection("ip", address)["intend_row"]]}
+        masked = []
+        render = delivery.render
+
+        def counted(key, *args, candidates=None, **kwargs):
+            if candidates is not None and any(row.status == "imported" for row in candidates.overlays):
+                masked.append(key)
+            return render(key, *args, candidates=candidates, **kwargs)
+
+        with patch.object(delivery, "render", side_effect=counted):
+            self.assertEqual(self.preview(data).context["result"].status, "ready")
+        self.assertEqual(len(masked), 2, masked)
+
     def test_a_push_error_older_than_the_last_success_is_not_reported(self):
         import datetime
 

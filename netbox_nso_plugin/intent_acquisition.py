@@ -453,16 +453,19 @@ def _plan(management, user, selection, timestamp, correlations):
     dependencies = _render_dependencies(dependencies, policy_owners, (), ())
     batch = CandidateBatch(rows, relations)
     payloads, bodies = _render(management, keys, batch)
-    for index, row in enumerate(rows):
+    for index, (scope, _native, _current, row) in enumerate(resolved):
         masked = copy.copy(row)
         masked.status = "imported"
         alternate = CandidateBatch((*rows[:index], masked, *rows[index + 1 :]), relations)
-        # The shared renderer must observe each selected contribution.
-        masked_payloads = {
-            key: delivery.render(key, management.device_id, management.adapter_device_id, candidates=alternate).payload
-            for key in keys
-        }
-        if delivery.canonical_fingerprint(masked_payloads) == delivery.canonical_fingerprint(payloads):
+        # The shared renderer must observe each selected contribution; its own key usually shows it first.
+        observed = any(
+            delivery.canonical_fingerprint(
+                delivery.render(key, management.device_id, management.adapter_device_id, candidates=alternate).payload
+            )
+            != delivery.canonical_fingerprint(payloads[key])
+            for key in sorted(keys, key=lambda key: key != scope)
+        )
+        if not observed:
             raise _Refused(
                 f"{row._meta.verbose_name} ({row}) requires a renderable dependency, bundle or destination. "
                 "Select the missing dependency explicitly."
