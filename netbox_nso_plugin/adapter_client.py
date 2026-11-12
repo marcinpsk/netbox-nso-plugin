@@ -466,6 +466,10 @@ def _document(data, what: str) -> dict:
 _PUBLIC_ERROR_MESSAGES = {
     "bgp_source_as_required": "The device's NED requires a source AS for this BGP redistribution.",
     "configuration_error": "The NSO adapter is not configured. See the server log.",
+    "interface_proof_conflict": (
+        "The interface context changed after an earlier Apply, so the adapter refused to promote this push. "
+        "Apply the interface and IP intent together."
+    ),
     "invalid_response": "The NSO adapter returned an invalid response. See the server log.",
 }
 _PUBLIC_ERROR_DEFAULT = "The NSO adapter request failed. See the server log."

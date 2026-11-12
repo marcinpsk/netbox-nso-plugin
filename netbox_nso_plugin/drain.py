@@ -126,6 +126,13 @@ PROVEN_NO_EFFECT = ("fence_shut", "store_only_deletion")
 #: The adapter's refusal of the BODY, at the boundary: every raise site precedes the first
 #: statement of the request's own transaction, so it is proven no-effect by the same rule.
 BOUNDARY_REJECTION = "validation_error"
+
+#: The adapter's delivery conflicts (api-contract "Delivery conflicts"): raised after receipt
+#: admission and rolled back, so the request had no effect and its replay meets the same refusal.
+DELIVERY_CONFLICTS = ("apply_unexecutable", "interface_proof_conflict")
+#: How long a refused request that carries deletion authority waits before the tick resends it.
+#: It cannot wait for Apply: a store-only push refuses while deletion authority is queued.
+REFUSED_RETRY = datetime.timedelta(hours=1)
 _CAPTURE_OUTCOME_FIELDS = ("last_success_identity", "last_success_at", "last_error_code", "last_error_at", "attempts")
 _TAKEOVER_ABANDONED = object()
 
@@ -381,6 +388,16 @@ def request_identity(payload, *, mode, marking_mode, deletions, mark, epoch) -> 
     return _sha256(material)
 
 
+def refusal_fingerprint(identity: str, deletions) -> str:
+    """Identify a refused request with its full deletion records, which the request identity omits."""
+    return _sha256(
+        {
+            "request": identity,
+            "deletions": sorted(delivery._wire_deletions(deletions), key=lambda record: record["route_id"]),
+        }
+    )
+
+
 def mapping_epoch(mgmt) -> tuple:
     """Return the adapter a body is delivered to: its device row, and the store holding it.
 
@@ -600,6 +617,16 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         mark=mark,
         epoch=mapping_epoch(mgmt),
     )
+
+    if not force and refusal_fingerprint(identity, deletions) == state.refused_identity:
+        # The adapter refused this exact request deterministically: Apply or new intent resends it.
+        authority = bool(deletions or mark_any)
+        if not authority:
+            _retire(NSOIntentOutboxEntry.objects.filter(id__in=entry_ids), entry_ids)
+        if not authority or now - state.last_error_at < REFUSED_RETRY:
+            state.save()
+            logger.info("%s/%s holds the request the adapter refused; it is not resent yet", device_id, scope)
+            return None
 
     state.revoked_ids = sorted(folded.revoked)
     state.lineage_carry = folded.lineage_carry
@@ -1259,6 +1286,7 @@ def _commit_acknowledged_claim(state, claim, response, ack, now):
     state.attempts = 0
     state.last_success_identity = claim.identity
     state.last_success_at = now
+    state.refused_identity = ""
     state.save()
     _stamp_last_acked(claim)
 
@@ -1403,6 +1431,7 @@ def reset_offboard_state(device_id, *, using):
         state.last_drain_attempted_at = None
         state.last_success_identity = ""
         state.last_success_at = None
+        state.refused_identity = ""
         state.save()
 
 
@@ -1506,7 +1535,7 @@ def _send_failure_outcome(claimed, exc) -> str:
     logger.warning("push_seq %s failed for %s/%s: %s", claimed.push_seq, claimed.device_id, claimed.scope, exc)
     if _proven_no_effect(exc):
         return _withhold(claimed, exc)
-    if _rejected_at_boundary(exc):
+    if _rejected_at_boundary(exc) or _delivery_conflict(exc):
         return _dissolve(claimed, exc)
     return record_failure(claimed, exc)
 
@@ -1717,6 +1746,11 @@ def _rejected_at_boundary(exc) -> bool:
     return getattr(exc, "code", None) == BOUNDARY_REJECTION
 
 
+def _delivery_conflict(exc) -> bool:
+    """Whether the adapter refused the promotion for a reason only an operator can correct."""
+    return getattr(exc, "status_code", None) == 409 and getattr(exc, "code", None) in DELIVERY_CONFLICTS
+
+
 def _dissolve(claim: Claim, exc) -> str:
     """Retire an authority-free refused body until an operator edit records new work."""
     from .models import NSOIntentOutboxEntry
@@ -1738,8 +1772,9 @@ def _dissolve(claim: Claim, exc) -> str:
             _retire(returned_entries, entry_ids)
         state.last_error_code = str(getattr(exc, "code", "") or type(exc).__name__)[:64]
         state.last_error_at = _db_now()
+        state.refused_identity = refusal_fingerprint(claim.identity, claim.deletions)
         state.save()
-    logger.warning("%s/%s refused push_seq %s at the boundary: %s", claim.device_id, claim.scope, claim.push_seq, exc)
+    logger.warning("%s/%s refused push_seq %s: %s", claim.device_id, claim.scope, claim.push_seq, exc)
     return REJECTED
 
 

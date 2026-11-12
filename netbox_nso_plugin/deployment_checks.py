@@ -15,7 +15,7 @@ from .models import (
     NSODeviceManagement,
 )
 
-PLUGIN_MIGRATION_HEAD = "0047_owned_acceptance_times"
+PLUGIN_MIGRATION_HEAD = "0048_outbox_refused_identity"
 
 
 def check_contracts():
