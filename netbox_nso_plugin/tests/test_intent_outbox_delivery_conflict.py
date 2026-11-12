@@ -197,6 +197,38 @@ class TestAChangedDeletionLineageIsANewRequest(_OutcomeCase):
         assert len(record["triples"]) == 2
 
 
+class TestARevocationEndsAHeldRefusal(_OutcomeCase):
+    tag = "dcrev"
+    adapter_device_id = 7720
+
+    def test_a_re_own_during_a_held_refusal_is_a_new_request_without_the_deletion(self):
+        from netbox_nso_plugin import drain
+
+        route = own_route(self.mgmt, "198.51.100.224/28", "198.51.100.50")
+        own_route(self.mgmt, "198.51.100.240/28", "198.51.100.60")
+        with as_per_object("static_route"):
+            assert self.drain() == drain.SUCCEEDED
+            self.unown(route)
+            self.adapter._respond = conflict(
+                "apply_unexecutable", {"streams": {"static_route": "no_executable_interface"}}
+            )
+            assert self.drain() == drain.REJECTED
+            sent = len(self.adapter.requests)
+            assert self.drain() == drain.NOTHING, "the refused deletion is held"
+            assert [int(r["route_id"]) for r in state_of(self.device, "static_route").queued_deletions] == [route.pk]
+
+            # The re-own changes the rendered request, so the held refusal no longer matches.
+            self.reown(route)
+            self.adapter._respond = lambda body: partition()
+            assert self.drain() == drain.SUCCEEDED
+
+        assert len(self.adapter.requests) == sent + 1
+        body = self.adapter.requests[-1]["body"]
+        assert body["deleted_routes"] == [], "the revoked deletion is not sent"
+        assert route.pk in {item["route_id"] for item in body["routes"]}
+        assert state_of(self.device, "static_route").queued_deletions == []
+
+
 def test_the_interface_proof_conflict_has_fixed_public_text():
     from netbox_nso_plugin.adapter_client import AdapterError, public_error_message
 
