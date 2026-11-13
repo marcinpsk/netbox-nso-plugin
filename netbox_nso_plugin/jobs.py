@@ -18,9 +18,54 @@ logger = logging.getLogger(__name__)
 SYNC_CACHE_REFRESH_MINUTES = 5
 RENDERER_AUDIT_MINUTES = 5
 
+#: The RQ timeout every plugin system job enqueues with, so none depends on RQ_DEFAULT_TIMEOUT.
+SYSTEM_JOB_TIMEOUT_SECONDS = 600
+#: When a run stops starting work. The rest of the timeout is for the work still in flight then:
+#: one settlement poll or link repair makes a few adapter calls of up to the 30 s read timeout.
+SYSTEM_JOB_BUDGET_SECONDS = SYSTEM_JOB_TIMEOUT_SECONDS - 360
+#: The part of the sync-cache budget kept for its last pass, the settlement sweep.
+SETTLEMENT_SWEEP_SHARE = 0.25
+
+
+def run_deadline() -> float:
+    """Return the monotonic instant a system job run that starts now must stop starting work."""
+    return time.monotonic() + SYSTEM_JOB_BUDGET_SECONDS
+
+
+class _PluginSystemJob(JobRunner):
+    """A system job that sets its own RQ timeout and bounds each run below it.
+
+    RQ kills a run that passes its timeout, and NetBox then never reschedules it: the Job row
+    stays ``running`` and ``enqueue_once`` keeps skipping it. So each run stops at
+    :func:`run_deadline` and leaves the rest of its work to the next run.
+    """
+
+    @classmethod
+    def enqueue(cls, *args, **kwargs):
+        """Enqueue with the plugin's job timeout, also on NetBox's reschedule after each run."""
+        kwargs.setdefault("job_timeout", SYSTEM_JOB_TIMEOUT_SECONDS)
+        return super().enqueue(*args, **kwargs)
+
+    def carried(self, key):
+        """Return what the latest earlier run of this job recorded under *key*, or None.
+
+        RQ runs each job in a forked work horse, so process memory does not reach the next run.
+        """
+        from core.models import Job
+
+        previous = (
+            Job.objects.filter(name=self.name, data__has_key=key).exclude(pk=self.job.pk).order_by("-created").first()
+        )
+        return previous.data[key] if previous is not None else None
+
+    def carry(self, key, value) -> None:
+        """Record *value* under *key* on this run's Job row, for the next run."""
+        self.job.data = {**(self.job.data or {}), key: value}
+        self.job.save(update_fields=("data",))
+
 
 @system_job(interval=RENDERER_AUDIT_MINUTES)
-class AuditRendererScopesJob(JobRunner):
+class AuditRendererScopesJob(_PluginSystemJob):
     """Repair signal-less renderer drift on the periodic five-minute cadence."""
 
     class Meta:
@@ -30,11 +75,14 @@ class AuditRendererScopesJob(JobRunner):
         """Run one bounded fleet audit, or defer it while deployment is quiesced."""
         from .renderer_audit import audit_renderer_fleet
 
+        rotation = self.carried("fleet_rotation") or {}
         try:
-            result = audit_renderer_fleet()
+            result = audit_renderer_fleet(deadline=run_deadline(), rotation=rotation)
         except DeploymentQuiesced:
             logger.info("AuditRendererScopesJob: paused for an intent deployment")
             return None
+        finally:
+            self.carry("fleet_rotation", rotation)
         logger.info(
             "AuditRendererScopesJob: %d devices, %d repairs, %d deferred, %d unknown, %d failed",
             result.devices,
@@ -47,7 +95,7 @@ class AuditRendererScopesJob(JobRunner):
 
 
 @system_job(interval=JobIntervalChoices.INTERVAL_HOURLY)
-class AdvanceStaleOnboardingJob(JobRunner):
+class AdvanceStaleOnboardingJob(_PluginSystemJob):
     """Hourly backstop that advances every durable provision tombstone.
 
     The sweep polls open attempts and completes terminal attempts. It also offboards successful
@@ -62,13 +110,13 @@ class AdvanceStaleOnboardingJob(JobRunner):
         from .onboarding import advance_stale_onboarding_rows
 
         try:
-            advance_stale_onboarding_rows()
+            advance_stale_onboarding_rows(deadline=run_deadline())
         except DeploymentQuiesced:
             logger.info("AdvanceStaleOnboardingJob: paused for an intent deployment")
 
 
 @system_job(interval=SYNC_CACHE_REFRESH_MINUTES)
-class RefreshDeviceSyncCacheJob(JobRunner):
+class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     """The plugin's per-device maintenance tick. The name is kept; it does more than it says.
 
     Four passes today, in this order and for these reasons:
@@ -92,6 +140,9 @@ class RefreshDeviceSyncCacheJob(JobRunner):
 
     Renaming the class would change the system-job identity NetBox has registered, so the
     docstring carries the truth instead.
+
+    The first three passes stop early, so that :data:`SETTLEMENT_SWEEP_SHARE` of the run's
+    budget stays for the sweep. The sweep stops at the run's deadline.
     """
 
     class Meta:
@@ -99,29 +150,33 @@ class RefreshDeviceSyncCacheJob(JobRunner):
 
     def run(self, *args, **kwargs):
         """Run a scheduled tick, or return normally while a deployment pauses it."""
+        rotation = self.carried("settlement_rotation") or {}
         try:
-            return RefreshDeviceSyncCacheJob._run(*args, **kwargs)
+            return RefreshDeviceSyncCacheJob._run(run_deadline(), rotation)
         except DeploymentQuiesced:
             logger.info("RefreshDeviceSyncCacheJob: paused for an intent deployment")
             return None
+        finally:
+            self.carry("settlement_rotation", rotation)
 
     @staticmethod
     @_deployment_guarded("device maintenance tick")
-    def _run(*args, **kwargs):
+    def _run(deadline, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
         from .settlement import sweep_static_route_settlements
         from .sync_cache import _snapshot, reconcile_device_links, refresh_sync_caches
 
+        before_sweep = deadline - SYSTEM_JOB_BUDGET_SECONDS * SETTLEMENT_SWEEP_SHARE
         rows = list(NSODeviceManagement.objects.select_related("nso_instance"))
         # One adapter snapshot for both passes: they ask the same question of the same data,
         # and a second call could disagree with the first mid-sweep.
         snapshot = _snapshot(rows)
-        checked, updated = refresh_sync_caches(rows, snapshot=snapshot)
+        checked, updated = refresh_sync_caches(rows, snapshot=snapshot, deadline=before_sweep)
         # A row whose mapping is broken can't be mirrored at all — repair it so the next pass
         # has something to mirror.
-        broken, attempted = reconcile_device_links(rows, snapshot=snapshot)
+        broken, attempted = reconcile_device_links(rows, snapshot=snapshot, deadline=before_sweep)
         # LAST, and on its own candidate query: the repair above wrote the database while
         # leaving `rows` stale in two of its three branches, so reusing that list here would
         # skip a device repaired this tick or poll it on an id that no longer exists.
@@ -138,7 +193,7 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         # abort the tick before the sweep — the one pass that must always run.
         if by_id is None:
             try:
-                compact_intent_outbox()
+                compact_intent_outbox(deadline=before_sweep)
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox compaction failed")
             settle_started = time.monotonic()
@@ -147,11 +202,11 @@ class RefreshDeviceSyncCacheJob(JobRunner):
             # Same rule as the sweep, and for the same reason: a proven global outage is not
             # a per-key failure, and every candidate would wait out its own read timeout.
             try:
-                drained, drain_failed = drain_intent_outbox()
+                drained, drain_failed = drain_intent_outbox(deadline=before_sweep)
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
             settle_started = time.monotonic()
-            polled, settle_failed = sweep_static_route_settlements()
+            polled, settle_failed = sweep_static_route_settlements(deadline=deadline, rotation=rotation)
         logger.info(
             "RefreshDeviceSyncCacheJob: %d checked, %d updated, %d broken, %d repair attempted, "
             "%d outbox drained, %d outbox failed, outbox drain %.3fs, "
@@ -169,38 +224,24 @@ class RefreshDeviceSyncCacheJob(JobRunner):
         )
 
 
-PRUNE_TIME_BUDGET_SECONDS = 600
-
-
 @system_job(interval=JobIntervalChoices.INTERVAL_DAILY)
-class PruneApplyLedgerJob(JobRunner):
-    """Prune bounded batches of expired Apply history each day until the ledger ends or the time budget ends."""
+class PruneApplyLedgerJob(_PluginSystemJob):
+    """Prune bounded batches of expired Apply history each day until the ledger ends or the run's deadline."""
 
     class Meta:
         name = "Prune NSO Apply ledger"
 
     def run(self, *args, **kwargs):
         """Use the same eligibility and deletion path as the maintenance command."""
-        from core.models import Job
-
         from .apply_retention import prune_apply_ledger
 
-        previous = (
-            Job.objects.filter(name=self.name, data__has_key="apply_ledger_cursor")
-            .exclude(
-                pk=self.job.pk,
-            )
-            .order_by("-created")
-            .first()
-        )
-        cursor = previous.data["apply_ledger_cursor"] if previous is not None else None
-        deadline = time.monotonic() + PRUNE_TIME_BUDGET_SECONDS
+        cursor = self.carried("apply_ledger_cursor")
+        deadline = run_deadline()
         try:
             while True:
-                result = prune_apply_ledger(execute=True, cursor=cursor)
+                result = prune_apply_ledger(execute=True, cursor=cursor, deadline=deadline)
                 cursor = result.next_cursor
-                self.job.data = {**(self.job.data or {}), "apply_ledger_cursor": cursor}
-                self.job.save(update_fields=("data",))
+                self.carry("apply_ledger_cursor", cursor)
                 if result.adapter_unavailable or cursor is None or time.monotonic() >= deadline:
                     return result
         except DeploymentQuiesced:

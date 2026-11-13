@@ -908,18 +908,11 @@ def _queue_scope_sync(sender, instance, created, *, update_fields=None):
 
 
 def _update_management_mirror(instance, **values):
-    """Persist management lifecycle fields through the exact mirror writer."""
-    from .management_lifecycle import save_management
+    """Persist management lifecycle fields under the management row lock alone."""
+    from .intent_state import update_mirror_fields
 
-    fields = set(values)
-    current = type(instance).objects.filter(pk=instance.pk).first()
-    if current is None:
-        return
-    for field_name, value in values.items():
-        setattr(current, field_name, value)
-    save_management(current, update_fields=fields)
-    for field_name, value in values.items():
-        setattr(instance, field_name, value)
+    # The row lock is enough: the device's full renderer footprint re-reads every interface it has.
+    update_mirror_fields(instance, **values)
 
 
 def _sync_committed_scope_to_adapter(sender, instance_pk, created):
@@ -1006,17 +999,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         from django.db import connection
 
         if not connection.needs_rollback:
-            from .intent_state import RendererTargetsChanged
-            from .renderer_writer import IntentPlanStaleError
-
-            try:
-                _update_management_mirror(instance, adapter_link_error=message)
-            except (IntentPlanStaleError, RendererTargetsChanged) as mirror_exc:
-                logger.warning(
-                    "Skipped adapter error mirror update for management row %s because its renderer plan changed: %s",
-                    instance.pk,
-                    mirror_exc,
-                )
+            _update_management_mirror(instance, adapter_link_error=message)
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")

@@ -30,6 +30,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    system_job,
     wait_until_postgres_blocks,
     without_commit_drain,
 )
@@ -170,7 +171,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             patch("netbox_nso_plugin.drain.drain_intent_outbox", side_effect=record("drain", (0, 0))),
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", side_effect=record("settle", (0, 0))),
         ):
-            jobs.RefreshDeviceSyncCacheJob.run(None)  # self is unused by run()
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
         assert order == ["refresh", "repair", "drain", "settle"]
 
@@ -184,9 +185,10 @@ class TestTheTickDrainsTheTail(_DrainCase):
             patch("netbox_nso_plugin.drain.compact_intent_outbox") as compact,
             patch("netbox_nso_plugin.drain.drain_intent_outbox") as drain_all,
         ):
-            jobs.RefreshDeviceSyncCacheJob.run(None)
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
-        compact.assert_called_once_with()
+        compact.assert_called_once()
+        assert compact.call_args.kwargs["deadline"] is not None, "outage compaction keeps the sweep's share"
         drain_all.assert_not_called()
 
     def test_an_adapter_outage_reports_compaction_and_settlement_durations_separately(self):
@@ -202,8 +204,9 @@ class TestTheTickDrainsTheTail(_DrainCase):
             patch.object(jobs, "time") as clock,
             patch.object(jobs.logger, "info") as log,
         ):
-            clock.monotonic.side_effect = chain((10.0, 20.0), repeat(21.0))
-            jobs.RefreshDeviceSyncCacheJob.run(None)
+            # The run's deadline takes the first reading.
+            clock.monotonic.side_effect = chain((0.0, 10.0, 20.0), repeat(21.0))
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
         # Rendered, not indexed: a value added to that one `logger.info` shifts every index,
         # and the test would then assert the wrong duration and still pass.
@@ -225,9 +228,9 @@ class TestTheTickDrainsTheTail(_DrainCase):
             result = drain._drain_intent_outbox()
 
         assert result == (0, 0)
-        compact.assert_called_once_with(None)
+        compact.assert_called_once_with(None, deadline=None)
         guarded_compact.assert_not_called()
-        drain_key.assert_called_once_with(1, "vlan")
+        drain_key.assert_called_once_with(1, "vlan", deadline=None)
         restamp.assert_not_called()
 
     def test_the_tick_enters_the_deployment_gate_once_before_compaction(self):
@@ -307,7 +310,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
                 patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
                 patch.object(drain, "send_claim", side_effect=send_after_exclusive_queues),
             ):
-                jobs.RefreshDeviceSyncCacheJob.run(None)
+                system_job(jobs.RefreshDeviceSyncCacheJob).run()
             waiter.join(timeout=10)
 
             self.assertEqual(send_failures, [], send_failures[0] if send_failures else "")
@@ -343,7 +346,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
         def run_job():
             close_old_connections()
             try:
-                jobs.RefreshDeviceSyncCacheJob.run(None)
+                system_job(jobs.RefreshDeviceSyncCacheJob).run()
             except BaseException as exc:
                 errors.append(exc)
             finally:
@@ -428,7 +431,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
                 patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
             ):
                 with self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logged:
-                    jobs.RefreshDeviceSyncCacheJob.run(None)
+                    system_job(jobs.RefreshDeviceSyncCacheJob).run()
             assert "paused for an intent deployment" in "\n".join(logged.output)
             assert [row.pk for row in entries(device, "vlan", unconsumed=True)] == before
         finally:
@@ -439,7 +442,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
             patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
         ):
-            jobs.RefreshDeviceSyncCacheJob.run(None)
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
         assert [row.pk for row in entries(device, "vlan", unconsumed=True)] == [before[-1]]
 
         assert self.run_drain() == (1, 0)
@@ -480,7 +483,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
         self.edit(reused_mgmt)
         self.edit(missing_mgmt)
 
-        def repair(rows, snapshot=None):
+        def repair(rows, snapshot=None, deadline=None):
             """The two branches that leave the caller holding something untrue."""
             mirror_update(NSODeviceManagement.objects.get(pk=reused_mgmt.pk), adapter_device_id=7710)
             mirror_update(NSODeviceManagement.objects.get(pk=missing_mgmt.pk), adapter_device_id=7711)
@@ -499,7 +502,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             patch("netbox_nso_plugin.sync_cache.reconcile_device_links", side_effect=repair),
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
         ):
-            jobs.RefreshDeviceSyncCacheJob.run(None)  # self is unused by run()
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
         sent = sorted(request["url"].split("/devices/")[1].split("/")[0] for request in self.adapter.requests)
         assert sent == ["7710", "7711"]

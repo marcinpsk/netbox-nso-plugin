@@ -7,6 +7,7 @@ from __future__ import annotations
 import bisect
 import copy
 import dataclasses
+import functools
 import logging
 import time
 
@@ -35,10 +36,8 @@ _SWEEP_BUDGET_SHARE = 0.25
 _REPAIR_ATTEMPTS = 3
 _SERIALIZATION_FAILURE = "40001"
 
-# Where the two capped cadence walks resume. Both are process-local: no column holds them,
-# and a worker restart costs one tick of fairness rather than a permanently starved tail.
+# Where a capped scope walk resumes. Process-local: no column holds it.
 _SCOPE_ROTATION: dict[int | None, int] = {}
-_FLEET_ROTATION = {"after_device_id": 0}
 
 
 def _monotonic() -> float:
@@ -435,10 +434,8 @@ def audit_renderer_scopes(
         return RendererAuditResult(selected, (), deferred, candidates)
     if repaired:
         if not pre_capture:
-            from .signals import _schedule_intent_drain
-
-            for scope in repaired:
-                _schedule_intent_drain((device_id, scope))
+            # At once outside a transaction, and after the commit inside a caller's one.
+            transaction.on_commit(functools.partial(_drain_repaired, device_id, tuple(repaired), deadline))
         logger.warning(
             "renderer audit repaired device=%s scopes=%s trigger=%s",
             device_id,
@@ -448,16 +445,40 @@ def audit_renderer_scopes(
     return RendererAuditResult(selected, tuple(repaired), deferred)
 
 
-def _fleet_rotation(device_ids):
+def _drain_repaired(device_id, scopes, deadline) -> None:
+    """Send each repaired key inside the audit deadline; the outbox tick sends the rest."""
+    from . import drain
+
+    for index, scope in enumerate(scopes):
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            logger.info(
+                "renderer audit left repair sends to the outbox tick device=%s scopes=%s",
+                device_id,
+                scopes[index:],
+            )
+            return
+        try:
+            drain.drain_key(device_id, scope, deadline=remaining)
+        except Exception as exc:  # noqa: BLE001 (the outbox tick retries the key)
+            logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
+
+
+def _fleet_rotation(device_ids, after_device_id):
     """Resume after the device the previous tick last reached, so the tail is not starved."""
-    start = bisect.bisect_right(device_ids, _FLEET_ROTATION["after_device_id"])
+    start = bisect.bisect_right(device_ids, after_device_id)
     if start >= len(device_ids):
         start = 0
     return device_ids[start:] + device_ids[:start]
 
 
-def audit_renderer_fleet() -> RendererFleetAuditResult:
-    """Audit managed devices until the one shared cadence deadline expires."""
+def audit_renderer_fleet(*, deadline: float, rotation: dict | None = None) -> RendererFleetAuditResult:
+    """Audit managed devices until the one shared cadence deadline expires.
+
+    *deadline* is the caller's monotonic stop instant. The configured tick budget can only
+    make it earlier. A *rotation* dict that the caller carries between passes makes the next
+    pass resume after the last device this one reached.
+    """
     from .models import NSODeviceManagement
     from .provision_lifecycle import sweep_provision_tombstones
 
@@ -467,7 +488,8 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
         float,
     )
     started = _monotonic()
-    deadline = started + budget
+    deadline = min(deadline, started + budget)
+    budget = deadline - started
     scopes = tuple(delivery.delivery_keys())
     # The provision backstop belongs on this five-minute cadence rather than on the hourly job:
     # an orphan offboard or a stranded onboard would otherwise wait an hour. It runs before
@@ -487,7 +509,8 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
         .order_by("device_id")
         .values_list("device_id", flat=True)
     )
-    ordered = _fleet_rotation(device_ids)
+    rotation = {} if rotation is None else rotation
+    ordered = _fleet_rotation(device_ids, rotation.get("after_device_id", 0))
     audited_devices = repaired = deferred = unknown = failed = 0
     for index, device_id in enumerate(ordered):
         if _budget_expired(deadline):
@@ -495,7 +518,7 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
             break
         # Stamped for being TRIED, not for succeeding, and before the attempt: a device that
         # raises on every tick would otherwise hold the head and starve everything behind it.
-        _FLEET_ROTATION["after_device_id"] = device_id
+        rotation["after_device_id"] = device_id
         try:
             result = audit_renderer_scopes(
                 device_id,
