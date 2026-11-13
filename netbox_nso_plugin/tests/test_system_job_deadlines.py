@@ -262,6 +262,40 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
         drain.compact_intent_outbox()
         self.assertEqual(self._rows(), 1)
 
+    def test_an_expired_deadline_skips_candidate_discovery(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        table = NSOIntentOutboxEntry._meta.db_table
+        with CaptureQueriesContext(connection) as queries:
+            drain.compact_intent_outbox(deadline=time.monotonic() - 1)
+        self.assertFalse([query["sql"] for query in queries.captured_queries if table in query["sql"]])
+        self.assertEqual(self._rows(), 2)
+
+    def test_discovery_stops_reading_keys_when_the_deadline_passes(self):
+        from netbox_nso_plugin import drain
+
+        other, _management = make_managed("job-deadline-compact-b", 19164, index=2)
+        with without_commit_drain():
+            for _ in range(2):
+                with transaction.atomic():
+                    enqueue(other, "vlan")
+        clock, read = [0.0], []
+        unconsumed = drain._unconsumed
+
+        def _read_key(device_id, scope):
+            # The deadline passes while discovery reads the first key's entries.
+            read.append((device_id, scope))
+            clock[0] = 100.0
+            return unconsumed(device_id, scope)
+
+        with (
+            patch("netbox_nso_plugin.drain._send_clock", lambda: clock[0]),
+            patch("netbox_nso_plugin.drain._unconsumed", _read_key),
+        ):
+            drain.compact_intent_outbox(deadline=50.0)
+        self.assertEqual(read, [(self.device.pk, "vlan")])
+
     def test_the_outage_branch_compacts_inside_the_drain_share(self):
         from netbox_nso_plugin import jobs
 

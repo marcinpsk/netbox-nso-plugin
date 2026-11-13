@@ -872,14 +872,14 @@ def _compactable(row, held) -> bool:
     )
 
 
-def compaction_candidates(limit=None) -> list[tuple[int, str]]:
-    """Return keys with an eligible contiguous same-kind span."""
+def compaction_candidates(limit=None, *, deadline=None) -> list[tuple[int, str]]:
+    """Return keys with an eligible contiguous same-kind span, found before *deadline*."""
     from django.db.models import Count
 
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
     limit = DRAIN_BATCH if limit is None else limit
-    if limit == 0:
+    if limit == 0 or _past(deadline):
         return []
     grouped = (
         NSOIntentOutboxEntry.objects.filter(consumed_by_push_seq__isnull=True)
@@ -890,10 +890,14 @@ def compaction_candidates(limit=None) -> list[tuple[int, str]]:
     )
     candidates = []
     for device_id, scope, _rows in grouped.iterator():
+        if _past(deadline):
+            break
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).only("claim_deletions").first()
         held = {int(record["route_id"]) for record in (state.claim_deletions or [])} if state is not None else set()
         previous_kind = None
         for row in _unconsumed(device_id, scope).only("kind", "transitions").order_by("id").iterator():
+            if _past(deadline):
+                return candidates
             if not _compactable(row, held):
                 previous_kind = None
             elif row.kind == previous_kind:
@@ -965,6 +969,11 @@ def send_claim(claim: Claim, *, deadline=None):
 def _send_clock() -> float:
     """Return the monotonic clock used for a shared send deadline."""
     return time.monotonic()
+
+
+def _past(deadline) -> bool:
+    """Whether a monotonic *deadline* is set and has passed."""
+    return deadline is not None and _send_clock() >= deadline
 
 
 def _remaining_send_deadline(deadline_at) -> float:
@@ -2019,14 +2028,15 @@ def compact_intent_outbox(limit=None, *, deadline: float | None = None) -> None:
 
 def _compact_intent_outbox(limit=None, *, deadline=None) -> None:
     """Compact an admitted candidate set without contacting the adapter, stopping between keys at *deadline*."""
-    for device_id, scope in compaction_candidates(limit):
-        if deadline is not None and _send_clock() >= deadline:
-            logger.info("intent outbox compaction deferred the remaining keys to the next tick")
+    for device_id, scope in compaction_candidates(limit, deadline=deadline):
+        if _past(deadline):
             break
         try:
             compact(device_id, scope)
         except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
             logger.exception("intent outbox compaction failed for %s/%s", device_id, scope)
+    if _past(deadline):
+        logger.info("intent outbox compaction deferred at the run deadline; remaining keys wait for the next tick")
 
 
 def drain_intent_outbox(limit=None, *, deadline: float | None = None) -> tuple[int, int]:
