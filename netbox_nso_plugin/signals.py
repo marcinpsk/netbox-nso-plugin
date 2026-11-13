@@ -2564,7 +2564,9 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
 
     interfaces = []
     rows = render_rows(
-        NSOSwitchportState.objects.filter(management__device_id=device_id).select_related("interface", "untagged_vlan"),
+        NSOSwitchportState.objects.filter(management__device_id=device_id)
+        .select_related("interface", "untagged_vlan")
+        .prefetch_related("tagged_vlans"),
         scope="switchport",
     )
     for st in rows:

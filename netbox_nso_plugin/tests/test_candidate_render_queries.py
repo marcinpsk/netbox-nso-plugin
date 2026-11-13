@@ -87,4 +87,16 @@ def test_candidate_render_does_not_load_management_per_persisted_row():
 @pytest.mark.django_db
 def test_related_render_without_a_matching_candidate_does_not_load_management_per_row():
     first, second = _candidate_render_query_counts("render-related-switchport-queries", 17901, "switchport", 3)
-    assert second - first == 1, "each persisted row loads its identity relation beyond one tagged VLAN read"
+    assert second == first, "each persisted row loads its identity relation or its tagged VLANs"
+
+
+@pytest.mark.django_db
+def test_persisted_switchport_render_reads_tagged_vlans_once():
+    device, management = make_managed("render-persisted-switchport-queries", 17902)
+    counts = []
+    for index in (1, 2):
+        persist_candidates(*render_candidates(device, management, index))
+        with CaptureQueriesContext(connection) as queries:
+            delivery.render("switchport", device.pk, management.adapter_device_id)
+        counts.append(len(queries))
+    assert counts[1] == counts[0], "each persisted switchport reads its tagged VLANs"
