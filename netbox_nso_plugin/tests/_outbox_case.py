@@ -149,7 +149,10 @@ def content_update(instance, **values):
     candidate = copy.copy(current)
     for field_name, value in values.items():
         setattr(candidate, field_name, value)
-    fields = set(values)
+    from ._ownership_case import stamp_owned_fixture
+
+    fields = set(stamp_owned_fixture(candidate, tuple(values)))
+    values.update({field: getattr(candidate, field) for field in fields})
     plan = RendererMutationPlan.build(
         grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
     )
@@ -170,6 +173,13 @@ def content_bulk_update(instance, **values):
         renderer_writes,
     )
 
+    from ._ownership_case import stamp_owned_fixture
+
+    candidate = type(instance).objects.get(pk=instance.pk)
+    for name, value in values.items():
+        setattr(candidate, name, value)
+    fields = stamp_owned_fixture(candidate, tuple(values))
+    values.update({field: getattr(candidate, field) for field in fields})
     model = type(instance)
     plan = RendererMutationPlan.build(
         grant=OwnershipGrant("create"),
@@ -196,7 +206,10 @@ def own_vlan(mgmt, vid: int, tag: str):
             defaults={"name": f"NSO {mgmt.device.name}"},
         )
         vlan = VLAN.objects.create(group=group, vid=vid, name=f"cl-{tag}-v{vid}")
+        from ._ownership_case import stamp_owned_fixture
+
         state = NSOVLANState(management=mgmt, vlan=vlan, status="accepted")
+        stamp_owned_fixture(state)
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),
             saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),),
@@ -220,7 +233,10 @@ def write_vlan_state(state, **values):
     candidate = copy.copy(type(state).objects.get(pk=state.pk))
     for field_name, value in values.items():
         setattr(candidate, field_name, value)
-    fields = tuple(sorted(values))
+    from ._ownership_case import stamp_owned_fixture
+
+    fields = stamp_owned_fixture(candidate, tuple(sorted(values)))
+    values.update({field: getattr(candidate, field) for field in fields})
     plan = RendererMutationPlan.build(
         grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
     )

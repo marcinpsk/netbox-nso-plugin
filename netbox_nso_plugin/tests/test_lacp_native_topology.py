@@ -22,6 +22,7 @@ from netbox_nso_plugin.reconcile import run_device_reconcile
 
 from ._adapter_http import _REAL_SESSION, make_response
 from ._authority_case import concurrent_writer
+from ._candidate_render_case import ACCEPTED_AT
 from ._manual_capture_case import post_apply
 from ._outbox_case import make_managed, reset_renderer_audit_rotation, without_commit_drain
 from ._settlement_case import _evidence_generation
@@ -517,7 +518,7 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 device_id=self.device.pk, scope="lacp", native_id=native_only.pk
             ).exists()
         )
-        body = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload
+        body = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload["bundles"]
         self.assertEqual([member["interface_name"] for member in body[0]["members"]], ["et-0/0/1", "et-0/0/2"])
 
     def test_owned_native_membership_and_bundle_type_are_never_overwritten(self):
@@ -579,7 +580,7 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision,
             revision_before + 1,
         )
-        body = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload
+        body = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload["bundles"]
         self.assertEqual(
             {item["name"]: sorted(member["interface_name"] for member in item["members"]) for item in body},
             {"ae1": ["et-0/0/2"], "ae2": ["et-0/0/1"]},
@@ -606,7 +607,7 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(self.manifests[1].ownership_state, "retired")
         self.manifests[0].refresh_from_db()
         self.assertEqual(self.manifests[0].ownership_state, "owned")
-        body = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload
+        body = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload["bundles"]
         self.assertEqual([member["interface_name"] for member in body[0]["members"]], ["et-0/0/2"])
         self.assertFalse(NSOSwitchingRootDeletion.objects.filter(management=self.management).exists())
 
@@ -987,13 +988,15 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                         management=self.management, interface=member, status="imported"
                     )
                     state.status = "accepted"
+                    state.accepted_at = ACCEPTED_AT
                     with self.assertRaises(OwnershipNotQualified):
                         plan = RendererMutationPlan.build(
-                            grant=OwnershipGrant("accept"), saves=(planned_save(state, update_fields=("status",)),)
+                            grant=OwnershipGrant("accept"),
+                            saves=(planned_save(state, update_fields=("status", "accepted_at")),),
                         )
                         mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
                         with mutation(plan) as writer:
-                            writer.save(state, update_fields=("status",))
+                            writer.save(state, update_fields=("status", "accepted_at"))
                     self.assertFalse(
                         NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="lacp").exists()
                     )

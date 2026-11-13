@@ -378,6 +378,9 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
                 ("drain.py", "_sent_wire_digest", "delivery.render"),
                 ("drain.py", "_takeover", "delivery.render"),
                 ("durable_capture.py", "validate_claim_capture", "delivery.render"),
+                # Candidate proof renders freeze content and prove each selected contribution.
+                ("intent_acquisition.py", "_plan", "delivery.render"),
+                ("intent_acquisition.py", "_render", "delivery.render"),
                 ("renderer_audit.py", "_optimistic_candidates", "delivery.render"),
                 ("renderer_audit.py", "_repair_candidates", "delivery.render"),
                 ("renderer_writer.py", "finalize_renderer_fingerprints", "delivery.render"),

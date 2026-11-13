@@ -13,6 +13,7 @@ from django.test.utils import CaptureQueriesContext, override_settings
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import patch_matching_control_state
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import (
     ReceiptAdapter,
     in_thread,
@@ -39,6 +40,7 @@ def own_redistribution(management, dest_protocol, source_protocol):
         source_protocol=source_protocol,
         source_ref="",
         status="accepted",
+        accepted_at=ACCEPTED_AT,
     )
     plan = RendererMutationPlan.build(
         grant=OwnershipGrant("create"),
@@ -268,7 +270,9 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
         vlan = VLAN(group=baseline.vlan.group, vid=1630, name="renderer-audit-created")
         VLAN.objects.bulk_create([vlan])
-        state = NSOVLANState(management=self.management, vlan=vlan, device_name=vlan.name, status="accepted")
+        state = NSOVLANState(
+            management=self.management, vlan=vlan, device_name=vlan.name, status="accepted", accepted_at=ACCEPTED_AT
+        )
 
         with self.assertRaises(IntentMutationProtocolError):
             NSOVLANState.objects.bulk_create([state])

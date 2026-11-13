@@ -74,6 +74,17 @@ def current_content_digest(row):
     return canonical_fingerprint(canonical_fragment(row))
 
 
+def owner_relations(spec):
+    """Name the relations that an owner's device lookup and identity read."""
+    related = {spec.device_lookup.rsplit("__", 1)[0]}
+    related.update(
+        field.rsplit(".", 1)[0].replace(".", "__")
+        for field in _IDENTITY_FIELDS[spec.model._meta.model_name]
+        if "." in field
+    )
+    return sorted(related)
+
+
 def lock_manifest_rows(management, scopes):
     """Lock applicable owners after the caller locks device, management and revisions."""
     scopes = frozenset(scopes)
@@ -97,15 +108,9 @@ def lock_manifest_rows(management, scopes):
         if spec is None or not scopes.intersection(spec.delivery_keys):
             continue
         _enter_level(8, (rank, 0))
-        related = {spec.device_lookup.rsplit("__", 1)[0]}
-        related.update(
-            field.rsplit(".", 1)[0].replace(".", "__")
-            for field in _IDENTITY_FIELDS[spec.model._meta.model_name]
-            if "." in field
-        )
         queryset = (
             spec.model.objects.select_for_update(of=("self",))
-            .select_related(*sorted(related))
+            .select_related(*owner_relations(spec))
             .filter(**{spec.device_lookup: management.device_id}, status__in=OWNED_STATES)
         )
         if spec.model._meta.model_name == "nsoredistributionstate":
@@ -320,7 +325,7 @@ def _ospf_emissions(payload):
 
 
 def _lacp_emissions(payload):
-    for item in payload:
+    for item in payload["bundles"]:
         path = (("bundle", (item["name"],)),)
         content = {key: value for key, value in item.items() if key != "members"}
         yield _Emission("lag.bundle", path, (item["name"],), content)
@@ -358,7 +363,8 @@ def _emissions(scope, payload):
         raise RegistryError("blocked renderer output cannot form a selected manifest")
     if scope in _FLAT_SCOPES:
         subject, name, field = _FLAT_SCOPES[scope]
-        for item in payload:
+        items = payload["interfaces"] if scope == "switchport" else payload
+        for item in items:
             identity = (item[field],)
             yield _Emission(subject, ((name, identity),), identity, item)
     else:

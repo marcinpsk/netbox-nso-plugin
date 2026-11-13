@@ -310,6 +310,7 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         # Accepting a row that already MATCHES the device lands in_sync — still an owned
         # status, so it is pushed to record ownership (_status_after_accept).
         assert user.status == "in_sync"
+        assert user.accepted_at is not None
         mock_put.assert_called_once()
         pushed = mock_put.call_args[0][2]  # (adapter_device_id, communities, v3_users, ...)
         assert pushed == [
@@ -320,6 +321,7 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
                 "priv_protocol": "aes-128",
                 "auth_vault_ref": "network/netbox/snmp/v3/nms#auth",
                 "priv_vault_ref": "network/netbox/snmp/v3/nms#priv",
+                "accepted_at": user.accepted_at.isoformat(),
             }
         ]
 

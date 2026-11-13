@@ -22,6 +22,7 @@ from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 from netbox_nso_plugin.models import NSOBGPPeerState, NSODeviceManagement, NSOInstance
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._candidate_render_case import ACCEPTED_AT
 from ._outbox_case import enqueue, entries, make_managed, state_of, without_commit_drain
 from ._ownership_case import acquire_bgp_router, acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
@@ -390,6 +391,7 @@ class TestBgpIncompleteSnapshotDrain(_CascadeFlushMixin, IntentPushResetMixin, T
             vrf_name="",
             peer_address_str="198.18.0.4",
             status="in_sync",
+            accepted_at=ACCEPTED_AT,
         )
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("create"),

@@ -576,8 +576,21 @@ def _changed_keys(before, after, spec, dependency_changed):
     return keys
 
 
+def _require_owned_acceptance(instance):
+    # Direct ORM saves outside this writer escape this guard.
+    from .status_machine import OWNED_STATES
+
+    if (
+        instance._meta.label_lower in OVERLAY_MODEL_RANKS
+        and instance.status in OWNED_STATES
+        and instance.accepted_at is None
+    ):
+        raise IntentMutationProtocolError(f"{instance._meta.label_lower} owned save requires accepted_at")
+
+
 def _plan_save(proposed: RendererSave, creation_refs, support_refs, before, after):
     instance = proposed.instance
+    _require_owned_acceptance(after)
     label = instance._meta.label_lower
     spec = renderer_input_specs().get(label)
     if spec is None and label not in SOURCE_MODEL_RANKS and label not in OVERLAY_MODEL_RANKS:
@@ -969,6 +982,7 @@ def _plan_set_update(proposed: RendererSetUpdate, *, grant=None):
         after = copy.copy(before)
         for attname, value in values.items():
             setattr(after, attname, thaw_field_value(model._meta.get_field(attname), value))
+        _require_owned_acceptance(after)
         validate_acquisition(before, after, grant)
         dependency_footprint, dependency_changed = _dependencies(before, after, spec)
         footprints.extend((footprint_for_instance(before, spec), footprint_for_instance(after, spec)))
@@ -1278,7 +1292,10 @@ class RendererWriter:
         return (
             write.model_label in OVERLAY_MODEL_RANKS
             and dict(write.values).get("status") in OWNED_STATES
-            and (before.get("status") not in OWNED_STATES or (self.grant is not None and self.grant.kind == "accept"))
+            and (
+                before.get("status") not in OWNED_STATES
+                or (self.grant is not None and self.grant.kind in {"accept", "intend"})
+            )
         )
 
     def queryset_update_is_authorized(self, queryset, values, rows):

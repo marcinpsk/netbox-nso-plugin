@@ -274,11 +274,13 @@ class TestLoggingLevelsPush(LevelsTestBase):
         return self._recorded_requests(lambda: deliver("logging", self.device.pk, self.mgmt.adapter_device_id))
 
     def test_owned_row_pushes_set_severities_only(self):
-        self._row(console_severity="CRITICAL", monitor_severity="", status="accepted", accepted_at=timezone.now())
+        row = self._row(console_severity="CRITICAL", monitor_severity="", status="accepted", accepted_at=timezone.now())
         calls = self._push()
         self.assertEqual(len(calls), 1)
         body = calls[0].kwargs["json"]
-        self.assertEqual(body["local_levels"], {"console_severity": "CRITICAL"})
+        self.assertEqual(
+            body["local_levels"], {"console_severity": "CRITICAL", "accepted_at": row.accepted_at.isoformat()}
+        )
 
     def test_unowned_row_pushes_explicit_null(self):
         """null (not omission!) — the adapter reads the key presence-sensitively; omitting it
@@ -322,7 +324,9 @@ class TestLoggingLevelsPush(LevelsTestBase):
             with renderer_writes(plan) as writer:
                 writer.save(row, force_insert=True)
         mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args.args[2], {"console_severity": "ERROR"})
+        self.assertEqual(
+            mock_put.call_args.args[2], {"console_severity": "ERROR", "accepted_at": row.accepted_at.isoformat()}
+        )
 
     def test_foreign_levels_save_does_not_schedule_logging_behavior(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
@@ -420,7 +424,9 @@ class TestLoggingLevelsViews(LevelsTestBase):
             ).exists()
         )
         mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
+        self.assertEqual(
+            mock_put.call_args.args[2], {"console_severity": "CRITICAL", "accepted_at": row.accepted_at.isoformat()}
+        )
 
     def test_accept_all_blank_row_is_refused(self):
         row = self._row(status="imported")
@@ -507,6 +513,8 @@ class TestLoggingLevelsViews(LevelsTestBase):
             status="deploying",
             apply_attempt_id=attempt_id,
         )
+        accepted_at = row.accepted_at
+        self.assertIsNotNone(accepted_at)
         form = NSOLoggingLevelStateForm(
             data={
                 "console_severity": "WARNING",
@@ -522,12 +530,12 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertEqual(candidate.console_severity, "WARNING")
         self.assertEqual(candidate.status, "accepted")
         self.assertIsNone(candidate.apply_attempt_id)
-        self.assertIsNotNone(candidate.accepted_at)
+        self.assertEqual(candidate.accepted_at, accepted_at)
         persisted = NSOLoggingLevelState.objects.get(pk=row.pk)
         self.assertEqual(persisted.console_severity, "NOTICE")
         self.assertEqual(persisted.status, "deploying")
         self.assertEqual(persisted.apply_attempt_id, attempt_id)
-        self.assertIsNone(persisted.accepted_at)
+        self.assertEqual(persisted.accepted_at, accepted_at)
 
     def test_field_edit_rejects_a_value_outside_the_closed_oc_enum(self):
         row = self._row(console_severity="NOTICE", status="imported")

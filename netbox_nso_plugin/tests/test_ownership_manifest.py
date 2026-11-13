@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from django.db import IntegrityError
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from django.utils import timezone
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
@@ -585,6 +586,7 @@ class TestOwnershipManifestMaintenance(TestCase):
                     address=str(address.address),
                     vrf=vrf.name if vrf else "",
                     status="accepted",
+                    accepted_at=timezone.now(),
                 )
                 plan = RendererMutationPlan.build(
                     grant=OwnershipGrant("create"),

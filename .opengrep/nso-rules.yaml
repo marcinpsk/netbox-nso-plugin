@@ -168,6 +168,87 @@ rules:
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**"]
+  - id: nso-overlay-natural-key-from-unique-together
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Read an overlay's natural key through candidate_render.natural_key_fields. A singleton overlay keys on its
+      one-to-one management field and has no unique_together.
+    pattern: $MODEL._meta.unique_together[0]
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**", "netbox_nso_plugin/candidate_render.py"]
+  - id: nso-adapter-error-text-in-intend-result
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Do not put the text of an AdapterError in an Intend result. An intermediary can supply the error body.
+      Pass adapter_client.public_error_message(exc).
+    patterns:
+      - pattern-either:
+          - pattern: |
+              try:
+                  ...
+              except $TYPE as $EXC:
+                  $...BODY
+          - pattern: |
+              try:
+                  ...
+              except $FIRST as $FIRST_EXC:
+                  ...
+              except $TYPE as $EXC:
+                  $...BODY
+          - pattern: |
+              try:
+                  ...
+              except $FIRST as $FIRST_EXC:
+                  ...
+              except $SECOND as $SECOND_EXC:
+                  ...
+              except $TYPE as $EXC:
+                  $...BODY
+      - metavariable-regex:
+          metavariable: $TYPE
+          regex: .*\bAdapterError\b
+      - focus-metavariable: $...BODY
+      - pattern-either:
+          - pattern: _refusal(..., $RAW, ...)
+          - pattern: $MODULE._refusal(..., $RAW, ...)
+          - pattern: IntendResult(..., $RAW, ...)
+          - pattern: $MODULE.IntendResult(..., $RAW, ...)
+      - metavariable-pattern:
+          metavariable: $RAW
+          pattern-either:
+            - pattern: str($EXC)
+            - pattern: repr($EXC)
+            - pattern: $EXC.args
+            - pattern: f"...{$EXC}..."
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]
+  - id: nso-model-label-in-intend-refusal
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Do not put an app_label.model label in an Intend refusal. The operator reads it.
+      Use the model's _meta.verbose_name.
+    patterns:
+      - pattern-either:
+          - pattern: _Refused($MSG, ...)
+          - pattern: $MODULE._Refused($MSG, ...)
+          - pattern: _refusal($MSG, ...)
+          - pattern: $MODULE._refusal($MSG, ...)
+      - metavariable-pattern:
+          metavariable: $MSG
+          pattern-either:
+            - pattern: $OBJ._meta.label_lower
+            - pattern: $OBJ._meta.label
+            - pattern: $OBJ.model_label
+            - pattern: $OBJ.state_model_label
+            - pattern: label
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]
   - id: nso-ownership-refusal-exception-diagnostic
     languages: [python]
     severity: ERROR

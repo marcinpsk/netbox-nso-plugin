@@ -1,6 +1,8 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com> #}
+{% load nso_intend %}
 <div data-differences-panel>
+  {% include 'netbox_nso_plugin/inc/_intend_outcomes.html' %}
   <div class="small mb-3">
     {% for snapshot in snapshots %}
       <div><strong>{{ snapshot.read_state.family }}</strong>: Revision {{ snapshot.revision }}.
@@ -25,6 +27,27 @@
   <div class="small mb-2">
     {% for value, count in counts.items %}<span class="me-3">{{ value }}: {{ count }}</span>{% endfor %}
   </div>
+  {% if can_sync %}
+  <form method="post" action="{% url 'plugins:netbox_nso_plugin:device_nso_intend_preview' pk=device.pk %}" id="nso-intend-form" data-intend-form>
+    {% csrf_token %}
+    <div class="d-flex flex-wrap gap-2 align-items-center border rounded p-2 mb-3">
+      <strong class="small">Intend</strong>
+      <span class="small text-muted">Select native rows and their dependencies. Acquisition is not deployment.</span>
+    </div>
+    <details class="mb-3" data-intend-catalog>
+      <summary>Dependencies and native rows</summary>
+      <p class="small text-muted">Select required rows even when they have no current difference.</p>
+      <input type="search" class="form-control form-control-sm mb-2" placeholder="Filter native rows" aria-label="Filter native rows" data-intend-filter>
+      {% for choice in intend_choices %}
+        <div data-intend-choice><div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+          <label class="form-check-label small"><input type="checkbox" class="form-check-input" name="intend_row" value="{{ choice.token }}" data-intend-row> {{ choice.scope }}: {{ choice.label }}{% if choice.state_key %} <code>{{ choice.state_key|pairs }}</code>{% endif %}</label>
+          {% if choice.bundle %}<label class="small">LACP lag_id <input class="form-control form-control-sm" type="number" min="1" name="lag_id-{{ choice.token }}" data-intend-option></label>{% endif %}
+          {% if choice.restart %}<label class="form-check-label small"><input type="checkbox" class="form-check-input" name="restart-{{ choice.token }}" value="true" data-intend-option> Restart ended episode</label>{% endif %}
+        </div></div>
+      {% endfor %}
+    </details>
+  </form>
+  {% endif %}
   <form method="post" action="{% url 'plugins:netbox_nso_plugin:device_nso_sync_preview' pk=device.pk %}" data-sync-form>
   {% csrf_token %}
   {% if can_sync and sync_scopes %}
@@ -41,6 +64,7 @@
               title="Read the selected scopes again and preview the NetBox changes. Nothing is written until you confirm.">
         <span class="mdi mdi-database-arrow-left"></span> Sync from NSO
       </button>
+      <button type="submit" form="nso-intend-form" class="btn btn-sm btn-primary">Preview Intend</button>
     </div>
   {% endif %}
   <div class="table-responsive">
@@ -50,7 +74,7 @@
         {% for row in page_obj %}
           <tr>
             {% if can_sync %}<td>{% if row.syncable %}<input class="form-check-input" type="checkbox" name="row" value="{{ row.token }}" aria-label="Select {{ row.scope }} {{ row.identity }}">{% elif row.sync_note %}<span class="small text-muted text-nowrap">{{ row.sync_note }}</span>{% endif %}</td>{% endif %}
-            <td>{{ row.scope }}</td><td><span class="badge {{ row.css }}">{{ row.kind }}</span></td>
+            <td>{{ row.scope }}{% for choice in row.intend_choices %}<label class="d-block small"><input type="checkbox" class="form-check-input" name="intend_row" value="{{ choice.token }}" form="nso-intend-form" data-intend-row> Intend{% if choice.state_key.attribute %} {{ choice.state_key.attribute }}{% endif %}</label>{% endfor %}</td><td><span class="badge {{ row.css }}">{{ row.kind }}</span></td>
             <td>{{ row.identity }}</td><td>{{ row.attribute }}</td>
             <td><code>{{ row.netbox_value }}</code></td><td><code>{{ row.device_value }}</code></td>
             <td>{{ row.reason }}{% if row.association_candidate %}

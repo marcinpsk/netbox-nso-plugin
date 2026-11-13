@@ -162,6 +162,7 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
                     "dot1q_vlan": 100,
                     "type": "subinterface",
                     "vrf": "",
+                    "accepted_at": state.accepted_at.isoformat(),
                 }
             ],
         )

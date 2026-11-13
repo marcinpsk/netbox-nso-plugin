@@ -101,6 +101,7 @@ RECONCILE = "reconcile"  # device read refreshed the row (automatic)
 DRIFT = "drift"  # device diverged / payload dropped the row (automatic)
 CONFLICT_DETECTED = "conflict_detected"  # native object exists, not ours (automatic)
 ACCEPT = "accept"  # operator takes ownership
+ACQUIRE = "acquire"  # validated native intent takes ownership
 EDIT = "edit"  # operator edited the row's content
 REVERT = "revert"  # operator edits back to device value / un-accepts
 APPLY = "apply"  # operator triggers Apply → mark deploying
@@ -109,7 +110,7 @@ APPLY_ERR = "apply_err"  # apply worker reported a failure
 RECONCILE_ERROR = "reconcile_error"  # unexpected exception during reconcile
 
 EVENTS: frozenset[str] = frozenset(
-    {RECONCILE, DRIFT, CONFLICT_DETECTED, ACCEPT, EDIT, REVERT, APPLY, APPLY_OK, APPLY_ERR, RECONCILE_ERROR}
+    {RECONCILE, DRIFT, CONFLICT_DETECTED, ACCEPT, ACQUIRE, EDIT, REVERT, APPLY, APPLY_OK, APPLY_ERR, RECONCILE_ERROR}
 )
 
 
@@ -164,6 +165,10 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(CONFLICT_DETECTED, IMPORTED, CONFLICT, True, "native object diverged from ours"),
     Transition(CONFLICT_DETECTED, CHANGED, CONFLICT, True, "drift is an adoption conflict"),
     Transition(CONFLICT_DETECTED, CONFLICT, CONFLICT, True, "still conflicting"),
+    *(
+        Transition(ACQUIRE, source, ACCEPTED, True, "validated native acquisition")
+        for source in (IMPORTED, CHANGED, CONFLICT, UNKNOWN, ERROR)
+    ),
     # -- operator: accept / revert -------------------------------------------
     Transition(ACCEPT, IMPORTED, ACCEPTED, True, "operator takes ownership"),
     Transition(ACCEPT, CHANGED, ACCEPTED, True, "accept the drifted value"),
