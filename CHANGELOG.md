@@ -2,6 +2,157 @@
 
 <!-- version list -->
 
+## v1.19.0 (2026-11-13)
+
+### Bug Fixes
+
+- **drain**: Dissolve an adapter delivery conflict and do not resend the refused request
+  ([`0948536`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0948536d4b5a808cba6e971c08dc403f2f6bc5b8))
+
+- **drain**: Fingerprint a refusal by its deletion records and retry held authority
+  ([`b7ce41d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b7ce41dd681e2226bea738fff06e1964ea3605a7))
+
+- **intend**: Escape the adapter code in the Intend failure log
+  ([`98e5bbf`](https://github.com/marcinpsk/netbox-nso-plugin/commit/98e5bbffcf820214f2fcb609c182792a178db0f4))
+
+- **intend**: Ignore a push error that a later delivery superseded
+  ([`db78db9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/db78db9cbd7462bbb10933090d0179fb2ddd95bc))
+
+- **intend**: Keep management delivery records out of the confirmation digest
+  ([`ed395b8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ed395b8f3f5a883e65db9920d8bb51535b3bce92))
+
+- **intend**: Let a switching acknowledgement supersede a push error too
+  ([`4fe5d84`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4fe5d84a008b8771c008cf6606b0ce1d62202f1a))
+
+- **intend**: List only viewable dependencies in the Intend preview
+  ([`5eaf4b0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5eaf4b00ea63d547529d4c6ebb2a22ad59f2e844))
+
+- **intend**: Name overlays by verbose name in Intend refusals
+  ([`1ff078a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1ff078ab55ca36626bcf3b1f93c727fd00084b4d))
+
+- **intend**: Name the busy adapter job in an Intend refusal
+  ([`164bb05`](https://github.com/marcinpsk/netbox-nso-plugin/commit/164bb05cca9a4b63e6b194e1dff26aa29dfccb2c))
+
+- **intend**: Offer Intend choices on route-policy root and redistribution rows
+  ([`c852d07`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c852d07ac6228af901833f026f8f7a08bdaa2dba))
+
+- **intend**: Offer the Intend choice on an IP prefix mismatch row
+  ([`d6a80ac`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d6a80ac1263f8e68043c3db3b957acb476957e92))
+
+- **intend**: Polish the Intend catalog and preview for operators
+  ([`09ab40d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/09ab40d58e37bccf6e04e2adf5b5711220653f2a))
+
+- **intend**: Show the public adapter message in Intend refusals
+  ([`59c1170`](https://github.com/marcinpsk/netbox-nso-plugin/commit/59c1170ba9ca29a0491665c63a16569ae473d8c8))
+
+- **intend**: Write the plan that confirmation made under the writer locks
+  ([`3037075`](https://github.com/marcinpsk/netbox-nso-plugin/commit/30370750b0e64d9b3fa30e68c72963f7661f4fcf))
+
+- **render**: Key singleton overlay candidates on their one-to-one field
+  ([`89f5c14`](https://github.com/marcinpsk/netbox-nso-plugin/commit/89f5c14b6f30c09f554aefda20a3b31a5cc33744))
+
+- **signals**: Prefetch tagged VLANs for the switchport render
+  ([`3ceb9d0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3ceb9d06dc72afcf02e47abfb6327c5addf2f16a))
+
+### Chores
+
+- **ci**: Bump amannn/action-semantic-pull-request
+  ([`c5f84ca`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c5f84ca6b89bdb2cdac3da72b97c1f8c2e92f850))
+
+- **ci**: Bump https://github.com/compilerla/conventional-pre-commit
+  ([`cbee20b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cbee20be0e58c83c4923aa56cac91e2f17aa03ae))
+
+- **ci**: Pin the joined adapter to ccc0f4e
+  ([`4c1468f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4c1468fc0db899e572538c7855e74c5f4b4bdf52))
+
+- **deployment**: Name migration 0048 as the plugin migration head
+  ([`2e8bff8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2e8bff849f0643244e7b607e4cce4291aecfe3d3))
+
+- **deps**: Bump the python-minor-patch group across 1 directory with 4 updates
+  ([`5111a68`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5111a68cd71a2cc059341e4e155bf18d6cd2fb1f))
+
+- **deps**: Bump vitest
+  ([`b17ab4c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b17ab4caa519bc0a83ee49821725f7d8c1ca8af8))
+
+- **opengrep**: Read an overlay natural key through one helper
+  ([`af2b299`](https://github.com/marcinpsk/netbox-nso-plugin/commit/af2b29986ce36e9af9509f4f1128b13a928aaf74))
+
+- **opengrep**: Refuse AdapterError text in an Intend result
+  ([`942902f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/942902f98f6173c03b2ae87d972c33b0641f508c))
+
+- **refusal**: Sync the refusal catalog with service-footprint-shared
+  ([`9ac3f21`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9ac3f2118e2048720231f1a3215ac1caa032d1cd))
+
+### Code Style
+
+- Merge a nested if into its elif for ruff 0.17.4 SIM102
+  ([`d098264`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d09826495a96e83eef53f8e39e082ce1fa1f712b))
+
+- Merge a nested if into its elif for ruff 0.17.4 SIM102
+  ([`c07da33`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c07da333d67db69708e15a576dc380940279dcc0))
+
+### Documentation
+
+- **copilot**: Define the Apply confirmation selector
+  ([`8810627`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8810627adf6794740b622b8cb0dbfeae566aeb28))
+
+- **copilot**: Qualify the Apply selector comparisons
+  ([`99fafd2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/99fafd2361e50a1b9f65eb57e3d0e4e4763ee275))
+
+- **preflight**: Name delivery sections as candidate streams
+  ([`a704ef3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a704ef318e11f2f94dbee9124f56448ee8546a4d))
+
+### Features
+
+- **intend**: Acquire native intent through candidate preflight and ordinary delivery
+  ([`2990ef5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2990ef599b09627b0fa6209fda2fd70ac766666a))
+
+- **intend**: Intend preview and confirm views with Differences selection
+  ([`fe7bc88`](https://github.com/marcinpsk/netbox-nso-plugin/commit/fe7bc88e226645f29a817d79ab8c703c894a5052))
+
+- **preflight**: Candidate preflight client with the adapter's delivery effect (#1788 P2b1)
+  ([`63f406a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/63f406a6279eff97b204ec41bc3131fbb275db52))
+
+- **render**: Candidate-render seam for Intend (#1788 P2a)
+  ([`88923d9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/88923d9ce37cd0ee6b739cbb9cdfbdd09f64e8a2))
+
+### Performance Improvements
+
+- **differences**: Look up each row's Intend choices in an index
+  ([`a525d65`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a525d6543049b4c6b8e104ccc107596a335a0a4c))
+
+- **intend**: Resolve an IP owner VRF inside the owner query
+  ([`cd589af`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cd589af32f4de3f8e07bc850ebdfa949267f0fc5))
+
+- **intend**: Resolve Intend outcomes with a bounded query count
+  ([`9c686db`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9c686db91b512e9959c01bd4bc3e4e98143818dc))
+
+- **intend**: Stop the contribution check at the first key that shows the row
+  ([`a7b4aba`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a7b4abaf34c48d2c2e37ea4b415ddf47532ee1aa))
+
+- **intend**: Validate Intend tokens without Differences projections
+  ([`609afe2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/609afe274796adad397d8b071bbc8e2bb416b1f1))
+
+- **render**: Load the identity relation once for candidate renders
+  ([`fd7268c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/fd7268cd28fa36302bb3f9b637538156555c4f3d))
+
+### Refactoring
+
+- **intend**: Read candidate natural keys through natural_key_fields
+  ([`40a016e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/40a016e83f324a64e292436e50bbd245441c54ee))
+
+### Testing
+
+- **drain**: A re-own during a held refusal sends a new request
+  ([`1c0eadb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1c0eadbce55d09780c289b826da939e0227675ba))
+
+- **render**: Deep-copy candidate values in the render purity check
+  ([`7ea0ecf`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7ea0ecfa531ff18000f759f170b80d8cfd644f67))
+
+- **render**: Fail the acceptance-time check when it checks nothing
+  ([`0854397`](https://github.com/marcinpsk/netbox-nso-plugin/commit/08543979870739691c534ac3e2f88cb01adfe966))
+
+
 ## v1.18.0 (2026-11-10)
 
 ### Bug Fixes
