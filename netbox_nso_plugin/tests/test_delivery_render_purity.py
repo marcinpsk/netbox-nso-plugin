@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """#1627: every delivery renderer is a pure database read."""
 
+import copy
 from unittest.mock import patch
 
 from django.db import connection, transaction
@@ -11,6 +12,24 @@ from ._candidate_render_case import persist_candidates, render_candidates
 from ._outbox_case import make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+def _render_inputs(batch):
+    """Copy each candidate's field values and planned relations, so an in-place change shows."""
+    from netbox_nso_plugin.candidate_render import overlay_identity
+
+    rows = tuple(
+        (
+            tuple(row.__dict__),
+            tuple((field.attname, copy.deepcopy(getattr(row, field.attname))) for field in row._meta.concrete_fields),
+        )
+        for row in batch.overlays
+    )
+    relations = tuple(
+        (overlay_identity(relation.instance), relation.field_name, tuple(row.pk for row in relation.related))
+        for relation in batch.m2m
+    )
+    return rows, relations
 
 
 class TestDeliveryRenderPurity(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -46,7 +65,7 @@ class TestDeliveryRenderPurity(_CascadeFlushMixin, IntentPushResetMixin, Transac
         from netbox_nso_plugin.candidate_render import CandidateBatch
 
         batch = CandidateBatch(self.candidates, self.relations)
-        before = tuple(tuple(row.__dict__.items()) for row in batch.overlays)
+        before = _render_inputs(batch)
         with patch("netbox_nso_plugin.adapter_client.requests.Session") as transport, transaction.atomic():
             transport.side_effect = AssertionError("rendering must not open an HTTP session")
             with connection.cursor() as cursor:
@@ -57,4 +76,4 @@ class TestDeliveryRenderPurity(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 self.assertEqual(rendered.payload, repeated.payload)
             transport.assert_not_called()
         self.assertTrue(all(row.pk is None for row in batch.overlays))
-        self.assertEqual(tuple(tuple(row.__dict__.items()) for row in batch.overlays), before)
+        self.assertEqual(_render_inputs(batch), before)
