@@ -9,7 +9,9 @@ also requires the route generation and fingerprint echoed by the adapter.
 
 from __future__ import annotations
 
+import bisect
 import logging
+import time
 from dataclasses import dataclass, replace
 
 from django.db import transaction
@@ -423,8 +425,12 @@ def settle_static_routes(mgmt) -> ConsumeResult:
     return consume_static_route_settlements(mgmt)
 
 
-def sweep_static_route_settlements() -> tuple[int, int]:
+def sweep_static_route_settlements(*, deadline: float | None = None, rotation: dict | None = None) -> tuple[int, int]:
     """Poll devices with pending owned work. Return ``(polled, failed)``.
+
+    A monotonic *deadline* stops the sweep between devices, after at least one poll. A
+    *rotation* dict that the caller carries between sweeps makes the next sweep start after
+    the last device this one reached, so a cut tail is not starved.
 
     This independent clock can recover when the adapter cannot deliver callbacks.
     Query candidates after link repair so each poll uses the current mapping.
@@ -463,9 +469,16 @@ def sweep_static_route_settlements() -> tuple[int, int]:
         )
     )
     candidates = sorted(candidate_pks)
+    rotation = {} if rotation is None else rotation
+    start = bisect.bisect_right(candidates, rotation.get("after_pk", 0))
+    candidates = candidates[start:] + candidates[:start]
     polled = 0
     failed = 0
-    for pk in candidates:
+    for index, pk in enumerate(candidates):
+        if index and deadline is not None and time.monotonic() >= deadline:
+            logger.info("static-route settlement sweep deferred %d devices to the next tick", len(candidates) - index)
+            break
+        rotation["after_pk"] = pk
         try:
             settle_static_routes(pk)
         except Exception:  # noqa: BLE001 one device's failure must not stop the fleet sweep

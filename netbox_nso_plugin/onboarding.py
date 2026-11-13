@@ -684,11 +684,11 @@ def _fail_untracked_provisioning(mgmt) -> dict:
         return {"status": "provision_failed", "error": current.onboard_error}
 
 
-def advance_stale_onboarding_rows() -> tuple:
+def advance_stale_onboarding_rows(*, deadline: float) -> tuple:
     """Delegate the periodic backstop to the sole provision completion owner."""
     from .provision_lifecycle import sweep_provision_tombstones
 
-    return sweep_provision_tombstones()
+    return sweep_provision_tombstones(deadline=deadline)
 
 
 def manage_existing(device, instance, nso_device_name) -> dict:

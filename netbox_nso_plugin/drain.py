@@ -872,14 +872,14 @@ def _compactable(row, held) -> bool:
     )
 
 
-def compaction_candidates(limit=None) -> list[tuple[int, str]]:
-    """Return keys with an eligible contiguous same-kind span."""
+def compaction_candidates(limit=None, *, deadline=None) -> list[tuple[int, str]]:
+    """Return keys with an eligible contiguous same-kind span, found before *deadline*."""
     from django.db.models import Count
 
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
     limit = DRAIN_BATCH if limit is None else limit
-    if limit == 0:
+    if limit == 0 or _past(deadline):
         return []
     grouped = (
         NSOIntentOutboxEntry.objects.filter(consumed_by_push_seq__isnull=True)
@@ -890,10 +890,14 @@ def compaction_candidates(limit=None) -> list[tuple[int, str]]:
     )
     candidates = []
     for device_id, scope, _rows in grouped.iterator():
+        if _past(deadline):
+            break
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).only("claim_deletions").first()
         held = {int(record["route_id"]) for record in (state.claim_deletions or [])} if state is not None else set()
         previous_kind = None
         for row in _unconsumed(device_id, scope).only("kind", "transitions").order_by("id").iterator():
+            if _past(deadline):
+                return candidates
             if not _compactable(row, held):
                 previous_kind = None
             elif row.kind == previous_kind:
@@ -965,6 +969,11 @@ def send_claim(claim: Claim, *, deadline=None):
 def _send_clock() -> float:
     """Return the monotonic clock used for a shared send deadline."""
     return time.monotonic()
+
+
+def _past(deadline) -> bool:
+    """Whether a monotonic *deadline* is set and has passed."""
+    return deadline is not None and _send_clock() >= deadline
 
 
 def _remaining_send_deadline(deadline_at) -> float:
@@ -2008,25 +2017,29 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
     return [key for _stamped, _at, key in ordered[:limit]]
 
 
-def compact_intent_outbox(limit=None) -> None:
+def compact_intent_outbox(limit=None, *, deadline: float | None = None) -> None:
     """Compact the bounded candidate set unless a deployment has paused it."""
     try:
         with _deployment_operation("intent outbox compaction"):
-            _compact_intent_outbox(limit)
+            _compact_intent_outbox(limit, deadline=deadline)
     except DeploymentQuiesced:
         logger.info("intent outbox compaction is paused for a deployment")
 
 
-def _compact_intent_outbox(limit=None) -> None:
-    """Compact an admitted candidate set without contacting the adapter."""
-    for device_id, scope in compaction_candidates(limit):
+def _compact_intent_outbox(limit=None, *, deadline=None) -> None:
+    """Compact an admitted candidate set without contacting the adapter, stopping between keys at *deadline*."""
+    for device_id, scope in compaction_candidates(limit, deadline=deadline):
+        if _past(deadline):
+            break
         try:
             compact(device_id, scope)
         except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
             logger.exception("intent outbox compaction failed for %s/%s", device_id, scope)
+    if _past(deadline):
+        logger.info("intent outbox compaction deferred at the run deadline; remaining keys wait for the next tick")
 
 
-def drain_intent_outbox(limit=None) -> tuple[int, int]:
+def drain_intent_outbox(limit=None, *, deadline: float | None = None) -> tuple[int, int]:
     """Appendix O's tick pass. Returns ``(drained, failed)``.
 
     Bounded, candidate-filtered and starvation-free: a key is attempted only when it owes a
@@ -2036,23 +2049,31 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     Compaction runs first, over its OWN candidates: a key whose claim is stuck on a
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
+
+    A monotonic *deadline* stops the pass between keys and bounds each key's send.
     """
-    return _drain_intent_outbox(limit)
+    return _drain_intent_outbox(limit, deadline=deadline)
 
 
-def _drain_intent_outbox(limit=None) -> tuple[int, int]:
+def _drain_intent_outbox(limit=None, *, deadline=None) -> tuple[int, int]:
     """Run one tick with a new deployment admission for each bounded stage."""
     try:
         with _deployment_operation("intent outbox tick"):
-            _compact_intent_outbox(limit)
+            _compact_intent_outbox(limit, deadline=deadline)
     except DeploymentQuiesced:
         logger.info("the intent outbox tick is paused for a deployment")
         return 0, 0
 
     drained = failed = 0
-    for device_id, scope in drain_candidates(limit):
+    candidates = drain_candidates(limit)
+    for index, (device_id, scope) in enumerate(candidates):
+        remaining = None if deadline is None else deadline - _send_clock()
+        if remaining is not None and remaining <= 0:
+            logger.info("the intent outbox tick deferred %d keys to the next tick", len(candidates) - index)
+            break
         try:
-            outcome = drain_key(device_id, scope)
+            budget = None if remaining is None else min(SEND_DEADLINE.total_seconds(), remaining)
+            outcome = drain_key(device_id, scope, deadline=budget)
         except DeploymentQuiesced:
             logger.info("the intent outbox tick stopped because a deployment started")
             break

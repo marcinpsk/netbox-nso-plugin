@@ -269,10 +269,28 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         for _index in range(DEFAULT_BATCH_SIZE + 1):
             self.history()
         job = Job.objects.create(name=jobs.PruneApplyLedgerJob.name, job_id=uuid4())
-        with patch.object(jobs, "PRUNE_TIME_BUDGET_SECONDS", 0):
+        with patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 0):
             jobs.PruneApplyLedgerJob(job).run()
         self.assertEqual(NSOApplyAttempt.objects.count(), 1)
         self.assertIsNotNone(job.data["apply_ledger_cursor"])
+
+    def test_an_expired_deadline_stops_before_the_next_device_read_and_keeps_its_place(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        _device, other = make_managed("ledger-retention-deadline", 1769, index=2)
+        other.refresh_from_db()
+        self.adapter.store.add_device(nso_instance="placeholder", nso_device_name="placeholder-3", device_id=1769)
+        first, _execution = self.history(days=33)
+        later, _execution = self.history(days=32, management=other)
+
+        result = prune_apply_ledger(execute=True, deadline=0.0)
+
+        self.assertEqual((result.examined, result.deleted, result.adapter_unavailable), (1, 1, False))
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=first.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
+        resumed = prune_apply_ledger(execute=True, cursor=result.next_cursor)
+        self.assertEqual(resumed.deleted, 1)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
 
     def test_adapter_outage_on_one_device_retains_only_that_device(self):
         _device, other = make_managed("ledger-retention-other", 1768, index=2)
