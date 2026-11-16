@@ -500,6 +500,26 @@ class TestUnresolvedExecution(_SettlementCase):
         assert (resumed.consumed, resumed.drained, resumed.cursor) == (2, True, 3)
         assert self._cursor(mgmt).settle_resume_pending is False
 
+    def test_the_deadline_still_commits_one_new_carrier_after_the_historical_ones(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("historydeadline")
+        mgmt = _make_mgmt(device, "historydeadline", 86, adapter=self.adapter)
+        store = self.adapter.store
+        settled = store.terminal_job(86, job_type="sync")
+        assert consume_static_route_settlements(mgmt).cursor == 1
+        for _ in range(2):
+            store.terminal_job(86, job_type="sync")
+
+        # The committed carrier comes back as history, which never moves the cursor.
+        with patch("netbox_nso_plugin.settlement._historical_carriers", return_value=[settled["id"]]):
+            stopped = consume_static_route_settlements(mgmt, deadline=0.0)
+
+        assert (stopped.consumed, stopped.drained, stopped.cursor) == (1, False, 2)
+        assert self._cursor(mgmt).settle_cursor_seq == 2
+
     def test_backlog_beyond_the_evidence_bound_still_stalls_on_an_unresolved_apply(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
