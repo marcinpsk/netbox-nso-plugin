@@ -4,12 +4,15 @@
 
 import contextlib
 import logging
+import signal
+import threading
 import time
 from abc import abstractmethod
 
 from core.choices import JobIntervalChoices
 from django.db import OperationalError, connection
 from netbox.jobs import JobRunner, system_job
+from rq.timeouts import JobTimeoutException
 
 from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
@@ -73,11 +76,44 @@ def _bounded_lock_waits():
             cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous])
 
 
+class _RunTimedOut(BaseException):
+    """RQ's timeout as a BaseException, so that no ``except Exception`` in a tick can swallow it."""
+
+
+@contextlib.contextmanager
+def _unswallowable_timeout():
+    """Make RQ's timeout alarm end the run, and give NetBox RQ's exception on a usable connection."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    fired = False
+
+    def end_the_run(signum, frame):
+        nonlocal fired
+        fired = True
+        raise _RunTimedOut
+
+    previous = signal.signal(signal.SIGALRM, end_the_run)
+    try:
+        yield
+    except BaseException as exc:
+        if not fired:
+            raise
+        # The alarm can stop a statement in flight, and NetBox's terminate and reschedule need the connection.
+        if not connection.in_atomic_block:
+            connection.close()
+        raise JobTimeoutException("NSO system job passed its RQ timeout") from exc
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+
 class _PluginSystemJob(JobRunner):
     """A system job that sets its own RQ timeout and bounds each run below it.
 
-    RQ kills a run that passes its timeout, and NetBox then never reschedules it: the Job row
-    stays ``running`` and ``enqueue_once`` keeps skipping it. So each run stops at
+    RQ raises its timeout in the run, and NetBox reschedules the job only if that exception
+    reaches it. A broad handler in the tick that swallows it lets the run go on until RQ kills
+    the work horse, and then the Job row stays ``running`` and ``enqueue_once`` keeps skipping
+    it. So :meth:`run` makes the timeout unswallowable. Each run also stops at
     :func:`run_deadline` and leaves the rest of its work to the next run. The work in flight at
     the deadline is bounded too: every lock wait in :meth:`tick` by :data:`SYSTEM_JOB_LOCK_TIMEOUT`,
     and every adapter request by :data:`SYSTEM_JOB_REQUEST_LIMIT_SECONDS`.
@@ -93,7 +129,11 @@ class _PluginSystemJob(JobRunner):
         """Run one :meth:`tick` with bounded lock waits and adapter requests, both ended before the reschedule."""
         from .adapter_client import requests_until
 
-        with _bounded_lock_waits(), requests_until(time.monotonic() + SYSTEM_JOB_REQUEST_LIMIT_SECONDS):
+        with (
+            _unswallowable_timeout(),
+            _bounded_lock_waits(),
+            requests_until(time.monotonic() + SYSTEM_JOB_REQUEST_LIMIT_SECONDS),
+        ):
             return self.tick()
 
     @abstractmethod

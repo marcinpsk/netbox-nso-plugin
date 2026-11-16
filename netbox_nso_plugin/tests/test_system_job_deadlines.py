@@ -10,6 +10,7 @@ locks and re-reads every interface of the device. And the passes had no shared d
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from datetime import timedelta
@@ -594,6 +595,26 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             self.assertEqual(seen, [jobs.SYSTEM_JOB_LOCK_TIMEOUT], job_class.name)
             self.assertEqual(lock_timeout(), before, job_class.name)
 
+    def test_no_plugin_system_job_can_swallow_rq_s_timeout(self):
+        import signal
+
+        from netbox.registry import registry
+        from rq.timeouts import JobTimeoutException, UnixSignalDeathPenalty
+
+        from netbox_nso_plugin import jobs
+
+        def tick(_self):
+            with contextlib.suppress(Exception):
+                signal.raise_signal(signal.SIGALRM)
+
+        for job_class in [cls for cls in registry["system_jobs"] if cls.__module__ == jobs.__name__]:
+            with (
+                patch.object(job_class, "tick", tick),
+                UnixSignalDeathPenalty(60, JobTimeoutException, job_id=job_class.name),
+                self.assertRaises(JobTimeoutException, msg=job_class.name),
+            ):
+                system_job(job_class).run()
+
     def test_netbox_s_reschedule_after_a_run_keeps_the_plugin_timeout(self):
         import django_rq
         from core.models import Job
@@ -613,3 +634,84 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
 
         rq_job = RQJob.fetch(str(successor.job_id), connection=queue.connection)
         self.assertEqual(rq_job.timeout, jobs.SYSTEM_JOB_TIMEOUT_SECONDS)
+
+    def _overrun(self, tick):
+        """Run PruneApplyLedgerJob through NetBox's handle under RQ's own 1 s timeout alarm."""
+        import django_rq
+        from core.models import Job
+        from rq import Queue
+        from rq.timeouts import JobTimeoutException, UnixSignalDeathPenalty
+
+        from netbox_nso_plugin import jobs
+
+        queue = Queue(f"nso-test-job-timeout-{uuid4().hex}", connection=django_rq.get_queue("default").connection)
+        self.addCleanup(queue.delete, delete_jobs=True)
+        with patch("django_rq.get_queue", return_value=queue), patch.object(jobs.PruneApplyLedgerJob, "tick", tick):
+            first = jobs.PruneApplyLedgerJob.enqueue(schedule_at=timezone.now() + timedelta(hours=1), interval=1440)
+            started = time.monotonic()
+            with UnixSignalDeathPenalty(1, JobTimeoutException, job_id=str(first.job_id)):
+                jobs.PruneApplyLedgerJob.handle(first)
+            elapsed = time.monotonic() - started
+        first.refresh_from_db()
+        successors = Job.objects.filter(name=jobs.PruneApplyLedgerJob.name, status="scheduled").exclude(pk=first.pk)
+        return first, elapsed, successors.count()
+
+    def test_an_overrun_that_a_broad_handler_would_swallow_ends_at_the_timeout_and_reschedules(self):
+        import http.server
+        import socketserver
+
+        import requests
+
+        class _Trickle(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                for _ in range(100):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.1)
+
+            def log_message(self, *args):
+                pass
+
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Trickle)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+
+        def tick(_self):
+            # One slow response per key, each under a broad handler, as the drain and the sweep run.
+            stop = time.monotonic() + 6
+            while time.monotonic() < stop:
+                with contextlib.suppress(Exception):
+                    requests.get(url, timeout=(1, 1))
+
+        job, elapsed, successors = self._overrun(tick)
+
+        self.assertLess(elapsed, 4, "the run went on after RQ's timeout")
+        self.assertEqual(job.status, "errored")
+        self.assertEqual(successors, 1)
+
+    def test_an_overrun_inside_a_lock_wait_leaves_netbox_a_working_connection_to_reschedule_on(self):
+        from core.models import Job
+
+        held = Job.objects.create(name="nso-test-held-row", job_id=uuid4())
+
+        def tick(_self):
+            stop = time.monotonic() + 6
+            while time.monotonic() < stop:
+                try:
+                    with transaction.atomic():
+                        list(Job.objects.select_for_update().filter(pk=held.pk))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        with _HeldRowLock(held):
+            job, elapsed, successors = self._overrun(tick)
+
+        self.assertLess(elapsed, 4, "the run went on after RQ's timeout")
+        self.assertEqual(job.status, "errored")
+        self.assertEqual(successors, 1)
