@@ -478,7 +478,27 @@ class TestUnresolvedExecution(_SettlementCase):
 
         requests = [request for request in self.adapter.store.feed_requests if request[0] == 83]
         assert (83, SETTLE_FEED_PAGE, SETTLE_FEED_PAGE) not in requests, requests
-        assert self._cursor(mgmt).settle_cursor_seq == SETTLE_FEED_PAGE
+        # The expired deadline also stops the carrier commits after the first.
+        assert self._cursor(mgmt).settle_cursor_seq == 1
+
+    def test_the_deadline_stops_the_carrier_commits_after_the_first(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("commitdeadline")
+        mgmt = _make_mgmt(device, "commitdeadline", 85, adapter=self.adapter)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_resume_pending=True)
+        for _ in range(3):
+            self.adapter.store.terminal_job(85, job_type="sync")
+
+        stopped = consume_static_route_settlements(mgmt, deadline=0.0)
+
+        assert (stopped.consumed, stopped.drained, stopped.cursor) == (1, False, 1)
+        row = self._cursor(mgmt)
+        assert (row.settle_cursor_seq, row.settle_resume_pending) == (1, True)
+        resumed = consume_static_route_settlements(mgmt)
+        assert (resumed.consumed, resumed.drained, resumed.cursor) == (2, True, 3)
+        assert self._cursor(mgmt).settle_resume_pending is False
 
     def test_backlog_beyond_the_evidence_bound_still_stalls_on_an_unresolved_apply(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements

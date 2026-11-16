@@ -49,7 +49,8 @@ class ConsumeResult:
 def consume_static_route_settlements(mgmt, *, deadline: float | None = None) -> ConsumeResult:
     """Commit complete carriers in order and retain progress before a stalled item.
 
-    A monotonic *deadline* stops the evidence feed read, as the feed cap does.
+    A monotonic *deadline* stops the evidence feed read, as the feed cap does, and the carrier
+    commits after the first. A stopped pass is not drained, and the next pass resumes at its cursor.
     """
     from .apply_settlement import (
         EvidenceInvariantError,
@@ -81,10 +82,13 @@ def consume_static_route_settlements(mgmt, *, deadline: float | None = None) -> 
         work = [(carrier, None) for carrier in historical] + [(job["id"], job) for job in jobs]
         if not work:
             work = [(None, None)]
-        stalled = False
+        stalled = stopped = False
         expected_fence = fence
         seen = set()
-        for carrier_id, job in work:
+        for index, (carrier_id, job) in enumerate(work):
+            if index and deadline is not None and time.monotonic() >= deadline:
+                stopped = True
+                break
             management = NSODeviceManagement.objects.get(pk=pk)
             fence = request_fence(management)
             if fence != expected_fence:
@@ -106,7 +110,7 @@ def consume_static_route_settlements(mgmt, *, deadline: float | None = None) -> 
                 break
             if job is not None:
                 consumed += 1
-        drained = not stalled and len(jobs) < SETTLE_FEED_PAGE
+        drained = not stalled and not stopped and len(jobs) < SETTLE_FEED_PAGE
         result = ConsumeResult(row.adapter_device_id, consumed, stalled, epoch_reset, cursor, drained)
         if read is not None and drained:
             management.refresh_from_db()
