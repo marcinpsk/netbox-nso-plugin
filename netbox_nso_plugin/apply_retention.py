@@ -8,13 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from django.db import OperationalError, transaction
+from django.db import transaction
 from django.db.models import BooleanField, ExpressionWrapper, ProtectedError, Q, RestrictedError
 from django.utils import timezone
 
 from . import adapter_client, refusal_contract
 from .deployment import guarded
 from .durable_capture import mapping_epoch
+from .jobs import skipped_on_lock_timeout
 from .models import (
     APPLY_ATTEMPT_PRUNABLE,
     APPLY_ATTEMPT_RETENTION_AT,
@@ -305,17 +306,10 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
         remote = remote_by_management[management_id]
         if remote is None:
             continue
-        try:
+        with skipped_on_lock_timeout(f"Apply ledger retention keeps attempt {attempt_id}"):
             found, removed = _prune_one(attempt_id, management_id, remote, cutoff, execute)
-        except OperationalError as exc:
-            from .jobs import lock_wait_timed_out
-
-            if not lock_wait_timed_out(exc):
-                raise
-            logger.warning("Apply ledger retention keeps attempt %s: its lock wait timed out", attempt_id)
-            continue
-        eligible += found
-        deleted += removed
+            eligible += found
+            deleted += removed
     if examined < len(candidates):
         next_cursor = _resume_cursor(candidates, examined, cursor)
         return PruneResult(examined, eligible, deleted, next_cursor, adapter_unavailable=not expired)

@@ -8,7 +8,7 @@ import time
 from abc import abstractmethod
 
 from core.choices import JobIntervalChoices
-from django.db import connection
+from django.db import OperationalError, connection
 from netbox.jobs import JobRunner, system_job
 
 from .deployment import DeploymentQuiesced
@@ -42,9 +42,15 @@ def run_deadline() -> float:
     return time.monotonic() + SYSTEM_JOB_BUDGET_SECONDS
 
 
-def lock_wait_timed_out(exc) -> bool:
-    """Whether a database error is a lock wait that passed :data:`SYSTEM_JOB_LOCK_TIMEOUT`."""
-    return getattr(exc.__cause__, "sqlstate", None) == "55P03"
+@contextlib.contextmanager
+def skipped_on_lock_timeout(what: str):
+    """Log and skip one unit of work whose lock wait passed :data:`SYSTEM_JOB_LOCK_TIMEOUT`."""
+    try:
+        yield
+    except OperationalError as exc:
+        if getattr(exc.__cause__, "sqlstate", None) != "55P03":
+            raise
+        logger.warning("%s: its lock wait timed out", what)
 
 
 @contextlib.contextmanager

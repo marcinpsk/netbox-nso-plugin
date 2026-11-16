@@ -19,10 +19,10 @@ import logging
 import time
 from datetime import UTC, datetime
 
-from django.db import OperationalError
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
+from .jobs import skipped_on_lock_timeout
 from .models import NSODeviceManagement
 
 logger = logging.getLogger(__name__)
@@ -244,14 +244,8 @@ def refresh_sync_caches(
             logger.info("last-sync refresh deferred %d rows to the next tick", len(mapped) - index)
             break
         rotation["after_pk"] = mgmt.pk
-        try:
+        with skipped_on_lock_timeout(f"last-sync refresh skipped management row {mgmt.pk}"):
             updated += _refresh_row(mgmt, by_id, by_identity)
-        except OperationalError as exc:
-            from .jobs import lock_wait_timed_out
-
-            if not lock_wait_timed_out(exc):
-                raise
-            logger.warning("last-sync refresh skipped management row %s: its lock wait timed out", mgmt.pk)
     return len(mapped), updated
 
 
@@ -365,7 +359,8 @@ def reconcile_device_links(rows, snapshot=None, *, deadline: float | None = None
             logger.info("Link reconcile deferred %d broken rows to the next tick", len(broken) - index)
             break
         if attempted >= MAX_RELINKS_PER_RUN:
-            _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
+            with skipped_on_lock_timeout(f"Link reconcile skipped management row {mgmt.pk}"):
+                _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
         expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
         attempted_this_row = False

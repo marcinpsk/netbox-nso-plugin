@@ -293,7 +293,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
                 "netbox_nso_plugin.settlement.sweep_static_route_settlements",
                 side_effect=lambda **_kwargs: swept.append(True) or (0, 0),
             ),
-            self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING") as logs,
+            self.assertLogs("netbox_nso_plugin.jobs", level="WARNING") as logs,
             _HeldRowLock(management),
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
@@ -302,6 +302,28 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertTrue(any("lock wait timed out" in line for line in logs.output), logs.output)
         management.refresh_from_db()
         self.assertEqual(management.last_sync_status, "")
+
+    def test_a_held_row_over_the_repair_cap_skips_its_flag_and_the_tick_goes_on(self):
+        from netbox_nso_plugin import jobs
+
+        _device, management = make_managed("job-deadline-relink-lock", 19167)
+        swept = []
+        with (
+            patch.object(jobs, "SYSTEM_JOB_LOCK_TIMEOUT", "1s"),
+            patch("netbox_nso_plugin.sync_cache.MAX_RELINKS_PER_RUN", 0),
+            # The adapter no longer lists the device, so its mapping is broken.
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch(
+                "netbox_nso_plugin.settlement.sweep_static_route_settlements",
+                side_effect=lambda **_kwargs: swept.append(True) or (0, 0),
+            ),
+            self.assertLogs("netbox_nso_plugin.jobs", level="WARNING") as logs,
+            _HeldRowLock(management),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        self.assertEqual(swept, [True], "the lock timeout aborted the tick before the sweep")
+        self.assertTrue(any("Link reconcile skipped" in line for line in logs.output), logs.output)
 
 
 class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

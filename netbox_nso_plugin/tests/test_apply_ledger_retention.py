@@ -319,7 +319,7 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         removable, _execution = self.history(days=32, management=other)
         _short_lock_timeout(self)
 
-        with self.assertLogs("netbox_nso_plugin.apply_retention", level="WARNING"), _HeldRowLock(self.management):
+        with self.assertLogs("netbox_nso_plugin.jobs", level="WARNING"), _HeldRowLock(self.management):
             result = prune_apply_ledger(execute=True)
 
         self.assertEqual((result.examined, result.deleted), (2, 1))
