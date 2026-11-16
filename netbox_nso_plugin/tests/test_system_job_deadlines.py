@@ -270,6 +270,27 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(self._unconsumed(device), 0, "the drain had no time left after the refresh")
 
+    def test_a_refresh_that_uses_its_whole_share_still_leaves_the_link_repair_its_own(self):
+        from netbox_nso_plugin import jobs
+
+        _device, management = make_managed("job-deadline-repair-share", 19168)
+
+        def slow_refresh(rows, *, snapshot, deadline, rotation):
+            time.sleep(max(0.0, deadline - time.monotonic()))
+            return len(rows), 0
+
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            # The adapter no longer lists the device, so its mapping is broken.
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", side_effect=slow_refresh),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        management.refresh_from_db()
+        self.assertIsNotNone(management.adapter_link_attempted_at, "the link repair had no time left")
+
     def test_a_held_management_row_skips_its_refresh_and_the_tick_goes_on(self):
         from netbox_nso_plugin import jobs
 
@@ -539,7 +560,10 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         self.addCleanup(queue.delete, delete_jobs=True)
         plugin_jobs = [cls for cls in registry["system_jobs"] if cls.__module__ == jobs.__name__]
         self.assertEqual(len(plugin_jobs), 4)
-        self.assertGreater(jobs.SYSTEM_JOB_TIMEOUT_SECONDS, jobs.SYSTEM_JOB_BUDGET_SECONDS)
+        self.assertGreater(jobs.SYSTEM_JOB_TIMEOUT_SECONDS, jobs.SYSTEM_JOB_REQUEST_LIMIT_SECONDS)
+        self.assertGreater(
+            jobs.SYSTEM_JOB_REQUEST_LIMIT_SECONDS, jobs.SYSTEM_JOB_BUDGET_SECONDS + jobs.SETTLEMENT_FEED_GRACE_SECONDS
+        )
         # A poll that pages its feed until the grace ends still has time for its later reads.
         self.assertLessEqual(
             jobs.SETTLEMENT_FEED_GRACE_SECONDS, (jobs.SYSTEM_JOB_TIMEOUT_SECONDS - jobs.SYSTEM_JOB_BUDGET_SECONDS) / 2

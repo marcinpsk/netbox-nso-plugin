@@ -275,6 +275,19 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(NSOApplyAttempt.objects.count(), DEFAULT_BATCH_SIZE)
         self.assertIsNotNone(job.data["apply_ledger_cursor"])
 
+    def test_the_daily_job_sends_no_adapter_request_after_its_request_limit(self):
+        from core.models import Job
+
+        from netbox_nso_plugin import jobs
+
+        attempt, _execution = self.history()
+        job = Job.objects.create(name=jobs.PruneApplyLedgerJob.name, job_id=uuid4())
+        with patch.object(jobs, "SYSTEM_JOB_REQUEST_LIMIT_SECONDS", 0):
+            jobs.PruneApplyLedgerJob(job).run()
+
+        self.assertEqual(self.adapter.store.feed_requests, [])
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+
     def test_an_expired_deadline_stops_before_the_next_device_read_and_keeps_its_place(self):
         from netbox_nso_plugin.apply_retention import prune_apply_ledger
 

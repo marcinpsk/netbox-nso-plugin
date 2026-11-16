@@ -26,6 +26,10 @@ SYSTEM_JOB_TIMEOUT_SECONDS = 600
 #: When a run stops starting work. The rest of the timeout is for the work still in flight then:
 #: one settlement poll or link repair makes a few adapter calls of up to the 30 s read timeout.
 SYSTEM_JOB_BUDGET_SECONDS = SYSTEM_JOB_TIMEOUT_SECONDS - 360
+#: When a run stops starting adapter requests. The last 60 s cover the request then in flight
+#: (one 30 s read window at most, except a response that keeps sending bytes), the database
+#: writes after it, and NetBox's reschedule.
+SYSTEM_JOB_REQUEST_LIMIT_SECONDS = SYSTEM_JOB_TIMEOUT_SECONDS - 60
 #: The longest one lock wait in a run may take. A longer wait fails that unit of work, and a later run retries it.
 SYSTEM_JOB_LOCK_TIMEOUT = "30s"
 #: How long after the run deadline a started settlement poll may still page its evidence feed.
@@ -35,6 +39,8 @@ SETTLEMENT_FEED_GRACE_SECONDS = 180
 SETTLEMENT_SWEEP_SHARE = 0.25
 #: The part of the sync-cache budget kept for the outbox compaction and drain, before the sweep's share.
 OUTBOX_DRAIN_SHARE = 0.25
+#: The part of the sync-cache budget kept for the link repair, before the drain's share.
+LINK_REPAIR_SHARE = 0.25
 
 
 def run_deadline() -> float:
@@ -72,9 +78,9 @@ class _PluginSystemJob(JobRunner):
 
     RQ kills a run that passes its timeout, and NetBox then never reschedules it: the Job row
     stays ``running`` and ``enqueue_once`` keeps skipping it. So each run stops at
-    :func:`run_deadline` and leaves the rest of its work to the next run. A row lock that another
-    transaction holds can block a unit of work past that deadline, so every lock wait in
-    :meth:`tick` is bounded by :data:`SYSTEM_JOB_LOCK_TIMEOUT`.
+    :func:`run_deadline` and leaves the rest of its work to the next run. The work in flight at
+    the deadline is bounded too: every lock wait in :meth:`tick` by :data:`SYSTEM_JOB_LOCK_TIMEOUT`,
+    and every adapter request by :data:`SYSTEM_JOB_REQUEST_LIMIT_SECONDS`.
     """
 
     @classmethod
@@ -84,8 +90,10 @@ class _PluginSystemJob(JobRunner):
         return super().enqueue(*args, **kwargs)
 
     def run(self, *args, **kwargs):
-        """Run one :meth:`tick` with bounded lock waits, restored before NetBox reschedules the job."""
-        with _bounded_lock_waits():
+        """Run one :meth:`tick` with bounded lock waits and adapter requests, both ended before the reschedule."""
+        from .adapter_client import requests_until
+
+        with _bounded_lock_waits(), requests_until(time.monotonic() + SYSTEM_JOB_REQUEST_LIMIT_SECONDS):
             return self.tick()
 
     @abstractmethod
@@ -187,9 +195,9 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     Renaming the class would change the system-job identity NetBox has registered, so the
     docstring carries the truth instead.
 
-    The first two passes stop early, so that :data:`OUTBOX_DRAIN_SHARE` of the run's budget
-    stays for the drain. The drain stops early, so that :data:`SETTLEMENT_SWEEP_SHARE` stays for
-    the sweep. The sweep stops at the run's deadline.
+    Each pass but the last stops early, so that the later passes keep their shares of the run's
+    budget: :data:`LINK_REPAIR_SHARE` for the repair, :data:`OUTBOX_DRAIN_SHARE` for the drain and
+    :data:`SETTLEMENT_SWEEP_SHARE` for the sweep. The sweep stops at the run's deadline.
     """
 
     class Meta:
@@ -219,12 +227,13 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
 
         before_sweep = deadline - SYSTEM_JOB_BUDGET_SECONDS * SETTLEMENT_SWEEP_SHARE
         before_drain = before_sweep - SYSTEM_JOB_BUDGET_SECONDS * OUTBOX_DRAIN_SHARE
+        before_repair = before_drain - SYSTEM_JOB_BUDGET_SECONDS * LINK_REPAIR_SHARE
         rows = list(NSODeviceManagement.objects.select_related("nso_instance"))
         # One adapter snapshot for both passes: they ask the same question of the same data,
         # and a second call could disagree with the first mid-sweep.
         snapshot = _snapshot(rows)
         checked, updated = refresh_sync_caches(
-            rows, snapshot=snapshot, deadline=before_drain, rotation=refresh_rotation
+            rows, snapshot=snapshot, deadline=before_repair, rotation=refresh_rotation
         )
         # A row whose mapping is broken can't be mirrored at all — repair it so the next pass
         # has something to mirror.
