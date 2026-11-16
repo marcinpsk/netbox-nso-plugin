@@ -342,7 +342,8 @@ def reconcile_device_links(  # noqa: C901
     cap ``C`` every one of them is attempted within ``ceil(B / C)`` ticks — five minutes each.
     A monotonic *deadline* stops the walk; the rows it did not reach sort first next time.
     A row whose lock wait timed out records no attempt, so *rotation* (carried between runs)
-    sorts it last next time. Otherwise a few held rows could use up every tick's deadline.
+    keeps when the walk last reached it, and the walk orders by the later of the two. Otherwise
+    a few held rows could use up every tick's deadline.
     """
     candidates, by_id, by_identity = snapshot if snapshot is not None else _snapshot(rows)
     if by_id is None:
@@ -353,18 +354,20 @@ def reconcile_device_links(  # noqa: C901
         return 0, 0
 
     # Least-recently-attempted first (never-attempted first, pk to break ties deterministically).
-    lock_skipped = set(rotation.get("lock_skipped", ())) if rotation is not None else set()
+    now = timezone.now()
+    skipped = {
+        int(pk): datetime.fromisoformat(at)
+        for pk, at in (rotation or {}).get("lock_skipped", {}).items()
+        if int(pk) in {mgmt.pk for mgmt, _state, _device in broken}
+    }
     broken.sort(
         key=lambda item: (
-            item[0].pk in lock_skipped,
-            item[0].adapter_link_attempted_at or _NEVER_ATTEMPTED,
+            max(item[0].adapter_link_attempted_at or _NEVER_ATTEMPTED, skipped.get(item[0].pk, _NEVER_ATTEMPTED)),
             item[0].pk,
         )
     )
-    timed_out = []
 
     attempted = 0
-    now = timezone.now()
     for index, (mgmt, state, adapter_device) in enumerate(broken):
         if deadline is not None and time.monotonic() >= deadline:
             # No further writes. Least-recently-attempted order puts these rows first next tick.
@@ -452,7 +455,7 @@ def reconcile_device_links(  # noqa: C901
             continue
         except Exception as exc:  # noqa: BLE001 — one bad row must not abort the sweep
             if lock_wait_timed_out(exc):
-                timed_out.append(mgmt.pk)
+                skipped[mgmt.pk] = now
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue
         finally:
@@ -464,6 +467,6 @@ def reconcile_device_links(  # noqa: C901
                 except Exception:  # noqa: BLE001 — a stamp failure must not abort the sweep
                     logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
     if rotation is not None:
-        rotation["lock_skipped"] = timed_out
+        rotation["lock_skipped"] = {str(pk): at.isoformat() for pk, at in skipped.items()}
     logger.info("Link reconcile: %d broken, %d repair attempted", len(broken), attempted)
     return len(broken), attempted
