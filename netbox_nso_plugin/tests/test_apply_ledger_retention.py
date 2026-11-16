@@ -307,6 +307,25 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         resumed = prune_apply_ledger(execute=True, cursor=result.next_cursor)
         self.assertEqual(resumed.deleted, 1)
 
+    def test_a_lock_wait_timeout_on_one_device_retains_only_that_device(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        from .test_system_job_deadlines import _HeldRowLock, _short_lock_timeout
+
+        _device, other = make_managed("ledger-retention-locked", 1770, index=2)
+        other.refresh_from_db()
+        self.adapter.store.add_device(nso_instance="placeholder", nso_device_name="placeholder-4", device_id=1770)
+        held, _execution = self.history(days=33)
+        removable, _execution = self.history(days=32, management=other)
+        _short_lock_timeout(self)
+
+        with self.assertLogs("netbox_nso_plugin.apply_retention", level="WARNING"), _HeldRowLock(self.management):
+            result = prune_apply_ledger(execute=True)
+
+        self.assertEqual((result.examined, result.deleted), (2, 1))
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=held.pk).exists())
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
+
     def test_adapter_outage_on_one_device_retains_only_that_device(self):
         _device, other = make_managed("ledger-retention-other", 1768, index=2)
         other.refresh_from_db()

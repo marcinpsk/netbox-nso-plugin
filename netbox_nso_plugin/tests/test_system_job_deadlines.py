@@ -217,6 +217,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         def sweep(**kwargs):
             swept.append(kwargs["deadline"])
+            self.assertEqual(kwargs["feed_deadline"], kwargs["deadline"] + jobs.SETTLEMENT_FEED_GRACE_SECONDS)
             return 1, 0
 
         started = time.monotonic()
@@ -268,6 +269,39 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
         self.assertEqual(self._unconsumed(device), 0, "the drain had no time left after the refresh")
+
+    def test_a_held_management_row_skips_its_refresh_and_the_tick_goes_on(self):
+        from netbox_nso_plugin import jobs
+
+        device, management = make_managed("job-deadline-refresh-lock", 19166)
+        listing = [
+            {
+                "id": management.adapter_device_id,
+                "nso_instance": management.nso_instance.adapter_instance_id,
+                "nso_device_name": management.nso_device_name,
+                "netbox_device_id": device.pk,
+                "last_sync_at": None,
+                "last_sync_status": "succeeded",
+                "degraded_surfaces": None,
+            }
+        ]
+        swept = []
+        with (
+            patch.object(jobs, "SYSTEM_JOB_LOCK_TIMEOUT", "1s"),
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=listing),
+            patch(
+                "netbox_nso_plugin.settlement.sweep_static_route_settlements",
+                side_effect=lambda **_kwargs: swept.append(True) or (0, 0),
+            ),
+            self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING") as logs,
+            _HeldRowLock(management),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        self.assertEqual(swept, [True], "the lock timeout aborted the tick before the sweep")
+        self.assertTrue(any("lock wait timed out" in line for line in logs.output), logs.output)
+        management.refresh_from_db()
+        self.assertEqual(management.last_sync_status, "")
 
 
 class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -484,6 +518,10 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         plugin_jobs = [cls for cls in registry["system_jobs"] if cls.__module__ == jobs.__name__]
         self.assertEqual(len(plugin_jobs), 4)
         self.assertGreater(jobs.SYSTEM_JOB_TIMEOUT_SECONDS, jobs.SYSTEM_JOB_BUDGET_SECONDS)
+        # A poll that pages its feed until the grace ends still has time for its later reads.
+        self.assertLessEqual(
+            jobs.SETTLEMENT_FEED_GRACE_SECONDS, (jobs.SYSTEM_JOB_TIMEOUT_SECONDS - jobs.SYSTEM_JOB_BUDGET_SECONDS) / 2
+        )
         for job_class in plugin_jobs:
             with patch("django_rq.get_queue", return_value=queue):
                 job = job_class.enqueue(schedule_at=timezone.now() + timedelta(hours=1), interval=5)

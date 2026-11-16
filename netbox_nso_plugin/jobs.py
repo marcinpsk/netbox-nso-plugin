@@ -28,6 +28,9 @@ SYSTEM_JOB_TIMEOUT_SECONDS = 600
 SYSTEM_JOB_BUDGET_SECONDS = SYSTEM_JOB_TIMEOUT_SECONDS - 360
 #: The longest one lock wait in a run may take. A longer wait fails that unit of work, and a later run retries it.
 SYSTEM_JOB_LOCK_TIMEOUT = "30s"
+#: How long after the run deadline a started settlement poll may still page its evidence feed.
+#: The rest of the timeout is for that poll's reads and writes after the feed.
+SETTLEMENT_FEED_GRACE_SECONDS = 180
 #: The part of the sync-cache budget kept for its last pass, the settlement sweep.
 SETTLEMENT_SWEEP_SHARE = 0.25
 #: The part of the sync-cache budget kept for the outbox compaction and drain, before the sweep's share.
@@ -37,6 +40,11 @@ OUTBOX_DRAIN_SHARE = 0.25
 def run_deadline() -> float:
     """Return the monotonic instant a system job run that starts now must stop starting work."""
     return time.monotonic() + SYSTEM_JOB_BUDGET_SECONDS
+
+
+def lock_wait_timed_out(exc) -> bool:
+    """Whether a database error is a lock wait that passed :data:`SYSTEM_JOB_LOCK_TIMEOUT`."""
+    return getattr(exc.__cause__, "sqlstate", None) == "55P03"
 
 
 @contextlib.contextmanager
@@ -244,7 +252,9 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
             settle_started = time.monotonic()
-            polled, settle_failed = sweep_static_route_settlements(deadline=deadline, rotation=rotation)
+            polled, settle_failed = sweep_static_route_settlements(
+                deadline=deadline, feed_deadline=deadline + SETTLEMENT_FEED_GRACE_SECONDS, rotation=rotation
+            )
         logger.info(
             "RefreshDeviceSyncCacheJob: %d checked, %d updated, %d broken, %d repair attempted, "
             "%d outbox drained, %d outbox failed, outbox drain %.3fs, "

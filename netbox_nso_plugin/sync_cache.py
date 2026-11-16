@@ -19,6 +19,7 @@ import logging
 import time
 from datetime import UTC, datetime
 
+from django.db import OperationalError
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -243,16 +244,28 @@ def refresh_sync_caches(
             logger.info("last-sync refresh deferred %d rows to the next tick", len(mapped) - index)
             break
         rotation["after_pk"] = mgmt.pk
-        state, adapter_device = _classify(mgmt, by_id, by_identity)
-        if state is _MATCHED:
-            if refresh_sync_cache(mgmt, adapter_device):
-                updated += 1
-        elif state is not _MATCHED and not (mgmt.onboard_status or mgmt.source_rekey_pending):
-            # A page render can PROVE the mapping is wrong but does not repair it (that is the
-            # job's work). Record it now, or the row keeps rendering its last good 'succeeded'
-            # until the next sweep — the stale-green lie this whole change exists to remove.
-            _flag_link_error(mgmt, _BROKEN_LINK_MESSAGE)
+        try:
+            updated += _refresh_row(mgmt, by_id, by_identity)
+        except OperationalError as exc:
+            from .jobs import lock_wait_timed_out
+
+            if not lock_wait_timed_out(exc):
+                raise
+            logger.warning("last-sync refresh skipped management row %s: its lock wait timed out", mgmt.pk)
     return len(mapped), updated
+
+
+def _refresh_row(mgmt, by_id, by_identity) -> int:
+    """Mirror one row, or flag its broken mapping. Return 1 when the mirror changed."""
+    state, adapter_device = _classify(mgmt, by_id, by_identity)
+    if state is _MATCHED:
+        return int(bool(refresh_sync_cache(mgmt, adapter_device)))
+    if not (mgmt.onboard_status or mgmt.source_rekey_pending):
+        # A page render can PROVE the mapping is wrong but does not repair it (that is the
+        # job's work). Record it now, or the row keeps rendering its last good 'succeeded'
+        # until the next sweep — the stale-green lie this whole change exists to remove.
+        _flag_link_error(mgmt, _BROKEN_LINK_MESSAGE)
+    return 0
 
 
 def _flag_link_error(mgmt, message) -> None:

@@ -428,11 +428,13 @@ def settle_static_routes(mgmt, *, deadline: float | None = None) -> ConsumeResul
     return consume_static_route_settlements(mgmt, deadline=deadline)
 
 
-def sweep_static_route_settlements(*, deadline: float | None = None, rotation: dict | None = None) -> tuple[int, int]:
+def sweep_static_route_settlements(
+    *, deadline: float | None = None, feed_deadline: float | None = None, rotation: dict | None = None
+) -> tuple[int, int]:
     """Poll devices with pending owned work. Return ``(polled, failed)``.
 
-    A monotonic *deadline* stops the sweep between devices, after at least one poll, and
-    stops each poll's evidence feed read. A
+    A monotonic *deadline* stops the sweep between devices, after at least one poll. A later
+    *feed_deadline* stops each started poll's evidence feed read. A
     *rotation* dict that the caller carries between sweeps makes the next sweep start after
     the last device this one reached, so a cut tail is not starved.
 
@@ -484,7 +486,7 @@ def sweep_static_route_settlements(*, deadline: float | None = None, rotation: d
             break
         rotation["after_pk"] = pk
         try:
-            settle_static_routes(pk, deadline=deadline)
+            settle_static_routes(pk, deadline=feed_deadline)
         except Exception:  # noqa: BLE001 one device's failure must not stop the fleet sweep
             logger.exception("static-route settlement sweep failed for management row %s", pk)
             failed += 1

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from django.db import transaction
+from django.db import OperationalError, transaction
 from django.db.models import BooleanField, ExpressionWrapper, ProtectedError, Q, RestrictedError
 from django.utils import timezone
 
@@ -236,6 +236,33 @@ def _resume_cursor(candidates, examined, cursor):
     return f"{last[2].isoformat()}|{last[0]}" if last is not None else cursor
 
 
+def _prune_one(attempt_id, management_id, remote, cutoff, execute) -> tuple[int, int]:
+    """Judge and delete one expired attempt in its own transaction. Return ``(eligible, deleted)``."""
+    with transaction.atomic():
+        management = NSODeviceManagement.objects.select_for_update().get(pk=management_id)
+        if management.adapter_device_id != remote.adapter_device_id:
+            return 0, 0
+        attempt = _expired_attempts(cutoff).select_for_update().filter(pk=attempt_id).first()
+        if attempt is None or not _eligible(attempt, management):
+            return 0, 0
+        if _historical_certificate_required(attempt, management, remote):
+            return 0, 0
+        if not execute:
+            return 1, 0
+        selection_ids = list(attempt.overlay_snapshots.values_list("selection_id", flat=True))
+        try:
+            with transaction.atomic():
+                attempt.delete()
+        except (ProtectedError, RestrictedError):
+            return 1, 0
+        NSOAcceptedSelection.objects.filter(
+            pk__in=selection_ids,
+            binding_state="invalidated",
+            overlay_snapshots__isnull=True,
+        ).delete()
+        return 1, 1
+
+
 @guarded("Apply ledger retention")
 def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=None, deadline=None):
     """Examine at most one batch and retain all unresolved or referenced records.
@@ -278,30 +305,17 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
         remote = remote_by_management[management_id]
         if remote is None:
             continue
-        with transaction.atomic():
-            management = NSODeviceManagement.objects.select_for_update().get(pk=management_id)
-            if management.adapter_device_id != remote.adapter_device_id:
-                continue
-            attempt = _expired_attempts(cutoff).select_for_update().filter(pk=attempt_id).first()
-            if attempt is None or not _eligible(attempt, management):
-                continue
-            if _historical_certificate_required(attempt, management, remote):
-                continue
-            eligible += 1
-            if not execute:
-                continue
-            selection_ids = list(attempt.overlay_snapshots.values_list("selection_id", flat=True))
-            try:
-                with transaction.atomic():
-                    attempt.delete()
-            except (ProtectedError, RestrictedError):
-                continue
-            deleted += 1
-            NSOAcceptedSelection.objects.filter(
-                pk__in=selection_ids,
-                binding_state="invalidated",
-                overlay_snapshots__isnull=True,
-            ).delete()
+        try:
+            found, removed = _prune_one(attempt_id, management_id, remote, cutoff, execute)
+        except OperationalError as exc:
+            from .jobs import lock_wait_timed_out
+
+            if not lock_wait_timed_out(exc):
+                raise
+            logger.warning("Apply ledger retention keeps attempt %s: its lock wait timed out", attempt_id)
+            continue
+        eligible += found
+        deleted += removed
     if examined < len(candidates):
         next_cursor = _resume_cursor(candidates, examined, cursor)
         return PruneResult(examined, eligible, deleted, next_cursor, adapter_unavailable=not expired)
