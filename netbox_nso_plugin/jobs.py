@@ -51,13 +51,18 @@ def run_deadline() -> float:
     return time.monotonic() + SYSTEM_JOB_BUDGET_SECONDS
 
 
+def lock_wait_timed_out(exc: BaseException) -> bool:
+    """Return whether *exc* is a lock wait that passed :data:`SYSTEM_JOB_LOCK_TIMEOUT`."""
+    return isinstance(exc, OperationalError) and getattr(exc.__cause__, "sqlstate", None) == "55P03"
+
+
 @contextlib.contextmanager
 def skipped_on_lock_timeout(what: str):
     """Log and skip one unit of work whose lock wait passed :data:`SYSTEM_JOB_LOCK_TIMEOUT`."""
     try:
         yield
     except OperationalError as exc:
-        if getattr(exc.__cause__, "sqlstate", None) != "55P03":
+        if not lock_wait_timed_out(exc):
             raise
         logger.warning("%s: its lock wait timed out", what)
 
@@ -246,19 +251,21 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     def tick(self):
         """Run a scheduled tick, or return normally while a deployment pauses it."""
         refresh_rotation = self.carried("refresh_rotation") or {}
+        repair_rotation = self.carried("repair_rotation") or {}
         rotation = self.carried("settlement_rotation") or {}
         try:
-            return RefreshDeviceSyncCacheJob._run(run_deadline(), refresh_rotation, rotation)
+            return RefreshDeviceSyncCacheJob._run(run_deadline(), refresh_rotation, repair_rotation, rotation)
         except DeploymentQuiesced:
             logger.info("RefreshDeviceSyncCacheJob: paused for an intent deployment")
             return None
         finally:
             self.carry("refresh_rotation", refresh_rotation)
+            self.carry("repair_rotation", repair_rotation)
             self.carry("settlement_rotation", rotation)
 
     @staticmethod
     @_deployment_guarded("device maintenance tick")
-    def _run(deadline, refresh_rotation, rotation):
+    def _run(deadline, refresh_rotation, repair_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
@@ -277,7 +284,9 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         )
         # A row whose mapping is broken can't be mirrored at all — repair it so the next pass
         # has something to mirror.
-        broken, attempted = reconcile_device_links(rows, snapshot=snapshot, deadline=before_drain)
+        broken, attempted = reconcile_device_links(
+            rows, snapshot=snapshot, deadline=before_drain, rotation=repair_rotation
+        )
         # LAST, and on its own candidate query: the repair above wrote the database while
         # leaving `rows` stale in two of its three branches, so reusing that list here would
         # skip a device repaired this tick or poll it on an id that no longer exists.

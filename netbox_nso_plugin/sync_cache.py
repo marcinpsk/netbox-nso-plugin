@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from .jobs import skipped_on_lock_timeout
+from .jobs import lock_wait_timed_out, skipped_on_lock_timeout
 from .models import NSODeviceManagement
 
 logger = logging.getLogger(__name__)
@@ -312,7 +312,9 @@ def invalidate_delivery_baselines(device_id: int) -> None:
         )
 
 
-def reconcile_device_links(rows, snapshot=None, *, deadline: float | None = None) -> tuple[int, int]:  # noqa: C901
+def reconcile_device_links(  # noqa: C901
+    rows, snapshot=None, *, deadline: float | None = None, rotation: dict | None = None
+) -> tuple[int, int]:
     """Repair rows whose ``adapter_device_id`` no longer resolves to their own adapter device.
 
     An adapter device row can disappear under a live management row — a provision that rolled
@@ -339,6 +341,8 @@ def reconcile_device_links(rows, snapshot=None, *, deadline: float | None = None
     row that repaired nothing still spends the cap, on every run. With ``B`` broken rows and
     cap ``C`` every one of them is attempted within ``ceil(B / C)`` ticks — five minutes each.
     A monotonic *deadline* stops the walk; the rows it did not reach sort first next time.
+    A row whose lock wait timed out records no attempt, so *rotation* (carried between runs)
+    sorts it last next time. Otherwise a few held rows could use up every tick's deadline.
     """
     candidates, by_id, by_identity = snapshot if snapshot is not None else _snapshot(rows)
     if by_id is None:
@@ -349,7 +353,15 @@ def reconcile_device_links(rows, snapshot=None, *, deadline: float | None = None
         return 0, 0
 
     # Least-recently-attempted first (never-attempted first, pk to break ties deterministically).
-    broken.sort(key=lambda item: (item[0].adapter_link_attempted_at or _NEVER_ATTEMPTED, item[0].pk))
+    lock_skipped = set(rotation.get("lock_skipped", ())) if rotation is not None else set()
+    broken.sort(
+        key=lambda item: (
+            item[0].pk in lock_skipped,
+            item[0].adapter_link_attempted_at or _NEVER_ATTEMPTED,
+            item[0].pk,
+        )
+    )
+    timed_out = []
 
     attempted = 0
     now = timezone.now()
@@ -438,7 +450,9 @@ def reconcile_device_links(rows, snapshot=None, *, deadline: float | None = None
                 save_management(current)
         except _LinkReconcileNoOp:
             continue
-        except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
+        except Exception as exc:  # noqa: BLE001 — one bad row must not abort the sweep
+            if lock_wait_timed_out(exc):
+                timed_out.append(mgmt.pk)
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue
         finally:
@@ -449,5 +463,7 @@ def reconcile_device_links(rows, snapshot=None, *, deadline: float | None = None
                     _mirror_management(mgmt, adapter_link_attempted_at=now)
                 except Exception:  # noqa: BLE001 — a stamp failure must not abort the sweep
                     logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
+    if rotation is not None:
+        rotation["lock_skipped"] = timed_out
     logger.info("Link reconcile: %d broken, %d repair attempted", len(broken), attempted)
     return len(broken), attempted

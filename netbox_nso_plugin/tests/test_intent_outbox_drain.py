@@ -483,7 +483,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
         self.edit(reused_mgmt)
         self.edit(missing_mgmt)
 
-        def repair(rows, snapshot=None, deadline=None):
+        def repair(rows, snapshot=None, deadline=None, rotation=None):
             """The two branches that leave the caller holding something untrue."""
             mirror_update(NSODeviceManagement.objects.get(pk=reused_mgmt.pk), adapter_device_id=7710)
             mirror_update(NSODeviceManagement.objects.get(pk=missing_mgmt.pk), adapter_device_id=7711)

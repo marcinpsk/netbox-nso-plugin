@@ -347,6 +347,29 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(swept, [True], "the lock timeout aborted the tick before the sweep")
         self.assertTrue(any("Link reconcile skipped" in line for line in logs.output), logs.output)
 
+    def test_a_held_repair_row_goes_last_next_tick_so_the_rows_behind_it_get_their_turn(self):
+        from netbox_nso_plugin import jobs
+
+        _held_device, held = make_managed("job-deadline-relink-held", 19169)
+        _device, behind = make_managed("job-deadline-relink-behind", 19170)
+        with (
+            # One lock wait outlasts the repair share, so the row behind the held one is deferred.
+            patch.object(jobs, "SYSTEM_JOB_LOCK_TIMEOUT", "2s"),
+            patch.object(_SlowAdapter, "DELAY", 0),
+            # The adapter no longer lists either device, so both mappings are broken.
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+            _HeldRowLock(held),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+            behind.refresh_from_db()
+            self.assertIsNone(behind.adapter_link_attempted_at, "the held row did not use the repair share")
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        behind.refresh_from_db()
+        self.assertIsNotNone(behind.adapter_link_attempted_at, "the held row came first again")
+
 
 class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """Compaction runs one transaction per key, so a large backlog must not use the sweep's share."""
