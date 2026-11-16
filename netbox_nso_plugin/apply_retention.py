@@ -219,18 +219,15 @@ def _expired_attempts(cutoff):
     ).filter(APPLY_ATTEMPT_PRUNABLE, retention_at__lt=cutoff)
 
 
-def _read_remote(management_id, remote_by_management, deadline) -> str | None:
-    """Read one management row's adapter generations. Return why the batch stops, or None."""
-    # Only after the first read, so that every run makes progress.
-    if remote_by_management and deadline is not None and time.monotonic() >= deadline:
-        return "deadline"
+def _read_remote(management_id, remote_by_management) -> bool:
+    """Read one management row's adapter generations. Return False when the adapter is unavailable."""
     try:
         remote_by_management[management_id] = _remote_generations(management_id)
     except _AdapterUnavailable:
         # The shared deployment lock is held: waiting out the timeout per device would block quiesce().
         logger.warning("Apply ledger retention stops: the adapter is unavailable")
-        return "adapter"
-    return None
+        return False
+    return True
 
 
 def _resume_cursor(candidates, examined, cursor):
@@ -243,7 +240,7 @@ def _resume_cursor(candidates, examined, cursor):
 def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=None, deadline=None):
     """Examine at most one batch and retain all unresolved or referenced records.
 
-    A monotonic *deadline* stops the batch before its next adapter read (never before the
+    A monotonic *deadline* stops the batch before its next candidate (never before the
     first one), and the returned cursor resumes after the last examined record.
     """
     if type(batch_size) is not int or not 1 <= batch_size <= 10000:
@@ -271,12 +268,13 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
     examined = len(candidates)
     expired = False
     for index, (attempt_id, management_id, _completed_at) in enumerate(candidates):
-        if management_id not in remote_by_management:
-            stop = _read_remote(management_id, remote_by_management, deadline)
-            if stop is not None:
-                examined = index
-                expired = stop == "deadline"
-                break
+        # Only after the first candidate, so that every run makes progress.
+        if index and deadline is not None and time.monotonic() >= deadline:
+            examined, expired = index, True
+            break
+        if management_id not in remote_by_management and not _read_remote(management_id, remote_by_management):
+            examined = index
+            break
         remote = remote_by_management[management_id]
         if remote is None:
             continue
