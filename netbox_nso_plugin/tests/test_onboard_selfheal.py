@@ -15,7 +15,7 @@ from django.test import TestCase
 from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-from ._outbox_case import open_provision_attempt
+from ._outbox_case import open_provision_attempt, system_job
 from .test_django_views import ViewTestBase
 from .test_onboarding import _device
 
@@ -243,7 +243,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         from netbox_nso_plugin.jobs import AdvanceStaleOnboardingJob
 
         with patch("netbox_nso_plugin.onboarding.advance_stale_onboarding_rows", return_value=(0, 0)) as sweep:
-            AdvanceStaleOnboardingJob.run(None)  # self unused by run()
+            system_job(AdvanceStaleOnboardingJob).run()
         sweep.assert_called_once()
 
     def test_system_job_pauses_once_without_logging_a_failed_poll(self):
@@ -258,7 +258,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
                 self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logged,
                 patch("netbox_nso_plugin.adapter_client.get_provision_attempt") as get_provision_attempt,
             ):
-                result = AdvanceStaleOnboardingJob.run(None)
+                result = system_job(AdvanceStaleOnboardingJob).run()
         finally:
             resume()
 
