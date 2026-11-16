@@ -464,6 +464,22 @@ class TestUnresolvedExecution(_SettlementCase):
         assert (result.stalled, result.consumed, result.cursor) == (False, SETTLE_FEED_PAGE, SETTLE_FEED_PAGE)
         assert self._cursor(mgmt).settle_cursor_seq == SETTLE_FEED_PAGE
 
+    def test_the_sweep_deadline_stops_the_evidence_feed_read_like_the_bound(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, sweep_static_route_settlements
+
+        device = _make_device("feeddeadline")
+        mgmt = _make_mgmt(device, "feeddeadline", 83, adapter=self.adapter)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_resume_pending=True)
+        for _ in range(2 * SETTLE_FEED_PAGE + 1):
+            self.adapter.store.terminal_job(83, job_type="sync")
+
+        assert sweep_static_route_settlements(deadline=0.0) == (1, 0)
+
+        requests = [request for request in self.adapter.store.feed_requests if request[0] == 83]
+        assert (83, SETTLE_FEED_PAGE, SETTLE_FEED_PAGE) not in requests, requests
+        assert self._cursor(mgmt).settle_cursor_seq == SETTLE_FEED_PAGE
+
     def test_backlog_beyond_the_evidence_bound_still_stalls_on_an_unresolved_apply(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 

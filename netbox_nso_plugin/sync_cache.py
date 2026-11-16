@@ -13,6 +13,7 @@ the bare number would mirror that device's sync status onto this row and, on the
 push this row's scope, failover addresses and auto-apply flag onto it.
 """
 
+import bisect
 import contextlib
 import logging
 import time
@@ -209,12 +210,15 @@ def _snapshot(rows):
     return candidates, by_id, by_identity
 
 
-def refresh_sync_caches(rows, snapshot=None, *, deadline: float | None = None) -> tuple[int, int]:
+def refresh_sync_caches(
+    rows, snapshot=None, *, deadline: float | None = None, rotation: dict | None = None
+) -> tuple[int, int]:
     """Refresh the cached last-sync mirror for *rows* from a single bulk adapter call.
 
     Pass *snapshot* (the ``(mapped, by_id, by_identity)`` triple from :func:`_snapshot`) to
     share one adapter call with :func:`reconcile_device_links`. Returns ``(checked, updated)``.
-    A monotonic *deadline* leaves the remaining rows to the next refresh.
+    A monotonic *deadline* leaves the remaining rows to the next refresh. A *rotation* dict that
+    the caller carries between refreshes makes the next one start after the last row this one reached.
     Only rows whose stored id still resolves to their own device are mirrored — see the module
     docstring on why a bare id match is unsafe. An adapter outage leaves the mirror untouched.
     """
@@ -229,10 +233,16 @@ def refresh_sync_caches(rows, snapshot=None, *, deadline: float | None = None) -
     if by_id is None:
         return len(mapped), 0
     updated = 0
+    rotation = {} if rotation is None else rotation
+    mapped.sort(key=lambda mgmt: mgmt.pk)
+    start = bisect.bisect_right([mgmt.pk for mgmt in mapped], rotation.get("after_pk", 0))
+    mapped = mapped[start:] + mapped[:start]
     for index, mgmt in enumerate(mapped):
-        if deadline is not None and time.monotonic() >= deadline:
+        # Only after the first row, so that every refresh makes progress.
+        if index and deadline is not None and time.monotonic() >= deadline:
             logger.info("last-sync refresh deferred %d rows to the next tick", len(mapped) - index)
             break
+        rotation["after_pk"] = mgmt.pk
         state, adapter_device = _classify(mgmt, by_id, by_identity)
         if state is _MATCHED:
             if refresh_sync_cache(mgmt, adapter_device):

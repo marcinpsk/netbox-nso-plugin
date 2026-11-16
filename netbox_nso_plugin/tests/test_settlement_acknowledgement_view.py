@@ -547,9 +547,9 @@ class TestSettlementResume(AcknowledgementViewHelpers, BGPSettlementHelpers, BGP
         polled = []
         real = settlement.settle_static_routes
 
-        def record(pk):
+        def record(pk, **kwargs):
             polled.append(pk)
-            return real(pk)
+            return real(pk, **kwargs)
 
         with patch.object(settlement, "settle_static_routes", side_effect=record):
             for _tick in range(ticks):

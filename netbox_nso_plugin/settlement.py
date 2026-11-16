@@ -46,8 +46,11 @@ class ConsumeResult:
     mapping_epoch: str | None = None
 
 
-def consume_static_route_settlements(mgmt) -> ConsumeResult:
-    """Commit complete carriers in order and retain progress before a stalled item."""
+def consume_static_route_settlements(mgmt, *, deadline: float | None = None) -> ConsumeResult:
+    """Commit complete carriers in order and retain progress before a stalled item.
+
+    A monotonic *deadline* stops the evidence feed read, as the feed cap does.
+    """
     from .apply_settlement import (
         EvidenceInvariantError,
     )
@@ -64,7 +67,7 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     consumed = 0
     epoch_reset = False
     try:
-        read = _read_device_evidence(management)
+        read = _read_device_evidence(management, deadline)
         with transaction.atomic():
             row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
             fence = request_fence(row)
@@ -224,18 +227,18 @@ def _complete_evidence_result(result, read, management, fence, expected_fence, e
     return result
 
 
-def _read_device_evidence(management):
-    """Retain the fail-closed cursor walk when the store changes or the backlog is unbounded."""
+def _read_device_evidence(management, deadline=None):
+    """Retain the fail-closed cursor walk when the store changes, the backlog is unbounded, or time is up."""
     from .apply_settlement import EvidenceInvariantError, load_deployment_evidence
 
     if management.adapter_device_id is None:
         return None
     fence = request_fence(management)
     try:
-        return load_deployment_evidence(management, defer_carriers=True)
+        return load_deployment_evidence(management, defer_carriers=True, deadline=deadline)
     except EvidenceInvariantError as exc:
         logger.warning("Settlement evidence remains unresolved for management %s", management.pk)
-        if str(exc) not in {"settlement_feed_not_bounded", "evidence_epoch_changed"}:
+        if str(exc) not in {"settlement_feed_not_bounded", "settlement_feed_deadline", "evidence_epoch_changed"}:
             raise
         if str(exc) == "evidence_epoch_changed" and request_fence(management) != fence:
             raise _SettlementReadChanged from exc
@@ -420,15 +423,16 @@ def _invalid_evidence_stall(management, fence, acknowledged, error, stall_class,
         return ConsumeResult(row.adapter_device_id, 0, True, False, row.settle_cursor_seq, False)
 
 
-def settle_static_routes(mgmt) -> ConsumeResult:
+def settle_static_routes(mgmt, *, deadline: float | None = None) -> ConsumeResult:
     """Consume the shared logical outcomes and the static-route success proof."""
-    return consume_static_route_settlements(mgmt)
+    return consume_static_route_settlements(mgmt, deadline=deadline)
 
 
 def sweep_static_route_settlements(*, deadline: float | None = None, rotation: dict | None = None) -> tuple[int, int]:
     """Poll devices with pending owned work. Return ``(polled, failed)``.
 
-    A monotonic *deadline* stops the sweep between devices, after at least one poll. A
+    A monotonic *deadline* stops the sweep between devices, after at least one poll, and
+    stops each poll's evidence feed read. A
     *rotation* dict that the caller carries between sweeps makes the next sweep start after
     the last device this one reached, so a cut tail is not starved.
 
@@ -480,7 +484,7 @@ def sweep_static_route_settlements(*, deadline: float | None = None, rotation: d
             break
         rotation["after_pk"] = pk
         try:
-            settle_static_routes(pk)
+            settle_static_routes(pk, deadline=deadline)
         except Exception:  # noqa: BLE001 one device's failure must not stop the fleet sweep
             logger.exception("static-route settlement sweep failed for management row %s", pk)
             failed += 1

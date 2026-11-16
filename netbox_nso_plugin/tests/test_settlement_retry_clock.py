@@ -142,10 +142,10 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
         enqueue(devices["healthy"][0], "static_route")
         real = settlement.settle_static_routes
 
-        def settle(pk):
+        def settle(pk, **kwargs):
             if pk == devices["unexpected"][1].pk:
                 raise RuntimeError("unexpected settlement defect")
-            return real(pk)
+            return real(pk, **kwargs)
 
         with (
             patch.object(settlement, "settle_static_routes", side_effect=settle),

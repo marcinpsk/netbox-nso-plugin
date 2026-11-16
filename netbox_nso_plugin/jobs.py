@@ -2,10 +2,13 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Periodic system jobs for the NSO plugin."""
 
+import contextlib
 import logging
 import time
+from abc import abstractmethod
 
 from core.choices import JobIntervalChoices
+from django.db import connection
 from netbox.jobs import JobRunner, system_job
 
 from .deployment import DeploymentQuiesced
@@ -23,8 +26,12 @@ SYSTEM_JOB_TIMEOUT_SECONDS = 600
 #: When a run stops starting work. The rest of the timeout is for the work still in flight then:
 #: one settlement poll or link repair makes a few adapter calls of up to the 30 s read timeout.
 SYSTEM_JOB_BUDGET_SECONDS = SYSTEM_JOB_TIMEOUT_SECONDS - 360
+#: The longest one lock wait in a run may take. A longer wait fails that unit of work, and a later run retries it.
+SYSTEM_JOB_LOCK_TIMEOUT = "30s"
 #: The part of the sync-cache budget kept for its last pass, the settlement sweep.
 SETTLEMENT_SWEEP_SHARE = 0.25
+#: The part of the sync-cache budget kept for the outbox compaction and drain, before the sweep's share.
+OUTBOX_DRAIN_SHARE = 0.25
 
 
 def run_deadline() -> float:
@@ -32,12 +39,28 @@ def run_deadline() -> float:
     return time.monotonic() + SYSTEM_JOB_BUDGET_SECONDS
 
 
+@contextlib.contextmanager
+def _bounded_lock_waits():
+    """Set this session's lock_timeout to :data:`SYSTEM_JOB_LOCK_TIMEOUT`, then restore the previous value."""
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT current_setting('lock_timeout')")
+        previous = cursor.fetchone()[0]
+        cursor.execute("SELECT set_config('lock_timeout', %s, false)", [SYSTEM_JOB_LOCK_TIMEOUT])
+    try:
+        yield
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous])
+
+
 class _PluginSystemJob(JobRunner):
     """A system job that sets its own RQ timeout and bounds each run below it.
 
     RQ kills a run that passes its timeout, and NetBox then never reschedules it: the Job row
     stays ``running`` and ``enqueue_once`` keeps skipping it. So each run stops at
-    :func:`run_deadline` and leaves the rest of its work to the next run.
+    :func:`run_deadline` and leaves the rest of its work to the next run. A row lock that another
+    transaction holds can block a unit of work past that deadline, so every lock wait in
+    :meth:`tick` is bounded by :data:`SYSTEM_JOB_LOCK_TIMEOUT`.
     """
 
     @classmethod
@@ -45,6 +68,15 @@ class _PluginSystemJob(JobRunner):
         """Enqueue with the plugin's job timeout, also on NetBox's reschedule after each run."""
         kwargs.setdefault("job_timeout", SYSTEM_JOB_TIMEOUT_SECONDS)
         return super().enqueue(*args, **kwargs)
+
+    def run(self, *args, **kwargs):
+        """Run one :meth:`tick` with bounded lock waits, restored before NetBox reschedules the job."""
+        with _bounded_lock_waits():
+            return self.tick()
+
+    @abstractmethod
+    def tick(self):
+        """Do one run's work."""
 
     def carried(self, key):
         """Return what the latest earlier run of this job recorded under *key*, or None.
@@ -71,7 +103,7 @@ class AuditRendererScopesJob(_PluginSystemJob):
     class Meta:
         name = "Audit NSO renderer scopes"
 
-    def run(self, *args, **kwargs):
+    def tick(self):
         """Run one bounded fleet audit, or defer it while deployment is quiesced."""
         from .renderer_audit import audit_renderer_fleet
 
@@ -105,7 +137,7 @@ class AdvanceStaleOnboardingJob(_PluginSystemJob):
     class Meta:
         name = "Advance stale NSO onboarding rows"
 
-    def run(self, *args, **kwargs):
+    def tick(self):
         """Advance each non-closed provision tombstone."""
         from .onboarding import advance_stale_onboarding_rows
 
@@ -141,27 +173,30 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     Renaming the class would change the system-job identity NetBox has registered, so the
     docstring carries the truth instead.
 
-    The first three passes stop early, so that :data:`SETTLEMENT_SWEEP_SHARE` of the run's
-    budget stays for the sweep. The sweep stops at the run's deadline.
+    The first two passes stop early, so that :data:`OUTBOX_DRAIN_SHARE` of the run's budget
+    stays for the drain. The drain stops early, so that :data:`SETTLEMENT_SWEEP_SHARE` stays for
+    the sweep. The sweep stops at the run's deadline.
     """
 
     class Meta:
         name = "Refresh NSO device sync cache"
 
-    def run(self, *args, **kwargs):
+    def tick(self):
         """Run a scheduled tick, or return normally while a deployment pauses it."""
+        refresh_rotation = self.carried("refresh_rotation") or {}
         rotation = self.carried("settlement_rotation") or {}
         try:
-            return RefreshDeviceSyncCacheJob._run(run_deadline(), rotation)
+            return RefreshDeviceSyncCacheJob._run(run_deadline(), refresh_rotation, rotation)
         except DeploymentQuiesced:
             logger.info("RefreshDeviceSyncCacheJob: paused for an intent deployment")
             return None
         finally:
+            self.carry("refresh_rotation", refresh_rotation)
             self.carry("settlement_rotation", rotation)
 
     @staticmethod
     @_deployment_guarded("device maintenance tick")
-    def _run(deadline, rotation):
+    def _run(deadline, refresh_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
@@ -169,14 +204,17 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         from .sync_cache import _snapshot, reconcile_device_links, refresh_sync_caches
 
         before_sweep = deadline - SYSTEM_JOB_BUDGET_SECONDS * SETTLEMENT_SWEEP_SHARE
+        before_drain = before_sweep - SYSTEM_JOB_BUDGET_SECONDS * OUTBOX_DRAIN_SHARE
         rows = list(NSODeviceManagement.objects.select_related("nso_instance"))
         # One adapter snapshot for both passes: they ask the same question of the same data,
         # and a second call could disagree with the first mid-sweep.
         snapshot = _snapshot(rows)
-        checked, updated = refresh_sync_caches(rows, snapshot=snapshot, deadline=before_sweep)
+        checked, updated = refresh_sync_caches(
+            rows, snapshot=snapshot, deadline=before_drain, rotation=refresh_rotation
+        )
         # A row whose mapping is broken can't be mirrored at all — repair it so the next pass
         # has something to mirror.
-        broken, attempted = reconcile_device_links(rows, snapshot=snapshot, deadline=before_sweep)
+        broken, attempted = reconcile_device_links(rows, snapshot=snapshot, deadline=before_drain)
         # LAST, and on its own candidate query: the repair above wrote the database while
         # leaving `rows` stale in two of its three branches, so reusing that list here would
         # skip a device repaired this tick or poll it on an id that no longer exists.
@@ -231,7 +269,7 @@ class PruneApplyLedgerJob(_PluginSystemJob):
     class Meta:
         name = "Prune NSO Apply ledger"
 
-    def run(self, *args, **kwargs):
+    def tick(self):
         """Use the same eligibility and deletion path as the maintenance command."""
         from .apply_retention import prune_apply_ledger
 

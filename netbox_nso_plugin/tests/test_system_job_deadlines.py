@@ -41,11 +41,11 @@ def _add_interfaces(device, count, start=0):
         )
 
 
-class _HeldInterfaceLock:
-    """Hold FOR UPDATE on one interface row from a second connection, as an operator edit does."""
+class _HeldRowLock:
+    """Hold FOR UPDATE on one row from a second connection, as an operator edit does."""
 
-    def __init__(self, interface):
-        self.interface = interface
+    def __init__(self, row):
+        self.row = row
         self.release = threading.Event()
         self.held = threading.Event()
         self.pid = None
@@ -57,7 +57,7 @@ class _HeldInterfaceLock:
                 with connection.cursor() as cursor:
                     cursor.execute("SELECT pg_backend_pid()")
                     self.pid = cursor.fetchone()[0]
-                list(Interface.objects.select_for_update(of=("self",)).filter(pk=self.interface.pk).order_by())
+                list(type(self.row).objects.select_for_update(of=("self",)).filter(pk=self.row.pk).order_by())
                 self.held.set()
                 self.release.wait(30)
         finally:
@@ -65,7 +65,7 @@ class _HeldInterfaceLock:
 
     def __enter__(self):
         self.thread.start()
-        assert self.held.wait(10), "the holder never took the interface lock"
+        assert self.held.wait(10), "the holder never took the row lock"
         return self
 
     def __exit__(self, *exc):
@@ -113,7 +113,7 @@ class TestPushBookkeepingLocksOnlyTheManagementRow(_CascadeFlushMixin, IntentPus
 
         _add_interfaces(self.device, 3)
         _short_lock_timeout(self)
-        with _HeldInterfaceLock(Interface.objects.filter(device=self.device).first()):
+        with _HeldRowLock(Interface.objects.filter(device=self.device).first()):
             attempt = signals._allocate_push_attempt(self.device.pk, "vlan")
 
         self.assertEqual(attempt, 1)
@@ -127,7 +127,7 @@ class TestPushBookkeepingLocksOnlyTheManagementRow(_CascadeFlushMixin, IntentPus
         _add_interfaces(self.device, 3)
         attempt = signals._allocate_push_attempt(self.device.pk, "vlan")
         _short_lock_timeout(self)
-        with _HeldInterfaceLock(Interface.objects.filter(device=self.device).first()):
+        with _HeldRowLock(Interface.objects.filter(device=self.device).first()):
             signals._record_push_outcome(self.device.pk, "vlan", attempt, AdapterError("refused", code="refused"))
 
         self.management.refresh_from_db()
@@ -235,6 +235,40 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         # The sweep keeps its share of the budget: the drain stopped before the sweep's deadline.
         self.assertGreater(swept[0] - (started + self.BUDGET * (1 - jobs.SETTLEMENT_SWEEP_SHARE)), -0.5)
 
+    def test_a_refresh_that_uses_its_whole_share_still_leaves_the_drain_its_own(self):
+        from netbox_nso_plugin import jobs
+
+        device, management = make_managed("job-deadline-drain-share", 19165)
+        with without_commit_drain():
+            with transaction.atomic():
+                enqueue(device, "vlan")
+        listing = [
+            {
+                "id": management.adapter_device_id,
+                "nso_instance": management.nso_instance.adapter_instance_id,
+                "nso_device_name": management.nso_device_name,
+                "netbox_device_id": device.pk,
+                "last_sync_at": None,
+                "last_sync_status": "",
+                "degraded_surfaces": None,
+            }
+        ]
+
+        def slow_refresh(rows, *, snapshot, deadline, rotation):
+            # A fleet whose mirror refresh runs until its deadline.
+            time.sleep(max(0.0, deadline - time.monotonic()))
+            return len(rows), 0
+
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=listing),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", side_effect=slow_refresh),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        self.assertEqual(self._unconsumed(device), 0, "the drain had no time left after the refresh")
+
 
 class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """Compaction runs one transaction per key, so a large backlog must not use the sweep's share."""
@@ -296,6 +330,27 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
             drain.compact_intent_outbox(deadline=50.0)
         self.assertEqual(read, [(self.device.pk, "vlan")])
 
+    def test_a_held_state_row_fails_the_compaction_at_the_job_lock_timeout(self):
+        from netbox_nso_plugin import jobs
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        state, _created = NSOIntentOutboxState.objects.get_or_create(device=self.device, scope="vlan")
+        started = time.monotonic()
+        with (
+            patch.object(jobs, "SYSTEM_JOB_LOCK_TIMEOUT", "1s"),
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], None, {})),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+            self.assertLogs("netbox_nso_plugin.drain", level="ERROR") as logs,
+            _HeldRowLock(state),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 10, "the compaction waited for the held lock")
+        self.assertTrue(any("compaction failed" in line for line in logs.output), logs.output)
+        self.assertEqual(self._rows(), 2)
+
     def test_the_outage_branch_compacts_inside_the_drain_share(self):
         from netbox_nso_plugin import jobs
 
@@ -350,7 +405,10 @@ class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixi
         polled = []
         with (
             patch("netbox_nso_plugin.adapter_client.list_devices", return_value=listing),
-            patch("netbox_nso_plugin.settlement.settle_static_routes", side_effect=polled.append),
+            patch(
+                "netbox_nso_plugin.settlement.settle_static_routes",
+                side_effect=lambda pk, **_kwargs: polled.append(pk),
+            ),
         ):
             for _run in range(4):
                 system_job(jobs.RefreshDeviceSyncCacheJob).run()
@@ -358,6 +416,37 @@ class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixi
         pks = sorted(row.pk for row in self.rows)
         self.assertEqual(polled, [*pks, pks[0]])
         self.assertEqual(self._carried(jobs.RefreshDeviceSyncCacheJob, "settlement_rotation"), {"after_pk": pks[0]})
+
+    def test_the_last_sync_refresh_resumes_after_the_row_the_previous_run_reached(self):
+        from netbox_nso_plugin import jobs
+
+        listing = [
+            {
+                "id": row.adapter_device_id,
+                "nso_instance": row.nso_instance.adapter_instance_id,
+                "nso_device_name": row.nso_device_name,
+                "netbox_device_id": row.device_id,
+                "last_sync_at": None,
+                "last_sync_status": "",
+                "degraded_surfaces": None,
+            }
+            for row in self.rows
+        ]
+        refreshed = []
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=listing),
+            patch(
+                "netbox_nso_plugin.sync_cache.refresh_sync_cache",
+                side_effect=lambda mgmt, _device: refreshed.append(mgmt.pk) or [],
+            ),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+        ):
+            for _run in range(4):
+                system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        pks = sorted(row.pk for row in self.rows)
+        self.assertEqual(refreshed, [*pks, pks[0]])
+        self.assertEqual(self._carried(jobs.RefreshDeviceSyncCacheJob, "refresh_rotation"), {"after_pk": pks[0]})
 
     def test_the_renderer_audit_resumes_after_the_device_the_previous_run_reached(self):
         from netbox_nso_plugin import jobs
@@ -401,6 +490,25 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             rq_job = RQJob.fetch(str(job.job_id), connection=queue.connection)
             self.addCleanup(rq_job.delete)
             self.assertEqual(rq_job.timeout, jobs.SYSTEM_JOB_TIMEOUT_SECONDS, job_class.name)
+
+    def test_every_plugin_system_job_bounds_its_lock_waits_and_restores_the_session(self):
+        from netbox.registry import registry
+
+        from netbox_nso_plugin import jobs
+
+        def lock_timeout():
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW lock_timeout")
+                return cursor.fetchone()[0]
+
+        before = lock_timeout()
+        self.assertNotEqual(before, jobs.SYSTEM_JOB_LOCK_TIMEOUT)
+        for job_class in [cls for cls in registry["system_jobs"] if cls.__module__ == jobs.__name__]:
+            seen = []
+            with patch.object(job_class, "tick", lambda _self, seen=seen: seen.append(lock_timeout())):
+                system_job(job_class).run()
+            self.assertEqual(seen, [jobs.SYSTEM_JOB_LOCK_TIMEOUT], job_class.name)
+            self.assertEqual(lock_timeout(), before, job_class.name)
 
     def test_netbox_s_reschedule_after_a_run_keeps_the_plugin_timeout(self):
         import django_rq
