@@ -3746,3 +3746,40 @@ def model_label_in_intend_refusal(model, row, read, label, native):
     return _refusal(f"Explicit restart is required for {model._meta.verbose_name} on {native}.")
     # ok: nso-model-label-in-intend-refusal
     return IntendResult("refused", "No acquisition occurred.")
+
+
+class _RotationInFinallyJob(_PluginSystemJob):
+    def tick(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            return audit_renderer_fleet(rotation=rotation)
+        except DeploymentQuiesced:
+            return None
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
+    def tick_without_handler(self):
+        rotation = self.carried("settlement_rotation") or {}
+        try:
+            return sweep(rotation=rotation)
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("settlement_rotation", rotation)
+
+    def tick_with_rotation(self):
+        try:
+            return audit_renderer_fleet(rotation=self.rotation("fleet_rotation"))
+        finally:
+            # ok: nso-system-job-carry-in-finally
+            logger.info("tick done")
+
+    def tick_with_checkpoints(self):
+        cursor = self.carried("apply_ledger_cursor")
+        try:
+            while True:
+                cursor = prune(cursor)
+                # ok: nso-system-job-carry-in-finally
+                self.carry("apply_ledger_cursor", cursor)
+        except DeploymentQuiesced:
+            return None
