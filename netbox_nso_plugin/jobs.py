@@ -122,10 +122,16 @@ class _RunTimedOut(BaseException):
 
 
 @contextlib.contextmanager
-def _unswallowable_timeout():
-    """Make RQ's timeout alarm end the run, and give NetBox RQ's exception on a usable connection."""
+def _unswallowable_timeout(record):
+    """Make RQ's timeout alarm end the run, then *record* the run's state and give NetBox RQ's exception.
+
+    Both happen on a usable connection, also when the alarm stops *record* itself.
+    """
     if threading.current_thread() is not threading.main_thread():
-        yield
+        try:
+            yield
+        finally:
+            record()
         return
     fired = False
 
@@ -136,13 +142,18 @@ def _unswallowable_timeout():
 
     previous = signal.signal(signal.SIGALRM, end_the_run)
     try:
-        yield
+        try:
+            yield
+        finally:
+            if not fired:
+                record()
     except BaseException as exc:
         if not fired:
             raise
         # The alarm can stop a statement in flight, and NetBox's terminate and reschedule need the connection.
         if not connection.in_atomic_block:
             connection.close()
+        record()
         raise JobTimeoutException("NSO system job passed its RQ timeout") from exc
     finally:
         signal.signal(signal.SIGALRM, previous)
@@ -171,18 +182,18 @@ class _PluginSystemJob(JobRunner):
         from .adapter_client import requests_until
 
         self._rotations = {}
-        try:
-            with (
-                _unswallowable_timeout(),
-                _bounded_lock_waits(),
-                requests_until(time.monotonic() + SYSTEM_JOB_REQUEST_LIMIT_SECONDS),
-            ):
-                return self.tick()
-        finally:
-            # After the timeout's connection recovery: a statement the alarm stopped leaves the connection unusable.
-            if self._rotations:
-                self.job.data = {**(self.job.data or {}), **self._rotations}
-                self.job.save(update_fields=("data",))
+        with (
+            _unswallowable_timeout(self._record_rotations),
+            _bounded_lock_waits(),
+            requests_until(time.monotonic() + SYSTEM_JOB_REQUEST_LIMIT_SECONDS),
+        ):
+            return self.tick()
+
+    def _record_rotations(self) -> None:
+        """Save every rotation the tick took on this run's Job row, in one write."""
+        if self._rotations:
+            self.job.data = {**(self.job.data or {}), **self._rotations}
+            self.job.save(update_fields=("data",))
 
     @abstractmethod
     def tick(self):

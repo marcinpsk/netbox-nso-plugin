@@ -786,6 +786,36 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         successors = Job.objects.filter(name=job_class.name, status="scheduled").exclude(pk=first.pk)
         return first, elapsed, successors.count()
 
+    def test_an_overrun_inside_the_rotation_save_still_records_it_and_reschedules(self):
+        from core.models import Job
+
+        from netbox_nso_plugin import jobs
+
+        def hold(pk, held):
+            # An editor of this Job row, so that the run's own save waits until RQ's alarm fires.
+            try:
+                with transaction.atomic():
+                    list(Job.objects.select_for_update().filter(pk=pk))
+                    held.set()
+                    time.sleep(2.5)
+            finally:
+                connection.close()
+
+        def tick(job_self):
+            job_self.rotation("fleet_rotation")["after_device_id"] = 7
+            held = threading.Event()
+            holder = threading.Thread(target=hold, args=(job_self.job.pk, held), daemon=True)
+            holder.start()
+            self.addCleanup(holder.join, 10)
+            self.assertTrue(held.wait(10))
+
+        job, elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob)
+
+        self.assertLess(elapsed, 5, "the run went on after RQ's timeout")
+        self.assertEqual(job.status, "errored")
+        self.assertEqual(successors, 1)
+        self.assertEqual(job.data, {"fleet_rotation": {"after_device_id": 7}})
+
     def test_an_overrun_inside_a_statement_still_records_every_rotation(self):
         from netbox_nso_plugin import jobs
 
