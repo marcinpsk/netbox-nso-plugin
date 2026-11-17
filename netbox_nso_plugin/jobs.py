@@ -82,13 +82,16 @@ def _bounded_lock_waits():
             cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous])
 
 
-#: A statement that can wait on another transaction's row lock.
-_MAY_WAIT_ON_A_ROW_LOCK = re.compile(r"^\s*(?:UPDATE|DELETE|INSERT)\b|\bFOR (?:NO KEY |KEY )?(?:UPDATE|SHARE)\b", re.I)
+#: A statement that can wait on another transaction's row lock or advisory lock.
+_MAY_WAIT_ON_A_LOCK = re.compile(
+    r"^\s*(?:UPDATE|DELETE|INSERT)\b|\bFOR (?:NO KEY |KEY )?(?:UPDATE|SHARE)\b|\bpg_advisory(?:_xact)?_lock(?:_shared)?\s*\(",
+    re.I,
+)
 
 
 @contextlib.contextmanager
 def lock_waits_until(deadline: float):
-    """End each row-lock wait in this block at *deadline* too, so that a pass keeps to its share of the run."""
+    """End each lock wait in this block at *deadline* too, so that a pass keeps to its share of the run."""
     with connection.cursor() as cursor:
         cursor.execute(
             "SELECT current_setting('lock_timeout'), EXTRACT(EPOCH FROM current_setting('lock_timeout')::interval)"
@@ -96,7 +99,7 @@ def lock_waits_until(deadline: float):
         previous, cap = cursor.fetchone()
 
     def bounded(execute, sql, params, many, context):
-        if _MAY_WAIT_ON_A_ROW_LOCK.search(sql):
+        if _MAY_WAIT_ON_A_LOCK.search(sql):
             left = deadline - time.monotonic()
             if cap:
                 left = min(left, float(cap))

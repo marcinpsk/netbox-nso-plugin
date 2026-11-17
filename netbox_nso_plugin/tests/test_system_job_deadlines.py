@@ -674,6 +674,34 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             cursor.execute("SHOW lock_timeout")
             self.assertEqual(cursor.fetchone()[0], "0")
 
+    def test_an_advisory_lock_wait_ends_at_the_deadline(self):
+        from django.db import OperationalError
+
+        from netbox_nso_plugin import jobs
+
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            try:
+                with transaction.atomic(), connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_xact_lock(19167, 1)")
+                    held.set()
+                    release.wait(30)
+            finally:
+                connection.close()
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        self.addCleanup(holder.join, 10)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(10))
+        started = time.monotonic()
+        with self.assertRaises(OperationalError) as caught:
+            with jobs.lock_waits_until(time.monotonic() + 1), transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s, %s)", [19167, 1])
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(jobs.lock_wait_timed_out(caught.exception), caught.exception)
+
     def test_every_plugin_system_job_bounds_its_lock_waits_and_restores_the_session(self):
         from netbox.registry import registry
 
