@@ -4,6 +4,7 @@
 
 import contextlib
 import logging
+import re
 import signal
 import threading
 import time
@@ -81,6 +82,38 @@ def _bounded_lock_waits():
             cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous])
 
 
+#: A statement that can wait on another transaction's row lock.
+_MAY_WAIT_ON_A_ROW_LOCK = re.compile(r"^\s*(?:UPDATE|DELETE|INSERT)\b|\bFOR (?:NO KEY |KEY )?(?:UPDATE|SHARE)\b", re.I)
+
+
+@contextlib.contextmanager
+def lock_waits_until(deadline: float):
+    """End each row-lock wait in this block at *deadline* too, so that a pass keeps to its share of the run."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT current_setting('lock_timeout'), EXTRACT(EPOCH FROM current_setting('lock_timeout')::interval)"
+        )
+        previous, cap = cursor.fetchone()
+
+    def bounded(execute, sql, params, many, context):
+        if _MAY_WAIT_ON_A_ROW_LOCK.search(sql):
+            left = deadline - time.monotonic()
+            if cap:
+                left = min(left, float(cap))
+            # The raw cursor, so that this statement does not pass through the wrappers again. 0 ms would mean no limit.
+            context["cursor"].cursor.execute(
+                "SELECT set_config('lock_timeout', %s, false)", [f"{max(1, int(left * 1000))}ms"]
+            )
+        return execute(sql, params, many, context)
+
+    try:
+        with connection.execute_wrapper(bounded):
+            yield
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous])
+
+
 class _RunTimedOut(BaseException):
     """RQ's timeout as a BaseException, so that no ``except Exception`` in a tick can swallow it."""
 
@@ -131,15 +164,22 @@ class _PluginSystemJob(JobRunner):
         return super().enqueue(*args, **kwargs)
 
     def run(self, *args, **kwargs):
-        """Run one :meth:`tick` with bounded lock waits and adapter requests, both ended before the reschedule."""
+        """Run one :meth:`tick` with bounded lock waits and adapter requests, then record its rotations."""
         from .adapter_client import requests_until
 
-        with (
-            _unswallowable_timeout(),
-            _bounded_lock_waits(),
-            requests_until(time.monotonic() + SYSTEM_JOB_REQUEST_LIMIT_SECONDS),
-        ):
-            return self.tick()
+        self._rotations = {}
+        try:
+            with (
+                _unswallowable_timeout(),
+                _bounded_lock_waits(),
+                requests_until(time.monotonic() + SYSTEM_JOB_REQUEST_LIMIT_SECONDS),
+            ):
+                return self.tick()
+        finally:
+            # After the timeout's connection recovery: a statement the alarm stopped leaves the connection unusable.
+            if self._rotations:
+                self.job.data = {**(self.job.data or {}), **self._rotations}
+                self.job.save(update_fields=("data",))
 
     @abstractmethod
     def tick(self):
@@ -156,6 +196,11 @@ class _PluginSystemJob(JobRunner):
             Job.objects.filter(name=self.name, data__has_key=key).exclude(pk=self.job.pk).order_by("-created").first()
         )
         return previous.data[key] if previous is not None else None
+
+    def rotation(self, key) -> dict:
+        """Return the rotation the latest earlier run recorded under *key*. :meth:`run` records it for the next run."""
+        self._rotations[key] = self.carried(key) or {}
+        return self._rotations[key]
 
     def carry(self, key, value) -> None:
         """Record *value* under *key* on this run's Job row, for the next run."""
@@ -174,14 +219,11 @@ class AuditRendererScopesJob(_PluginSystemJob):
         """Run one bounded fleet audit, or defer it while deployment is quiesced."""
         from .renderer_audit import audit_renderer_fleet
 
-        rotation = self.carried("fleet_rotation") or {}
         try:
-            result = audit_renderer_fleet(deadline=run_deadline(), rotation=rotation)
+            result = audit_renderer_fleet(deadline=run_deadline(), rotation=self.rotation("fleet_rotation"))
         except DeploymentQuiesced:
             logger.info("AuditRendererScopesJob: paused for an intent deployment")
             return None
-        finally:
-            self.carry("fleet_rotation", rotation)
         logger.info(
             "AuditRendererScopesJob: %d devices, %d repairs, %d deferred, %d unknown, %d failed",
             result.devices,
@@ -242,7 +284,8 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
 
     Each pass but the last stops early, so that the later passes keep their shares of the run's
     budget: :data:`LINK_REPAIR_SHARE` for the repair, :data:`OUTBOX_DRAIN_SHARE` for the drain and
-    :data:`SETTLEMENT_SWEEP_SHARE` for the sweep. The sweep stops at the run's deadline.
+    :data:`SETTLEMENT_SWEEP_SHARE` for the sweep. Their lock waits also end at their own deadlines.
+    The sweep stops at the run's deadline.
     """
 
     class Meta:
@@ -250,18 +293,12 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
 
     def tick(self):
         """Run a scheduled tick, or return normally while a deployment pauses it."""
-        refresh_rotation = self.carried("refresh_rotation") or {}
-        repair_rotation = self.carried("repair_rotation") or {}
-        rotation = self.carried("settlement_rotation") or {}
+        rotations = [self.rotation(key) for key in ("refresh_rotation", "repair_rotation", "settlement_rotation")]
         try:
-            return RefreshDeviceSyncCacheJob._run(run_deadline(), refresh_rotation, repair_rotation, rotation)
+            return RefreshDeviceSyncCacheJob._run(run_deadline(), *rotations)
         except DeploymentQuiesced:
             logger.info("RefreshDeviceSyncCacheJob: paused for an intent deployment")
             return None
-        finally:
-            self.carry("refresh_rotation", refresh_rotation)
-            self.carry("repair_rotation", repair_rotation)
-            self.carry("settlement_rotation", rotation)
 
     @staticmethod
     @_deployment_guarded("device maintenance tick")
@@ -279,14 +316,16 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         # One adapter snapshot for both passes: they ask the same question of the same data,
         # and a second call could disagree with the first mid-sweep.
         snapshot = _snapshot(rows)
-        checked, updated = refresh_sync_caches(
-            rows, snapshot=snapshot, deadline=before_repair, rotation=refresh_rotation
-        )
+        with lock_waits_until(before_repair):
+            checked, updated = refresh_sync_caches(
+                rows, snapshot=snapshot, deadline=before_repair, rotation=refresh_rotation
+            )
         # A row whose mapping is broken can't be mirrored at all — repair it so the next pass
         # has something to mirror.
-        broken, attempted = reconcile_device_links(
-            rows, snapshot=snapshot, deadline=before_drain, rotation=repair_rotation
-        )
+        with lock_waits_until(before_drain):
+            broken, attempted = reconcile_device_links(
+                rows, snapshot=snapshot, deadline=before_drain, rotation=repair_rotation
+            )
         # LAST, and on its own candidate query: the repair above wrote the database while
         # leaving `rows` stale in two of its three branches, so reusing that list here would
         # skip a device repaired this tick or poll it on an id that no longer exists.
@@ -303,7 +342,8 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         # abort the tick before the sweep — the one pass that must always run.
         if by_id is None:
             try:
-                compact_intent_outbox(deadline=before_sweep)
+                with lock_waits_until(before_sweep):
+                    compact_intent_outbox(deadline=before_sweep)
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox compaction failed")
             settle_started = time.monotonic()
@@ -312,7 +352,8 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
             # Same rule as the sweep, and for the same reason: a proven global outage is not
             # a per-key failure, and every candidate would wait out its own read timeout.
             try:
-                drained, drain_failed = drain_intent_outbox(deadline=before_sweep)
+                with lock_waits_until(before_sweep):
+                    drained, drain_failed = drain_intent_outbox(deadline=before_sweep)
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
             settle_started = time.monotonic()

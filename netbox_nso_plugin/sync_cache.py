@@ -355,10 +355,11 @@ def reconcile_device_links(  # noqa: C901
 
     # Least-recently-attempted first (never-attempted first, pk to break ties deterministically).
     now = timezone.now()
+    broken_pks = {mgmt.pk for mgmt, _state, _device in broken}
     skipped = {
         int(pk): datetime.fromisoformat(at)
         for pk, at in (rotation or {}).get("lock_skipped", {}).items()
-        if int(pk) in {mgmt.pk for mgmt, _state, _device in broken}
+        if int(pk) in broken_pks
     }
     broken.sort(
         key=lambda item: (

@@ -2028,8 +2028,9 @@ def compact_intent_outbox(limit=None, *, deadline: float | None = None) -> None:
 
 def _compact_intent_outbox(limit=None, *, deadline=None) -> None:
     """Compact an admitted candidate set without contacting the adapter, stopping between keys at *deadline*."""
-    for device_id, scope in compaction_candidates(limit, deadline=deadline):
-        if _past(deadline):
+    for index, (device_id, scope) in enumerate(compaction_candidates(limit, deadline=deadline)):
+        # Discovery shares the deadline, so a pass that found a key compacts at least that key.
+        if index and _past(deadline):
             break
         try:
             compact(device_id, scope)

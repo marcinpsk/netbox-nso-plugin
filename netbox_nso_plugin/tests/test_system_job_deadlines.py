@@ -217,7 +217,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         swept = []
 
         def sweep(**kwargs):
-            swept.append(kwargs["deadline"])
+            swept.append((time.monotonic(), kwargs["deadline"]))
             self.assertEqual(kwargs["feed_deadline"], kwargs["deadline"] + jobs.SETTLEMENT_FEED_GRACE_SECONDS)
             return 1, 0
 
@@ -234,8 +234,10 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertTrue(any("deferred" in line and "next tick" in line for line in logs.output), logs.output)
         self.assertGreater(self._unconsumed(device), 0)
         self.assertEqual(len(swept), 1, "the settlement sweep must run on every tick")
-        # The sweep keeps its share of the budget: the drain stopped before the sweep's deadline.
-        self.assertGreater(swept[0] - (started + self.BUDGET * (1 - jobs.SETTLEMENT_SWEEP_SHARE)), -0.5)
+        # The sweep keeps its share of the budget: the drain stopped at the share, with one request in flight.
+        called_at, run_deadline = swept[0]
+        before_sweep = run_deadline - self.BUDGET * jobs.SETTLEMENT_SWEEP_SHARE
+        self.assertLess(called_at - before_sweep, _SlowAdapter.DELAY + 0.1)
 
     def test_a_refresh_that_uses_its_whole_share_still_leaves_the_drain_its_own(self):
         from netbox_nso_plugin import jobs
@@ -434,6 +436,59 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
             drain.compact_intent_outbox(deadline=50.0)
         self.assertEqual(read, [(self.device.pk, "vlan")])
 
+    def test_a_key_found_before_discovery_reaches_the_deadline_is_still_compacted(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        other, _management = make_managed("job-deadline-compact-c", 19166, index=2)
+        with without_commit_drain():
+            for _ in range(2):
+                with transaction.atomic():
+                    enqueue(other, "vlan")
+        clock = [0.0]
+        unconsumed = drain._unconsumed
+
+        def _read_key(device_id, scope):
+            # The deadline passes while discovery reads the second key's entries.
+            if device_id == other.pk:
+                clock[0] = 100.0
+            return unconsumed(device_id, scope)
+
+        with (
+            patch("netbox_nso_plugin.drain._send_clock", lambda: clock[0]),
+            patch("netbox_nso_plugin.drain._unconsumed", _read_key),
+        ):
+            drain.compact_intent_outbox(deadline=50.0)
+        self.assertEqual(self._rows(), 1)
+        self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=other, scope="vlan").count(), 2)
+
+    def test_lock_waits_end_at_the_drain_s_deadline_so_the_sweep_keeps_its_share(self):
+        from netbox_nso_plugin import jobs
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        state, _created = NSOIntentOutboxState.objects.get_or_create(device=self.device, scope="vlan")
+        swept = []
+
+        def sweep(**kwargs):
+            swept.append((time.monotonic(), kwargs["deadline"]))
+            return 0, 0
+
+        budget = 8.0
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", budget),
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], {}, {})),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", side_effect=sweep),
+            # The compaction and the claim of this key each wait on the held state row.
+            _HeldRowLock(state),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        called_at, run_deadline = swept[0]
+        self.assertLess(called_at - (run_deadline - budget * jobs.SETTLEMENT_SWEEP_SHARE), 1)
+        self.assertEqual(self._rows(), 2)
+
     def test_a_held_state_row_fails_the_compaction_at_the_job_lock_timeout(self):
         from netbox_nso_plugin import jobs
         from netbox_nso_plugin.models import NSOIntentOutboxState
@@ -602,6 +657,23 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             self.addCleanup(rq_job.delete)
             self.assertEqual(rq_job.timeout, jobs.SYSTEM_JOB_TIMEOUT_SECONDS, job_class.name)
 
+    def test_an_update_that_waits_on_a_held_row_ends_at_the_deadline(self):
+        from core.models import Job
+        from django.db import OperationalError
+
+        from netbox_nso_plugin import jobs
+
+        held = Job.objects.create(name="nso-test-held-row", job_id=uuid4())
+        started = time.monotonic()
+        with _HeldRowLock(held), self.assertRaises(OperationalError) as caught:
+            with jobs.lock_waits_until(time.monotonic() + 1):
+                Job.objects.filter(pk=held.pk).update(error="held")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(jobs.lock_wait_timed_out(caught.exception), caught.exception)
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW lock_timeout")
+            self.assertEqual(cursor.fetchone()[0], "0")
+
     def test_every_plugin_system_job_bounds_its_lock_waits_and_restores_the_session(self):
         from netbox.registry import registry
 
@@ -661,8 +733,8 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         rq_job = RQJob.fetch(str(successor.job_id), connection=queue.connection)
         self.assertEqual(rq_job.timeout, jobs.SYSTEM_JOB_TIMEOUT_SECONDS)
 
-    def _overrun(self, tick):
-        """Run PruneApplyLedgerJob through NetBox's handle under RQ's own 1 s timeout alarm."""
+    def _overrun(self, tick, job_class=None):
+        """Run a plugin system job through NetBox's handle under RQ's own 1 s timeout alarm."""
         import django_rq
         from core.models import Job
         from rq import Queue
@@ -670,17 +742,60 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
 
         from netbox_nso_plugin import jobs
 
+        job_class = job_class or jobs.PruneApplyLedgerJob
         queue = Queue(f"nso-test-job-timeout-{uuid4().hex}", connection=django_rq.get_queue("default").connection)
         self.addCleanup(queue.delete, delete_jobs=True)
-        with patch("django_rq.get_queue", return_value=queue), patch.object(jobs.PruneApplyLedgerJob, "tick", tick):
-            first = jobs.PruneApplyLedgerJob.enqueue(schedule_at=timezone.now() + timedelta(hours=1), interval=1440)
+        with (
+            patch("django_rq.get_queue", return_value=queue),
+            patch.object(job_class, "tick", tick) if tick else contextlib.nullcontext(),
+        ):
+            first = job_class.enqueue(schedule_at=timezone.now() + timedelta(hours=1), interval=1440)
             started = time.monotonic()
             with UnixSignalDeathPenalty(1, JobTimeoutException, job_id=str(first.job_id)):
-                jobs.PruneApplyLedgerJob.handle(first)
+                job_class.handle(first)
             elapsed = time.monotonic() - started
         first.refresh_from_db()
-        successors = Job.objects.filter(name=jobs.PruneApplyLedgerJob.name, status="scheduled").exclude(pk=first.pk)
+        successors = Job.objects.filter(name=job_class.name, status="scheduled").exclude(pk=first.pk)
         return first, elapsed, successors.count()
+
+    def test_an_overrun_inside_a_statement_still_records_every_rotation(self):
+        from netbox_nso_plugin import jobs
+
+        def refresh(rows, *, snapshot, deadline, rotation):
+            rotation["after_pk"] = 1
+            return 0, 0
+
+        def repair(rows, *, snapshot, deadline, rotation):
+            rotation["lock_skipped"] = {"2": "2026-11-17T00:00:00+00:00"}
+            return 0, 0
+
+        def sweep(*, deadline, feed_deadline, rotation):
+            rotation["after_pk"] = 3
+            # RQ's alarm stops this statement in flight.
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_sleep(6)")
+            return 0, 0
+
+        with (
+            patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], {}, {})),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", side_effect=refresh),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", side_effect=repair),
+            patch("netbox_nso_plugin.drain.drain_intent_outbox", return_value=(0, 0)),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", side_effect=sweep),
+        ):
+            job, elapsed, successors = self._overrun(None, jobs.RefreshDeviceSyncCacheJob)
+
+        self.assertLess(elapsed, 4, "the run went on after RQ's timeout")
+        self.assertEqual(job.status, "errored")
+        self.assertEqual(successors, 1)
+        self.assertEqual(
+            job.data,
+            {
+                "refresh_rotation": {"after_pk": 1},
+                "repair_rotation": {"lock_skipped": {"2": "2026-11-17T00:00:00+00:00"}},
+                "settlement_rotation": {"after_pk": 3},
+            },
+        )
 
     def test_an_overrun_that_a_broad_handler_would_swallow_ends_at_the_timeout_and_reschedules(self):
         import http.server
