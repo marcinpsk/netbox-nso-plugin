@@ -1473,19 +1473,24 @@ def _stamp_attempt(device_id, scope) -> None:
         state.save()
 
 
-def _restamp_attempt(device_id, scope) -> None:
+def _restamp_attempt(device_id, scope) -> bool:
     """Stamp a key whose drain RAISED, in a transaction of its own (O1.33).
 
     The claim stamps itself before anything can refuse, but that write rolls back with the
     transaction it belongs to, so a key raising inside the claim (a render that blows up, a
     fold that hits a non-retryable error) leaves no stamp at all and stays at the head of
     every bounded pass, starving the keys behind it. The compact-retry path already
-    re-stamps for the same reason.
+    re-stamps for the same reason. Returns False when the stamp's lock wait timed out, so that
+    the caller can rotate the key another way.
     """
+    from .jobs import lock_wait_timed_out
+
     try:
         _stamp_attempt(device_id, scope)
-    except Exception:  # noqa: BLE001 (a key that cannot even be stamped must not abort the pass)
+    except Exception as exc:  # noqa: BLE001 (a key that cannot even be stamped must not abort the pass)
         logger.exception("intent outbox attempt stamp failed for %s/%s", device_id, scope)
+        return not lock_wait_timed_out(exc)
+    return True
 
 
 def _claim_or_compact(device_id, scope, *, mode, force):
@@ -1978,6 +1983,8 @@ def drain_candidates(limit=None, *, lock_skipped=None) -> list[tuple[int, str]]:
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
     limit = DRAIN_BATCH if limit is None else limit
+    # A lock-skipped key moves back after the database's order, so each query reads one more row for each.
+    fetch = limit + len(lock_skipped or {})
     fresh = _db_now() - LEASE
     state_for_entry = NSOIntentOutboxState.objects.filter(
         device_id=OuterRef("device_id"),
@@ -1996,14 +2003,14 @@ def drain_candidates(limit=None, *, lock_skipped=None) -> list[tuple[int, str]]:
         )
         .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
         .order_by(F("attempted_at").asc(nulls_first=True), "device_id", "scope")
-        .distinct()[:limit]
+        .distinct()[:fetch]
     )
     state_keys = list(
         NSOIntentOutboxState.objects.filter(device__nso_management__adapter_device_id__isnull=False)
         .filter(Q(push_seq__isnull=False) | ~Q(queued_deletions=[]))
         .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
         .order_by(F("last_drain_attempted_at").asc(nulls_first=True), "device_id", "scope")
-        .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))[:limit]
+        .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))[:fetch]
     )
 
     by_key = {}
@@ -2102,11 +2109,9 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
             break
         except Exception as exc:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
-            if lock_wait_timed_out(exc):
-                # The stamp would wait on the same row.
+            # After a lock timeout, the stamp would wait on the same row.
+            if lock_wait_timed_out(exc) or not _restamp_attempt(device_id, scope):
                 skipped[(device_id, scope)] = datetime.datetime.now(tz=datetime.UTC)
-            else:
-                _restamp_attempt(device_id, scope)
             failed += 1
             continue
         if outcome == SUCCEEDED:

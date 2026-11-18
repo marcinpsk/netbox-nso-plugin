@@ -419,6 +419,56 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertIsNone(management.adapter_link_attempted_at)
         self.assertIn(str(management.pk), rotation["lock_skipped"])
 
+    def test_lock_skipped_keys_that_fill_a_batch_still_let_the_next_key_in(self):
+        from netbox_nso_plugin import drain
+
+        devices = [
+            make_managed(f"job-deadline-drain-batch-{index}", 19179 + index, index=index)[0] for index in range(3)
+        ]
+        with without_commit_drain():
+            for device in devices:
+                with transaction.atomic():
+                    enqueue(device, "vlan")
+        now = timezone.now()
+
+        candidates = drain.drain_candidates(
+            limit=2, lock_skipped={(devices[0].pk, "vlan"): now, (devices[1].pk, "vlan"): now}
+        )
+
+        self.assertEqual(candidates[0], (devices[2].pk, "vlan"))
+
+    def test_a_failed_key_whose_fallback_stamp_waits_on_a_held_row_is_lock_skipped(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        device, _management = make_managed("job-deadline-drain-restamp", 19182)
+        with without_commit_drain():
+            with transaction.atomic():
+                enqueue(device, "vlan")
+        state = NSOIntentOutboxState.objects.create(device=device, scope="vlan")
+        holders = []
+
+        def fail_then_hold(device_id, scope, **_kwargs):
+            # The key's drain fails, and an operator edit then takes its state row.
+            holder = _HeldRowLock(state)
+            holder.__enter__()
+            holders.append(holder)
+            raise RuntimeError("render failed")
+
+        rotation = {}
+        _short_lock_timeout(self)
+        try:
+            with (
+                patch.object(drain, "drain_key", side_effect=fail_then_hold),
+                self.assertLogs("netbox_nso_plugin.drain", level="ERROR"),
+            ):
+                drain.drain_intent_outbox(deadline=time.monotonic() + 30, rotation=rotation)
+        finally:
+            for holder in holders:
+                holder.__exit__(None, None, None)
+
+        self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[device.pk, "vlan"]])
+
     def test_a_refresh_that_uses_its_whole_share_still_leaves_the_link_repair_its_own(self):
         from netbox_nso_plugin import jobs
 
