@@ -13,6 +13,7 @@ from django.utils import timezone
 
 from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
+from .jobs import skipped_on_lock_timeout
 
 logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
@@ -156,9 +157,10 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
         except Exception:  # noqa: BLE001 - one attempt must not stop the fleet sweep
             logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
         finally:
-            NSOProvisionTombstone.objects.filter(
-                provision_attempt_id=tombstone_id,
-            ).exclude(state="closed").update(updated_at=timezone.now())
+            with skipped_on_lock_timeout(f"Provision tombstone sweep left attempt {tombstone_id} unstamped"):
+                NSOProvisionTombstone.objects.filter(
+                    provision_attempt_id=tombstone_id,
+                ).exclude(state="closed").update(updated_at=timezone.now())
     return checked, closed
 
 

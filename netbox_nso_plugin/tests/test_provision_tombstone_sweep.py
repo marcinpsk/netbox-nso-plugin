@@ -1235,3 +1235,36 @@ class TestProvisionSweepLockWindow(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual((checked, closed), (1, 1))
         self.assertEqual(management.onboard_status, "")
         self.assertEqual(observed, {"instance": True})
+
+
+class TestAHeldTombstoneDoesNotStopTheFleetSweep(_CascadeFlushMixin, TransactionTestCase):
+    """A lock wait that times out on one attempt leaves the sweep free to reach the next one."""
+
+    def _offboarded(self, tag, *, age):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        row = NSOProvisionTombstone.objects.create(
+            netbox_device_id=make_device(tag).pk,
+            nso_instance=f"{tag}-nso",
+            nso_device_name=f"{tag}-device",
+            canonical_request={},
+            state="offboarded",
+        )
+        NSOProvisionTombstone.objects.filter(pk=row.pk).update(updated_at=timezone.now() - age)
+        return row
+
+    def test_the_sweep_closes_the_attempt_behind_a_held_one(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        from .test_system_job_deadlines import _HeldRowLock, _short_lock_timeout
+
+        held = self._offboarded("provision-held", age=timedelta(hours=2))
+        behind = self._offboarded("provision-behind", age=timedelta(hours=1))
+        _short_lock_timeout(self)
+        with _HeldRowLock(held), self.assertLogs("netbox_nso_plugin", level="WARNING"):
+            checked, closed = sweep_provision_tombstones()
+
+        self.assertEqual((checked, closed), (2, 1))
+        self.assertEqual(NSOProvisionTombstone.objects.get(pk=held.pk).state, "offboarded")
+        self.assertEqual(NSOProvisionTombstone.objects.get(pk=behind.pk).state, "closed")
