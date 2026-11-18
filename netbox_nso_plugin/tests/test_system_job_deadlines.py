@@ -273,6 +273,83 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(self._unconsumed(device), 0, "the drain had no time left after the refresh")
 
+    @staticmethod
+    def _listing(*managements):
+        return [
+            {
+                "id": management.adapter_device_id,
+                "nso_instance": management.nso_instance.adapter_instance_id,
+                "nso_device_name": management.nso_device_name,
+                "netbox_device_id": management.device_id,
+                "last_sync_at": None,
+                "last_sync_status": "",
+                "degraded_surfaces": None,
+            }
+            for management in managements
+        ]
+
+    def _outbox_only_tick(self, listing, *held, runs=1, after_each=None):
+        from netbox_nso_plugin import jobs
+
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 8.0),
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=listing),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+            contextlib.ExitStack() as stack,
+        ):
+            for row in held:
+                stack.enter_context(_HeldRowLock(row))
+            for _run in range(runs):
+                system_job(jobs.RefreshDeviceSyncCacheJob).run()
+                if after_each is not None:
+                    after_each()
+
+    def test_a_held_compaction_candidate_still_leaves_the_sends_their_time(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        held_device, held_management = make_managed("job-deadline-compact-held", 19172)
+        device, management = make_managed("job-deadline-compact-healthy", 19173, index=2)
+        with without_commit_drain():
+            for _ in range(2):
+                with transaction.atomic():
+                    enqueue(held_device, "vlan")
+            with transaction.atomic():
+                enqueue(device, "vlan")
+        # Tried just now, so the send loop reaches the healthy, never-tried key first.
+        held = NSOIntentOutboxState.objects.create(
+            device=held_device, scope="vlan", last_drain_attempted_at=timezone.now()
+        )
+
+        self._outbox_only_tick(self._listing(held_management, management), held)
+
+        self.assertEqual(self._unconsumed(device), 0, "the held compaction candidate took the sends' time")
+
+    def test_a_held_drain_key_goes_last_so_the_keys_behind_it_get_their_turn(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        held_device, held_management = make_managed("job-deadline-drain-held", 19174)
+        device, management = make_managed("job-deadline-drain-behind", 19175, index=2)
+        with without_commit_drain():
+            for target in (held_device, device):
+                with transaction.atomic():
+                    enqueue(target, "vlan")
+        # Never tried, and the lower device id, so the held key is first in the send order.
+        held = NSOIntentOutboxState.objects.create(device=held_device, scope="vlan")
+        unconsumed = []
+
+        self._outbox_only_tick(
+            self._listing(held_management, management),
+            held,
+            runs=2,
+            after_each=lambda: unconsumed.append(self._unconsumed(device)),
+        )
+
+        self.assertEqual(unconsumed[0], 1, "the held key did not use the first run's send time")
+        self.assertEqual(unconsumed[1], 0, "the held key took the second run's send time too")
+
     def test_a_refresh_that_uses_its_whole_share_still_leaves_the_link_repair_its_own(self):
         from netbox_nso_plugin import jobs
 
@@ -464,9 +541,10 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
 
     def test_lock_waits_end_at_the_drain_s_deadline_so_the_sweep_keeps_its_share(self):
         from netbox_nso_plugin import jobs
-        from netbox_nso_plugin.models import NSOIntentOutboxState
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
         state, _created = NSOIntentOutboxState.objects.get_or_create(device=self.device, scope="vlan")
+        queued = set(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").values_list("pk", flat=True))
         swept = []
 
         def sweep(**kwargs):
@@ -487,7 +565,9 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
 
         called_at, run_deadline = swept[0]
         self.assertLess(called_at - (run_deadline - budget * jobs.SETTLEMENT_SWEEP_SHARE), 1)
-        self.assertEqual(self._rows(), 2)
+        # Not compacted. The claim's pre-capture audit can queue a repair entry beside them.
+        self.assertEqual(len(queued), 2)
+        self.assertEqual(NSOIntentOutboxEntry.objects.filter(pk__in=queued).count(), 2)
 
     def test_a_held_state_row_fails_the_compaction_at_the_job_lock_timeout(self):
         from netbox_nso_plugin import jobs
@@ -827,6 +907,10 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             rotation["lock_skipped"] = {"2": "2026-11-17T00:00:00+00:00"}
             return 0, 0
 
+        def drain(*, deadline, compaction_deadline, rotation):
+            rotation["lock_skipped"] = [[4, "vlan", "2026-11-17T00:00:00+00:00"]]
+            return 0, 0
+
         def sweep(*, deadline, feed_deadline, rotation):
             rotation["after_pk"] = 3
             # RQ's alarm stops this statement in flight.
@@ -838,7 +922,7 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             patch("netbox_nso_plugin.sync_cache._snapshot", return_value=([], {}, {})),
             patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", side_effect=refresh),
             patch("netbox_nso_plugin.sync_cache.reconcile_device_links", side_effect=repair),
-            patch("netbox_nso_plugin.drain.drain_intent_outbox", return_value=(0, 0)),
+            patch("netbox_nso_plugin.drain.drain_intent_outbox", side_effect=drain),
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", side_effect=sweep),
         ):
             job, elapsed, successors = self._overrun(None, jobs.RefreshDeviceSyncCacheJob)
@@ -851,6 +935,7 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             {
                 "refresh_rotation": {"after_pk": 1},
                 "repair_rotation": {"lock_skipped": {"2": "2026-11-17T00:00:00+00:00"}},
+                "outbox_rotation": {"lock_skipped": [[4, "vlan", "2026-11-17T00:00:00+00:00"]]},
                 "settlement_rotation": {"after_pk": 3},
             },
         )

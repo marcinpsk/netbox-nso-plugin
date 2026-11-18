@@ -43,6 +43,8 @@ SETTLEMENT_FEED_GRACE_SECONDS = 180
 SETTLEMENT_SWEEP_SHARE = 0.25
 #: The part of the sync-cache budget kept for the outbox compaction and drain, before the sweep's share.
 OUTBOX_DRAIN_SHARE = 0.25
+#: The part of the drain's share kept for its sends, after the compaction.
+OUTBOX_SEND_SHARE = 0.5
 #: The part of the sync-cache budget kept for the link repair, before the drain's share.
 LINK_REPAIR_SHARE = 0.25
 
@@ -299,6 +301,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     Each pass but the last stops early, so that the later passes keep their shares of the run's
     budget: :data:`LINK_REPAIR_SHARE` for the repair, :data:`OUTBOX_DRAIN_SHARE` for the drain and
     :data:`SETTLEMENT_SWEEP_SHARE` for the sweep. Their lock waits also end at their own deadlines.
+    The drain's compaction stops early too, so that its sends keep :data:`OUTBOX_SEND_SHARE` of its share.
     The sweep stops at the run's deadline.
     """
 
@@ -307,7 +310,10 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
 
     def tick(self):
         """Run a scheduled tick, or return normally while a deployment pauses it."""
-        rotations = [self.rotation(key) for key in ("refresh_rotation", "repair_rotation", "settlement_rotation")]
+        rotations = [
+            self.rotation(key)
+            for key in ("refresh_rotation", "repair_rotation", "outbox_rotation", "settlement_rotation")
+        ]
         try:
             return RefreshDeviceSyncCacheJob._run(run_deadline(), *rotations)
         except DeploymentQuiesced:
@@ -316,7 +322,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
 
     @staticmethod
     @_deployment_guarded("device maintenance tick")
-    def _run(deadline, refresh_rotation, repair_rotation, rotation):
+    def _run(deadline, refresh_rotation, repair_rotation, outbox_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
@@ -324,6 +330,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         from .sync_cache import _snapshot, reconcile_device_links, refresh_sync_caches
 
         before_sweep = deadline - SYSTEM_JOB_BUDGET_SECONDS * SETTLEMENT_SWEEP_SHARE
+        before_sends = before_sweep - SYSTEM_JOB_BUDGET_SECONDS * OUTBOX_DRAIN_SHARE * OUTBOX_SEND_SHARE
         before_drain = before_sweep - SYSTEM_JOB_BUDGET_SECONDS * OUTBOX_DRAIN_SHARE
         before_repair = before_drain - SYSTEM_JOB_BUDGET_SECONDS * LINK_REPAIR_SHARE
         rows = list(NSODeviceManagement.objects.select_related("nso_instance"))
@@ -367,7 +374,9 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
             # a per-key failure, and every candidate would wait out its own read timeout.
             try:
                 with lock_waits_until(before_sweep):
-                    drained, drain_failed = drain_intent_outbox(deadline=before_sweep)
+                    drained, drain_failed = drain_intent_outbox(
+                        deadline=before_sweep, compaction_deadline=before_sends, rotation=outbox_rotation
+                    )
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
             settle_started = time.monotonic()

@@ -1965,12 +1965,13 @@ def _pending(device_id, scope) -> bool:
     return _work_pending(state)
 
 
-def drain_candidates(limit=None) -> list[tuple[int, str]]:
+def drain_candidates(limit=None, *, lock_skipped=None) -> list[tuple[int, str]]:
     """Return the keys this pass may claim, least recently attempted first.
 
     Re-queried, never taken from a caller's row objects: the tick's link repair writes the
     database while leaving those objects holding ``None`` or a dead adapter id, so a reused
     list would skip a device repaired this tick or push to an id that no longer exists.
+    *lock_skipped* maps a key to when its lock wait last timed out, which counts as an attempt.
     """
     from django.db.models import F, OuterRef, Q, Subquery
 
@@ -2008,7 +2009,8 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
     by_key = {}
     for row in [*entry_keys, *state_keys]:
         key = (row["device_id"], row["scope"])
-        by_key[key] = row["attempted_at"]
+        attempted, skipped = row["attempted_at"], (lock_skipped or {}).get(key)
+        by_key[key] = skipped if skipped is not None and (attempted is None or skipped > attempted) else attempted
     # Never-attempted keys sort before keys with a recorded attempt.
     ordered = [
         (attempted is not None, attempted or datetime.datetime.min.replace(tzinfo=datetime.UTC), key)
@@ -2041,7 +2043,13 @@ def _compact_intent_outbox(limit=None, *, deadline=None) -> None:
         logger.info("intent outbox compaction deferred at the run deadline; remaining keys wait for the next tick")
 
 
-def drain_intent_outbox(limit=None, *, deadline: float | None = None) -> tuple[int, int]:
+def drain_intent_outbox(
+    limit=None,
+    *,
+    deadline: float | None = None,
+    compaction_deadline: float | None = None,
+    rotation: dict | None = None,
+) -> tuple[int, int]:
     """Appendix O's tick pass. Returns ``(drained, failed)``.
 
     Bounded, candidate-filtered and starvation-free: a key is attempted only when it owes a
@@ -2052,22 +2060,35 @@ def drain_intent_outbox(limit=None, *, deadline: float | None = None) -> tuple[i
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
 
-    A monotonic *deadline* stops the pass between keys and bounds each key's send.
+    A monotonic *deadline* stops the pass between keys and bounds each key's send. An earlier
+    *compaction_deadline* also ends compaction's lock waits, so that the sends keep the rest.
+    A key whose lock wait timed out records no attempt, so *rotation* (carried between runs)
+    keeps when the pass last reached it, and the next pass orders it as an attempt.
     """
-    return _drain_intent_outbox(limit, deadline=deadline)
+    return _drain_intent_outbox(limit, deadline=deadline, compaction_deadline=compaction_deadline, rotation=rotation)
 
 
-def _drain_intent_outbox(limit=None, *, deadline=None) -> tuple[int, int]:
+def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None, rotation=None) -> tuple[int, int]:
     """Run one tick with a new deployment admission for each bounded stage."""
+    from .jobs import lock_wait_timed_out, lock_waits_until
+
     try:
         with _deployment_operation("intent outbox tick"):
-            _compact_intent_outbox(limit, deadline=deadline)
+            if compaction_deadline is None:
+                _compact_intent_outbox(limit, deadline=deadline)
+            else:
+                with lock_waits_until(compaction_deadline):
+                    _compact_intent_outbox(limit, deadline=compaction_deadline)
     except DeploymentQuiesced:
         logger.info("the intent outbox tick is paused for a deployment")
         return 0, 0
 
+    skipped = {
+        (int(device_id), scope): datetime.datetime.fromisoformat(at)
+        for device_id, scope, at in (rotation or {}).get("lock_skipped", [])
+    }
     drained = failed = 0
-    candidates = drain_candidates(limit)
+    candidates = drain_candidates(limit, lock_skipped=skipped)
     for index, (device_id, scope) in enumerate(candidates):
         remaining = None if deadline is None else deadline - _send_clock()
         if remaining is not None and remaining <= 0:
@@ -2079,15 +2100,22 @@ def _drain_intent_outbox(limit=None, *, deadline=None) -> tuple[int, int]:
         except DeploymentQuiesced:
             logger.info("the intent outbox tick stopped because a deployment started")
             break
-        except Exception:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
+        except Exception as exc:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
-            _restamp_attempt(device_id, scope)
+            if lock_wait_timed_out(exc):
+                # The stamp would wait on the same row.
+                skipped[(device_id, scope)] = datetime.datetime.now(tz=datetime.UTC)
+            else:
+                _restamp_attempt(device_id, scope)
             failed += 1
             continue
         if outcome == SUCCEEDED:
             drained += 1
         elif outcome in (FAILED, UNACKNOWLEDGED):
             failed += 1
+    if rotation is not None:
+        reached = set(candidates)
+        rotation["lock_skipped"] = [[*key, at.isoformat()] for key, at in skipped.items() if key in reached]
     return drained, failed
 
 
