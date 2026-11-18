@@ -74,6 +74,25 @@ class _HeldRowLock:
         self.thread.join(10)
 
 
+def _rq_test_queue(test_case):
+    """Return a private RQ queue, and delete every job it scheduled when the test ends."""
+    import django_rq
+    from rq import Queue
+
+    queue = Queue(f"nso-test-job-timeout-{uuid4().hex}", connection=django_rq.get_queue("default").connection)
+
+    def delete():
+        # Queue.delete empties only the ready list, and NetBox schedules each run and its successor.
+        for job_id in queue.scheduled_job_registry.get_job_ids():
+            job = queue.fetch_job(job_id)
+            if job is not None:
+                job.delete()
+        queue.delete(delete_jobs=True)
+
+    test_case.addCleanup(delete)
+    return queue
+
+
 def _short_lock_timeout(test_case):
     with connection.cursor() as cursor:
         cursor.execute("SET lock_timeout = '2s'")
@@ -761,15 +780,12 @@ class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixi
 
 class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
     def test_every_plugin_system_job_enqueues_with_the_plugin_timeout(self):
-        import django_rq
         from netbox.registry import registry
-        from rq import Queue
         from rq.job import Job as RQJob
 
         from netbox_nso_plugin import jobs
 
-        queue = Queue(f"nso-test-job-timeout-{uuid4().hex}", connection=django_rq.get_queue("default").connection)
-        self.addCleanup(queue.delete, delete_jobs=True)
+        queue = _rq_test_queue(self)
         plugin_jobs = [cls for cls in registry["system_jobs"] if cls.__module__ == jobs.__name__]
         self.assertEqual(len(plugin_jobs), 4)
         self.assertGreater(jobs.SYSTEM_JOB_TIMEOUT_SECONDS, jobs.SYSTEM_JOB_REQUEST_LIMIT_SECONDS)
@@ -872,15 +888,12 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
                 system_job(job_class).run()
 
     def test_netbox_s_reschedule_after_a_run_keeps_the_plugin_timeout(self):
-        import django_rq
         from core.models import Job
-        from rq import Queue
         from rq.job import Job as RQJob
 
         from netbox_nso_plugin import jobs
 
-        queue = Queue(f"nso-test-job-timeout-{uuid4().hex}", connection=django_rq.get_queue("default").connection)
-        self.addCleanup(queue.delete, delete_jobs=True)
+        queue = _rq_test_queue(self)
         with patch("django_rq.get_queue", return_value=queue):
             first = jobs.PruneApplyLedgerJob.enqueue(schedule_at=timezone.now() + timedelta(hours=1), interval=1440)
             jobs.PruneApplyLedgerJob.handle(first)
@@ -893,16 +906,13 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
 
     def _overrun(self, tick, job_class=None):
         """Run a plugin system job through NetBox's handle under RQ's own 1 s timeout alarm."""
-        import django_rq
         from core.models import Job
-        from rq import Queue
         from rq.timeouts import JobTimeoutException, UnixSignalDeathPenalty
 
         from netbox_nso_plugin import jobs
 
         job_class = job_class or jobs.PruneApplyLedgerJob
-        queue = Queue(f"nso-test-job-timeout-{uuid4().hex}", connection=django_rq.get_queue("default").connection)
-        self.addCleanup(queue.delete, delete_jobs=True)
+        queue = _rq_test_queue(self)
         with (
             patch("django_rq.get_queue", return_value=queue),
             patch.object(job_class, "tick", tick) if tick else contextlib.nullcontext(),
