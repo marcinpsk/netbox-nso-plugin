@@ -23,7 +23,7 @@ from django.utils import timezone
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._candidate_render_case import ACCEPTED_AT
-from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
+from ._outbox_case import content_bulk_update, mirror_update, wait_until_postgres_blocks
 from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
@@ -1049,26 +1049,65 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertTrue(self.mgmt.source_epoch_aware)
 
     def test_adapter_failure_is_recorded_beside_a_concurrent_management_edit(self):
+        from django.db import connection
+
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
 
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_backend_pid()")
+            writer_pid = cursor.fetchone()[0]
+        held, release, worker_errors = threading.Event(), threading.Event(), []
+
+        def hold_an_uncommitted_edit():
+            try:
+                with transaction.atomic():
+                    NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent")
+                    held.set()
+                    release.wait(10)
+            except BaseException as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                worker_errors.append(exc)
+            finally:
+                connection.close()
+
+        def commit_once_the_error_record_waits():
+            try:
+                wait_until_postgres_blocks(writer_pid, "the error record", timeout=5)
+            except BaseException as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                worker_errors.append(exc)
+            finally:
+                release.set()
+                connection.close()
+
+        holder = threading.Thread(target=hold_an_uncommitted_edit)
+        watcher = threading.Thread(target=commit_once_the_error_record_waits)
+
         def concurrent_edit_then_render(exc):
             # Between the failed call and the error record, after the push released its locks.
-            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent"))
+            holder.start()
+            self.assertTrue(held.wait(10), "the concurrent edit did not take the row")
+            watcher.start()
             return str(exc)
 
         errors = []
-        with (
-            patch(f"{_MOD}.set_scope", side_effect=AdapterError("adapter unavailable", code="nso_unreachable")),
-            patch(f"{_MOD}.public_error_message", side_effect=concurrent_edit_then_render),
-            self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as captured,
-        ):
-            try:
-                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
-            except Exception as exc:  # noqa: BLE001 (the assertion reports the escaped callback error)
-                errors.append(exc)
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", side_effect=AdapterError("adapter unavailable", code="nso_unreachable")),
+                patch(f"{_MOD}.public_error_message", side_effect=concurrent_edit_then_render),
+                self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as captured,
+            ):
+                try:
+                    _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+                except Exception as exc:  # noqa: BLE001 (the assertion reports the escaped callback error)
+                    errors.append(exc)
+        finally:
+            release.set()
+            for thread in (holder, watcher):
+                if thread.ident is not None:
+                    thread.join(10)
 
+        self.assertEqual(worker_errors, [])
         self.assertEqual(errors, [], f"the adapter callback raised {errors!r}")
         self.assertTrue(any("adapter unavailable" in message for message in captured.output), captured.output)
         self.mgmt.refresh_from_db()
