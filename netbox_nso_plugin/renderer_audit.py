@@ -498,8 +498,11 @@ def audit_renderer_fleet(*, deadline: float, rotation: dict | None = None) -> Re
     # adapter reads would otherwise burn the whole budget before the device loop's first check.
     # The cap bounds when the next attempt starts, not when it returns: one hung read still
     # overruns it by the adapter timeout.
+    rotation = {} if rotation is None else rotation
     try:
-        sweep_provision_tombstones(deadline=started + budget * _SWEEP_BUDGET_SHARE)
+        sweep_provision_tombstones(
+            deadline=started + budget * _SWEEP_BUDGET_SHARE, rotation=rotation.setdefault("tombstone_rotation", {})
+        )
     except DeploymentQuiesced:
         raise
     except Exception:  # noqa: BLE001 (the next cadence retries the sweep)
@@ -509,7 +512,6 @@ def audit_renderer_fleet(*, deadline: float, rotation: dict | None = None) -> Re
         .order_by("device_id")
         .values_list("device_id", flat=True)
     )
-    rotation = {} if rotation is None else rotation
     ordered = _fleet_rotation(device_ids, rotation.get("after_device_id", 0))
     audited_devices = repaired = deferred = unknown = failed = 0
     for index, device_id in enumerate(ordered):

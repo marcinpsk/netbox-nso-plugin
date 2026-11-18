@@ -267,7 +267,7 @@ class AdvanceStaleOnboardingJob(_PluginSystemJob):
         from .onboarding import advance_stale_onboarding_rows
 
         try:
-            advance_stale_onboarding_rows(deadline=run_deadline())
+            advance_stale_onboarding_rows(deadline=run_deadline(), rotation=self.rotation("tombstone_rotation"))
         except DeploymentQuiesced:
             logger.info("AdvanceStaleOnboardingJob: paused for an intent deployment")
 

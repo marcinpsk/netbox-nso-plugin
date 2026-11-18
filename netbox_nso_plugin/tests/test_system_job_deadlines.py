@@ -912,7 +912,10 @@ class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixi
 
         ids = sorted(row.device_id for row in self.rows)
         self.assertEqual(reached, [*ids, ids[0]])
-        self.assertEqual(self._carried(jobs.AuditRendererScopesJob, "fleet_rotation"), {"after_device_id": ids[0]})
+        self.assertEqual(
+            self._carried(jobs.AuditRendererScopesJob, "fleet_rotation"),
+            {"after_device_id": ids[0], "tombstone_rotation": {"lock_skipped": {}}},
+        )
 
 
 class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):

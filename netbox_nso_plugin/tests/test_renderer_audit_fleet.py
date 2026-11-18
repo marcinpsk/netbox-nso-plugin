@@ -206,7 +206,7 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
         ):
             audit_renderer_fleet(deadline=time.monotonic() + 600)
 
-        sweep.assert_called_once_with(deadline=70.0)
+        sweep.assert_called_once_with(deadline=70.0, rotation={})
 
     def test_a_slow_sweep_leaves_the_device_loop_its_share_of_the_tick(self):
         from netbox_nso_plugin.renderer_audit import audit_renderer_fleet

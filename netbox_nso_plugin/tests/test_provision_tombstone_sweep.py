@@ -3,6 +3,7 @@
 """Provision tombstone completion at the real database seam."""
 
 import threading
+import time
 from datetime import timedelta
 from importlib import import_module
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
-from ._outbox_case import make_device
+from ._outbox_case import HeldRowLock, make_device, short_lock_timeout, system_job
 from .mixins import _CascadeFlushMixin
 
 
@@ -1257,8 +1258,6 @@ class TestAHeldTombstoneDoesNotStopTheFleetSweep(_CascadeFlushMixin, Transaction
         from netbox_nso_plugin.models import NSOProvisionTombstone
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
-        from ._outbox_case import HeldRowLock, short_lock_timeout
-
         held = self._offboarded("provision-held", age=timedelta(hours=2))
         behind = self._offboarded("provision-behind", age=timedelta(hours=1))
         short_lock_timeout(self)
@@ -1268,3 +1267,54 @@ class TestAHeldTombstoneDoesNotStopTheFleetSweep(_CascadeFlushMixin, Transaction
         self.assertEqual((checked, closed), (2, 1))
         self.assertEqual(NSOProvisionTombstone.objects.get(pk=held.pk).state, "offboarded")
         self.assertEqual(NSOProvisionTombstone.objects.get(pk=behind.pk).state, "closed")
+
+    def test_a_held_attempt_goes_last_so_the_attempt_behind_it_gets_its_turn(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        held = self._offboarded("provision-held-first", age=timedelta(hours=2))
+        behind = self._offboarded("provision-held-second", age=timedelta(hours=1))
+        rotation = {}
+        states = []
+        short_lock_timeout(self)
+        with HeldRowLock(held), self.assertLogs("netbox_nso_plugin", level="WARNING"):
+            for _pass in range(2):
+                # The held attempt's lock wait outlasts the deadline, so each pass reaches one attempt.
+                sweep_provision_tombstones(deadline=time.monotonic() + 1, rotation=rotation)
+                states.append(NSOProvisionTombstone.objects.get(pk=behind.pk).state)
+
+        self.assertEqual(states, ["offboarded", "closed"])
+        self.assertEqual(list(rotation["lock_skipped"]), [str(held.pk)])
+
+    def _two_job_runs(self, job_class, held, behind):
+        from netbox_nso_plugin import jobs
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        states = []
+        with (
+            # The held attempt's lock wait outlasts each run's sweep share, so a run reaches one attempt.
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 1.0),
+            patch.object(jobs, "SYSTEM_JOB_LOCK_TIMEOUT", "2s"),
+            HeldRowLock(held),
+            self.assertLogs("netbox_nso_plugin", level="WARNING"),
+        ):
+            for _run in range(2):
+                system_job(job_class).run()
+                states.append(NSOProvisionTombstone.objects.get(pk=behind.pk).state)
+        return states
+
+    def test_the_hourly_job_carries_the_held_attempt_to_its_next_run(self):
+        from netbox_nso_plugin import jobs
+
+        held = self._offboarded("provision-hourly-held", age=timedelta(hours=2))
+        behind = self._offboarded("provision-hourly-behind", age=timedelta(hours=1))
+
+        self.assertEqual(self._two_job_runs(jobs.AdvanceStaleOnboardingJob, held, behind), ["offboarded", "closed"])
+
+    def test_the_renderer_audit_job_carries_the_held_attempt_to_its_next_run(self):
+        from netbox_nso_plugin import jobs
+
+        held = self._offboarded("provision-audit-held", age=timedelta(hours=2))
+        behind = self._offboarded("provision-audit-behind", age=timedelta(hours=1))
+
+        self.assertEqual(self._two_job_runs(jobs.AuditRendererScopesJob, held, behind), ["offboarded", "closed"])
