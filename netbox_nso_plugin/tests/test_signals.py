@@ -1369,6 +1369,44 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, warning)
 
+    def test_a_link_sweep_that_confirms_its_existing_warning_during_the_link_keeps_it(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        warning = "Adapter identity is ambiguous; repair requires operator action."
+        sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning)
+
+        def notify(_device_id):
+            # The link sweep confirms the same ambiguity after the notification.
+            in_thread(lambda: sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning))
+
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, warning)
+
+    def test_a_link_sweep_that_confirms_a_settled_warning_writes_nothing(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        warning = "Adapter identity is ambiguous; repair requires operator action."
+        sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning)
+        recorded = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+
+        with CaptureQueriesContext(connection) as queries:
+            sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning)
+
+        self.assertFalse([query for query in queries if query["sql"].lstrip().upper().startswith("UPDATE")])
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_attempt, recorded.adapter_link_attempt)
+
     def test_a_stale_full_save_does_not_restore_an_error_a_later_attempt_cleared(self):
         from netbox_nso_plugin import signals
         from netbox_nso_plugin.management_lifecycle import save_management

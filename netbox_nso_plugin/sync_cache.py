@@ -266,13 +266,21 @@ def _flag_link_error(mgmt, message) -> None:
     """Record an operator-visible link error without firing the post_save adapter push.
 
     It takes a link attempt number, so that a link callback that started earlier cannot clear it.
+    The same warning is written again only while an attempt that started after its outcome is in flight.
     """
     from .signals import _record_link_error, _start_link_attempt
 
-    if mgmt.adapter_link_error != message:
-        attempt = _start_link_attempt(mgmt)
-        if attempt is not None:
-            _record_link_error(mgmt, attempt, message)
+    current = (
+        type(mgmt)
+        .objects.filter(pk=mgmt.pk)
+        .values_list("adapter_link_error", "adapter_link_attempt", "adapter_link_outcome_attempt")
+        .first()
+    )
+    if current is None or (current[0] == message and current[2] >= current[1]):
+        return
+    attempt = _start_link_attempt(mgmt)
+    if attempt is not None:
+        _record_link_error(mgmt, attempt, message)
 
 
 def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
