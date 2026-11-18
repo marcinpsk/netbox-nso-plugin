@@ -677,6 +677,7 @@ _MANAGEMENT_MIRROR_FIELDS = frozenset(
         "adapter_incarnation",
         "adapter_link_error",
         "adapter_link_attempted_at",
+        "adapter_link_attempt",
         "settle_cursor_seq",
         "settle_cursor_incarnation",
         "settle_cursor_device_id",
@@ -915,22 +916,37 @@ def _update_management_mirror(instance, **values):
     update_mirror_fields(instance, **values)
 
 
-def _record_link_error(instance, seen, message):
-    """Record this attempt's link outcome unless another attempt changed the error after *seen* was read."""
+def _start_link_attempt(instance) -> int | None:
+    """Take the next adapter link attempt number of the row, or None when the row is gone."""
     from django.db import transaction
 
     with transaction.atomic():
-        current = (
-            type(instance)
-            .objects.select_for_update(of=("self",))
-            .filter(pk=instance.pk)
-            .values_list("adapter_link_error", flat=True)
-            .first()
-        )
-        if current != seen:
+        current = _locked_link_attempt(instance)
+        if current is None:
+            return None
+        _update_management_mirror(instance, adapter_link_attempt=current + 1)
+    return current + 1
+
+
+def _record_link_error(instance, attempt, message):
+    """Record this attempt's link outcome unless a later attempt has started since."""
+    from django.db import transaction
+
+    with transaction.atomic():
+        if _locked_link_attempt(instance) != attempt:
             logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
             return
         _update_management_mirror(instance, adapter_link_error=message)
+
+
+def _locked_link_attempt(instance):
+    return (
+        type(instance)
+        .objects.select_for_update(of=("self",))
+        .filter(pk=instance.pk)
+        .values_list("adapter_link_attempt", flat=True)
+        .first()
+    )
 
 
 def _sync_committed_scope_to_adapter(sender, instance_pk, created):
@@ -950,7 +966,9 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         return
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
         return
-    seen_error = instance.adapter_link_error
+    attempt = _start_link_attempt(instance)
+    if attempt is None:
+        return
 
     from . import adapter_client as client
     from .adapter_client import AdapterError
@@ -997,7 +1015,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
         # goes away.
         if instance.adapter_link_error:
-            _record_link_error(instance, seen_error, "")
+            _record_link_error(instance, attempt, "")
     except Exception as exc:
         logger.warning("Failed to sync scope to adapter for device %s: %s", instance.device_id, exc)
         # Surface the failure on the row instead of only logging it: otherwise the device looks
@@ -1018,7 +1036,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         from django.db import connection
 
         if not connection.needs_rollback:
-            _record_link_error(instance, seen_error, message)
+            _record_link_error(instance, attempt, message)
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")

@@ -17,7 +17,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.db import connections, transaction
+from django.db import connection, connections, transaction
+from django.db.models import F
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -1123,7 +1124,12 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
 
         def newer(value):
-            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error=value))
+            # A newer attempt started and recorded its outcome.
+            in_thread(
+                lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+                    adapter_link_attempt=F("adapter_link_attempt") + 1, adapter_link_error=value
+                )
+            )
 
         with sync_scope(lambda: newer(newer_attempt)):
             _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
@@ -1163,6 +1169,59 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 yield
 
         self.assertEqual(self._link_error_after("a newer failure", sync_scope=linking), "a newer failure")
+
+    def test_a_newer_linked_attempt_clears_the_error_an_older_attempt_recorded_after_it_started(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+        main = threading.current_thread()
+        newer_started, older_recorded, newer_errors = threading.Event(), threading.Event(), []
+
+        def set_scope(*_args, **_kwargs):
+            if threading.current_thread() is main:
+                raise AdapterError("adapter unavailable", code="nso_unreachable")
+            return {"device_id": 7}
+
+        def notify(_device_id):
+            newer_started.set()
+            self.assertTrue(older_recorded.wait(10), "the older attempt did not record its error")
+
+        def newer_attempt():
+            try:
+                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+            except BaseException as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                newer_errors.append(exc)
+            finally:
+                connection.close()
+
+        newer = threading.Thread(target=newer_attempt)
+
+        def render(exc):
+            # The newer attempt starts before this older one records its failure.
+            newer.start()
+            self.assertTrue(newer_started.wait(10), "the newer attempt did not start")
+            return str(exc)
+
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", side_effect=set_scope),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+                patch(f"{_MOD}.public_error_message", side_effect=render),
+                self.assertLogs("netbox_nso_plugin.signals", level="WARNING"),
+            ):
+                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+                older_recorded.set()
+                newer.join(10)
+        finally:
+            older_recorded.set()
+            if newer.ident is not None:
+                newer.join(10)
+
+        self.assertEqual(newer_errors, [])
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
 
     def test_new_source_rekey_waits_for_adapter_finalization(self):
         import select
