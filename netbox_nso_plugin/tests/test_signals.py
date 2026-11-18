@@ -1223,6 +1223,29 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")
 
+    def test_a_retry_that_read_no_error_still_clears_a_failure_recorded_before_its_turn(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        real_start = signals._start_link_attempt
+
+        def older_records_first(instance):
+            # An older attempt records its failure after this retry read the row, before it takes its turn.
+            in_thread(
+                lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="older failure")
+            )
+            return real_start(instance)
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=older_records_first),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_new_source_rekey_waits_for_adapter_finalization(self):
         import select
         import threading

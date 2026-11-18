@@ -921,11 +921,12 @@ def _start_link_attempt(instance) -> int | None:
     from django.db import transaction
 
     with transaction.atomic():
-        current = _locked_link_attempt(instance)
-        if current is None:
+        locked = _locked_link_attempt(instance)
+        if locked is None:
             return None
-        _update_management_mirror(instance, adapter_link_attempt=current + 1)
-    return current + 1
+        current = locked[0] + 1
+        _update_management_mirror(instance, adapter_link_attempt=current)
+    return current
 
 
 def _record_link_error(instance, attempt, message):
@@ -933,18 +934,21 @@ def _record_link_error(instance, attempt, message):
     from django.db import transaction
 
     with transaction.atomic():
-        if _locked_link_attempt(instance) != attempt:
+        locked = _locked_link_attempt(instance)
+        if locked is None or locked[0] != attempt:
             logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
             return
-        _update_management_mirror(instance, adapter_link_error=message)
+        if locked[1] != message:
+            _update_management_mirror(instance, adapter_link_error=message)
 
 
 def _locked_link_attempt(instance):
+    """Lock the management row and return its ``(adapter_link_attempt, adapter_link_error)``, or None."""
     return (
         type(instance)
         .objects.select_for_update(of=("self",))
         .filter(pk=instance.pk)
-        .values_list("adapter_link_attempt", flat=True)
+        .values_list("adapter_link_attempt", "adapter_link_error")
         .first()
     )
 
@@ -1013,9 +1017,8 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
                 notify_result["job_id"],
             )
         # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
-        # goes away.
-        if instance.adapter_link_error:
-            _record_link_error(instance, attempt, "")
+        # goes away. The row is read again under its lock: an older attempt can record its error after this load.
+        _record_link_error(instance, attempt, "")
     except Exception as exc:
         logger.warning("Failed to sync scope to adapter for device %s: %s", instance.device_id, exc)
         # Surface the failure on the row instead of only logging it: otherwise the device looks
