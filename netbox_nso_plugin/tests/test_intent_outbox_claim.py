@@ -104,6 +104,35 @@ class TestPreCaptureDeadline(_ClaimCase):
         self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
         self.assertEqual(self.adapter.requests, [])
 
+    def test_the_deployment_admission_spends_the_send_budget_too(self):
+        from netbox_nso_plugin import delivery, deployment, drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        own_vlan(self.mgmt, 812, "admission-budget")
+        clock = [100.0]
+        admissions = []
+        real_is_quiesced = deployment.is_quiesced
+
+        def slow_admission():
+            # Only the drain's own admission is slow.
+            if not admissions:
+                clock[0] += 0.6
+            admissions.append(True)
+            return real_is_quiesced()
+
+        config, session = self.adapter.patches()
+        with (
+            config,
+            session,
+            patch("netbox_nso_plugin.drain._send_clock", new=lambda: clock[0]),
+            patch.object(deployment, "is_quiesced", side_effect=slow_admission),
+            self.assertRaises(delivery.SendDeadlineExceeded),
+        ):
+            drain.drain_key(self.device.pk, "vlan", deadline=0.5)
+
+        self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
+        self.assertEqual(self.adapter.requests, [])
+
 
 class TestClaimFoldsEveryEntryOnce(_ClaimCase):
     """O1.6 (R8-B1): N saves cost one claim, and a batched pass truncates keys, not folds."""

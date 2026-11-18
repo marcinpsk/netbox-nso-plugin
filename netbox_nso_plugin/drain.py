@@ -1565,7 +1565,6 @@ def _claim_refusal_outcome(device_id, scope, refusal) -> str:
     return REFUSED
 
 
-@_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
     scope,
@@ -1584,12 +1583,30 @@ def _drain_once(
     ``_chained`` marks a pass the drain started for latency, not one the caller asked for:
     its claim is nobody's operation to name, so it never records into an open capture.
     """
+    if _deadline_at is None:
+        # Before the admission, so that the time it takes counts against the caller's budget.
+        _deadline_at = _send_clock() + (SEND_DEADLINE.total_seconds() if deadline is None else deadline)
+    return _drain_admitted(
+        device_id,
+        scope,
+        mode=mode,
+        force=force,
+        chain=chain,
+        reform=reform,
+        deadline=deadline,
+        _deadline_at=_deadline_at,
+        _chained=_chained,
+        _audit=_audit,
+    )
+
+
+@_deployment_guarded("intent drain")
+def _drain_admitted(device_id, scope, *, mode, force, chain, reform, deadline, _deadline_at, _chained, _audit):
+    """Run :func:`_drain_once` under the deployment admission."""
     _refuse_in_transaction("drain")
     from .renderer_audit import audit_renderer_scopes
 
     audit_deadline = None
-    if _deadline_at is None:
-        _deadline_at = _send_clock() + (SEND_DEADLINE.total_seconds() if deadline is None else deadline)
     if _audit and _deadline_at is not None:
         audit_started_at = time.monotonic()
         audit_deadline = audit_started_at + _remaining_send_deadline(_deadline_at)
