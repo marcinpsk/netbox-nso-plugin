@@ -364,6 +364,42 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(unconsumed[0], 1, "the held key did not use the first run's send time")
         self.assertEqual(unconsumed[1], 0, "the held key took the second run's send time too")
 
+    def test_a_failed_repair_whose_fallback_stamp_waits_on_a_held_row_is_lock_skipped(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        _device, management = make_managed("job-deadline-relink-fallback", 19177)
+        real_mirror = sync_cache._mirror_management
+        holders = []
+
+        def mirror(mgmt, **values):
+            if not connection.in_atomic_block:
+                # The repair rolled back its stamp. An operator edit now holds the row.
+                holder = _HeldRowLock(NSODeviceManagement.objects.get(pk=mgmt.pk))
+                holder.__enter__()
+                holders.append(holder)
+            return real_mirror(mgmt, **values)
+
+        rotation = {}
+        _short_lock_timeout(self)
+        try:
+            with (
+                # The adapter no longer lists the device, so its mapping is broken.
+                patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+                patch.object(sync_cache, "_mirror_management", side_effect=mirror),
+                patch.object(sync_cache, "invalidate_delivery_baselines", side_effect=RuntimeError("repair failed")),
+                self.assertLogs("netbox_nso_plugin.sync_cache", level="ERROR"),
+            ):
+                sync_cache.reconcile_device_links([management], rotation=rotation)
+        finally:
+            for holder in holders:
+                holder.__exit__(None, None, None)
+
+        self.assertEqual(len(holders), 1, "the fallback stamp did not run")
+        management.refresh_from_db()
+        self.assertIsNone(management.adapter_link_attempted_at)
+        self.assertIn(str(management.pk), rotation["lock_skipped"])
+
     def test_a_refresh_that_uses_its_whole_share_still_leaves_the_link_repair_its_own(self):
         from netbox_nso_plugin import jobs
 

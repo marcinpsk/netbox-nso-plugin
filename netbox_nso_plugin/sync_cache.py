@@ -465,7 +465,9 @@ def reconcile_device_links(  # noqa: C901
                 # outside the repair transaction so rollback cannot starve the tail.
                 try:
                     _mirror_management(mgmt, adapter_link_attempted_at=now)
-                except Exception:  # noqa: BLE001 — a stamp failure must not abort the sweep
+                except Exception as exc:  # noqa: BLE001 — a stamp failure must not abort the sweep
+                    if lock_wait_timed_out(exc):
+                        skipped[mgmt.pk] = now
                     logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
     if rotation is not None:
         rotation["lock_skipped"] = {str(pk): at.isoformat() for pk, at in skipped.items()}
