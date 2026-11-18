@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
+import itertools
 import logging
 import time
 from contextlib import contextmanager
@@ -872,9 +873,12 @@ def _compactable(row, held) -> bool:
     )
 
 
-def compaction_candidates(limit=None, *, deadline=None) -> list[tuple[int, str]]:
-    """Return keys with an eligible contiguous same-kind span, found before *deadline*."""
-    from django.db.models import Count
+def compaction_candidates(limit=None, *, deadline=None, after=None) -> list[tuple[int, str]]:
+    """Return keys with an eligible contiguous same-kind span, found before *deadline*.
+
+    The keys come in ``(device_id, scope)`` order, from the first key after *after*, and then from the start.
+    """
+    from django.db.models import Count, Q
 
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
@@ -888,8 +892,12 @@ def compaction_candidates(limit=None, *, deadline=None) -> list[tuple[int, str]]
         .filter(rows__gt=1)
         .order_by("device_id", "scope")
     )
+    keys = grouped.iterator()
+    if after is not None:
+        later = Q(device_id__gt=after[0]) | Q(device_id=after[0], scope__gt=after[1])
+        keys = itertools.chain(grouped.filter(later).iterator(), grouped.exclude(later).iterator())
     candidates = []
-    for device_id, scope, _rows in grouped.iterator():
+    for device_id, scope, _rows in keys:
         if _past(deadline):
             break
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).only("claim_deletions").first()
@@ -2049,21 +2057,29 @@ def _ordered_candidates(limit, lock_skipped) -> list[tuple[int, str]]:
     return [key for _stamped, _at, key in ordered]
 
 
-def compact_intent_outbox(limit=None, *, deadline: float | None = None) -> None:
+def compact_intent_outbox(limit=None, *, deadline: float | None = None, rotation: dict | None = None) -> None:
     """Compact the bounded candidate set unless a deployment has paused it."""
     try:
         with _deployment_operation("intent outbox compaction"):
-            _compact_intent_outbox(limit, deadline=deadline)
+            _compact_intent_outbox(limit, deadline=deadline, rotation=rotation)
     except DeploymentQuiesced:
         logger.info("intent outbox compaction is paused for a deployment")
 
 
-def _compact_intent_outbox(limit=None, *, deadline=None) -> None:
-    """Compact an admitted candidate set without contacting the adapter, stopping between keys at *deadline*."""
-    for index, (device_id, scope) in enumerate(compaction_candidates(limit, deadline=deadline)):
+def _compact_intent_outbox(limit=None, *, deadline=None, rotation=None) -> None:
+    """Compact an admitted candidate set without contacting the adapter, stopping between keys at *deadline*.
+
+    *rotation* (carried between runs) keeps the last key the pass reached, and the next pass starts after it.
+    """
+    after = (rotation or {}).get("compacted_after")
+    candidates = compaction_candidates(limit, deadline=deadline, after=None if after is None else tuple(after))
+    for index, (device_id, scope) in enumerate(candidates):
         # Discovery shares the deadline, so a pass that found a key compacts at least that key.
         if index and _past(deadline):
             break
+        if rotation is not None:
+            # Before the attempt, so that a key whose lock wait times out does not stay first.
+            rotation["compacted_after"] = [device_id, scope]
         try:
             compact(device_id, scope)
         except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
@@ -2092,7 +2108,8 @@ def drain_intent_outbox(
     A monotonic *deadline* stops the pass between keys and bounds each key's send. An earlier
     *compaction_deadline* also ends compaction's lock waits, so that the sends keep the rest.
     A key whose lock wait timed out records no attempt, so *rotation* (carried between runs)
-    keeps when the pass last reached it, and the next pass orders it as an attempt.
+    keeps when the pass last reached it, and the next pass orders it as an attempt. It also
+    keeps the last key compaction reached.
     """
     return _drain_intent_outbox(limit, deadline=deadline, compaction_deadline=compaction_deadline, rotation=rotation)
 
@@ -2104,10 +2121,10 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
     try:
         with _deployment_operation("intent outbox tick"):
             if compaction_deadline is None:
-                _compact_intent_outbox(limit, deadline=deadline)
+                _compact_intent_outbox(limit, deadline=deadline, rotation=rotation)
             else:
                 with lock_waits_until(compaction_deadline):
-                    _compact_intent_outbox(limit, deadline=compaction_deadline)
+                    _compact_intent_outbox(limit, deadline=compaction_deadline, rotation=rotation)
     except DeploymentQuiesced:
         logger.info("the intent outbox tick is paused for a deployment")
         return 0, 0

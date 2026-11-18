@@ -319,6 +319,26 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(self._unconsumed(device), 0, "the held compaction candidate took the sends' time")
 
+    def test_a_held_compaction_candidate_goes_last_so_the_keys_behind_it_are_compacted(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxState
+
+        held_device, _held_management = make_managed("job-deadline-compact-first", 19190)
+        device, _management = make_managed("job-deadline-compact-second", 19191, index=2)
+        with without_commit_drain():
+            for target in (held_device, device):
+                for _ in range(2):
+                    with transaction.atomic():
+                        enqueue(target, "vlan")
+        # No adapter mapping, so only compaction can merge these rows.
+        NSODeviceManagement.objects.filter(device__in=(held_device, device)).update(adapter_device_id=None)
+        held = NSOIntentOutboxState.objects.create(device=held_device, scope="vlan")
+        unconsumed = []
+
+        self._outbox_only_tick([], held, runs=2, after_each=lambda: unconsumed.append(self._unconsumed(device)))
+
+        self.assertEqual(unconsumed[0], 2, "the held key did not use the first run's compaction time")
+        self.assertEqual(unconsumed[1], 1, "the held key took the second run's compaction time too")
+
     def test_a_held_drain_key_goes_last_so_the_keys_behind_it_get_their_turn(self):
         from netbox_nso_plugin.models import NSOIntentOutboxState
 
