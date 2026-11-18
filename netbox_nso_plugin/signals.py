@@ -915,6 +915,24 @@ def _update_management_mirror(instance, **values):
     update_mirror_fields(instance, **values)
 
 
+def _record_link_error(instance, seen, message):
+    """Record this attempt's link outcome unless another attempt changed the error after *seen* was read."""
+    from django.db import transaction
+
+    with transaction.atomic():
+        current = (
+            type(instance)
+            .objects.select_for_update(of=("self",))
+            .filter(pk=instance.pk)
+            .values_list("adapter_link_error", flat=True)
+            .first()
+        )
+        if current != seen:
+            logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
+            return
+        _update_management_mirror(instance, adapter_link_error=message)
+
+
 def _sync_committed_scope_to_adapter(sender, instance_pk, created):
     """Push device + scope to the adapter whenever an NSODeviceManagement record is saved.
 
@@ -932,6 +950,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         return
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
         return
+    seen_error = instance.adapter_link_error
 
     from . import adapter_client as client
     from .adapter_client import AdapterError
@@ -978,7 +997,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
         # goes away.
         if instance.adapter_link_error:
-            _update_management_mirror(instance, adapter_link_error="")
+            _record_link_error(instance, seen_error, "")
     except Exception as exc:
         logger.warning("Failed to sync scope to adapter for device %s: %s", instance.device_id, exc)
         # Surface the failure on the row instead of only logging it: otherwise the device looks
@@ -999,7 +1018,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         from django.db import connection
 
         if not connection.needs_rollback:
-            _update_management_mirror(instance, adapter_link_error=message)
+            _record_link_error(instance, seen_error, message)
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")

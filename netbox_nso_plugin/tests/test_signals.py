@@ -10,6 +10,7 @@ instances plus a sys.modules-injected fake `models` module, which bypassed exact
 queries — e.g. the OWNED-states filter — and so could not catch a regression in them.)
 """
 
+import contextlib
 import copy
 import threading
 import unittest
@@ -23,7 +24,7 @@ from django.utils import timezone
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._candidate_render_case import ACCEPTED_AT
-from ._outbox_case import content_bulk_update, mirror_update, wait_until_postgres_blocks
+from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
 from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
@@ -1114,6 +1115,54 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         # The error record locks and writes its own field only, so the concurrent edit stands.
         self.assertEqual(self.mgmt.last_sync_status, "concurrent")
         self.assertEqual(self.mgmt.adapter_link_error, "adapter unavailable")
+
+    def _link_error_after(self, newer_attempt, *, sync_scope):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def newer(value):
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error=value))
+
+        with sync_scope(lambda: newer(newer_attempt)):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+        self.mgmt.refresh_from_db()
+        return self.mgmt.adapter_link_error
+
+    def test_an_older_failed_attempt_does_not_restore_its_error_over_a_newer_success(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        @contextlib.contextmanager
+        def failing(newer_commits):
+            def render(exc):
+                # A newer attempt links and clears the error before this one records its own.
+                newer_commits()
+                return str(exc)
+
+            with (
+                patch(f"{_MOD}.set_scope", side_effect=AdapterError("adapter unavailable", code="nso_unreachable")),
+                patch(f"{_MOD}.public_error_message", side_effect=render),
+                self.assertLogs("netbox_nso_plugin.signals", level="WARNING"),
+            ):
+                yield
+
+        self.assertEqual(self._link_error_after("", sync_scope=failing), "")
+
+    def test_an_older_linked_attempt_does_not_clear_a_newer_failure(self):
+        @contextlib.contextmanager
+        def linking(newer_commits):
+            def notify(_device_id):
+                # A newer attempt fails and records its error before this one clears the old one.
+                newer_commits()
+
+            with (
+                patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+            ):
+                yield
+
+        self.assertEqual(self._link_error_after("a newer failure", sync_scope=linking), "a newer failure")
 
     def test_new_source_rekey_waits_for_adapter_finalization(self):
         import select
