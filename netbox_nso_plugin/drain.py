@@ -1978,11 +1978,16 @@ def drain_candidates(limit=None, *, lock_skipped=None) -> list[tuple[int, str]]:
     list would skip a device repaired this tick or push to an id that no longer exists.
     *lock_skipped* maps a key to when its lock wait last timed out, which counts as an attempt.
     """
+    limit = DRAIN_BATCH if limit is None else limit
+    return _ordered_candidates(limit, lock_skipped)[:limit]
+
+
+def _ordered_candidates(limit, lock_skipped) -> list[tuple[int, str]]:
+    """Return every key the candidate queries read, in drain order. The first *limit* are the batch."""
     from django.db.models import F, OuterRef, Q, Subquery
 
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
-    limit = DRAIN_BATCH if limit is None else limit
     # A lock-skipped key moves back after the database's order, so each query reads one more row for each.
     fetch = limit + len(lock_skipped or {})
     fresh = _db_now() - LEASE
@@ -2024,7 +2029,7 @@ def drain_candidates(limit=None, *, lock_skipped=None) -> list[tuple[int, str]]:
         for key, attempted in by_key.items()
     ]
     ordered.sort(key=lambda item: (item[0], item[1], item[2]))
-    return [key for _stamped, _at, key in ordered[:limit]]
+    return [key for _stamped, _at, key in ordered]
 
 
 def compact_intent_outbox(limit=None, *, deadline: float | None = None) -> None:
@@ -2095,7 +2100,9 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
         for device_id, scope, at in (rotation or {}).get("lock_skipped", [])
     }
     drained = failed = 0
-    candidates = drain_candidates(limit, lock_skipped=skipped)
+    limit = DRAIN_BATCH if limit is None else limit
+    ordered = _ordered_candidates(limit, skipped)
+    candidates = ordered[:limit]
     for index, (device_id, scope) in enumerate(candidates):
         remaining = None if deadline is None else deadline - _send_clock()
         if remaining is not None and remaining <= 0:
@@ -2119,8 +2126,9 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
         elif outcome in (FAILED, UNACKNOWLEDGED):
             failed += 1
     if rotation is not None:
-        reached = set(candidates)
-        rotation["lock_skipped"] = [[*key, at.isoformat()] for key, at in skipped.items() if key in reached]
+        # A skip outside this batch still orders its key next time. Keys that no longer owe a send drop out.
+        pending = set(ordered)
+        rotation["lock_skipped"] = [[*key, at.isoformat()] for key, at in skipped.items() if key in pending]
     return drained, failed
 
 

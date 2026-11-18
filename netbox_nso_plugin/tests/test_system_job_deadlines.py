@@ -437,6 +437,39 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(candidates[0], (devices[2].pk, "vlan"))
 
+    def test_two_held_keys_ahead_of_a_one_key_batch_still_let_the_next_key_in(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        devices = [
+            make_managed(f"job-deadline-drain-pair-{index}", 19183 + index, index=index)[0] for index in range(3)
+        ]
+        with without_commit_drain():
+            for device in devices:
+                with transaction.atomic():
+                    enqueue(device, "vlan")
+        held = [NSOIntentOutboxState.objects.create(device=device, scope="vlan") for device in devices[:2]]
+        tried = []
+        real_drain_key = drain.drain_key
+
+        def record(device_id, scope, **kwargs):
+            tried.append(device_id)
+            return real_drain_key(device_id, scope, **kwargs)
+
+        rotation = {}
+        _short_lock_timeout(self)
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch.object(drain, "drain_key", side_effect=record),
+            self.assertLogs("netbox_nso_plugin.drain", level="ERROR"),
+            _HeldRowLock(held[0]),
+            _HeldRowLock(held[1]),
+        ):
+            for _pass in range(3):
+                drain.drain_intent_outbox(limit=1, deadline=time.monotonic() + 30, rotation=rotation)
+
+        self.assertEqual(tried, [devices[0].pk, devices[1].pk, devices[2].pk])
+
     def test_a_failed_key_whose_fallback_stamp_waits_on_a_held_row_is_lock_skipped(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState

@@ -221,7 +221,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
         with (
             patch.object(drain, "_compact_intent_outbox") as compact,
             patch.object(drain, "compact_intent_outbox") as guarded_compact,
-            patch.object(drain, "drain_candidates", return_value=[(1, "vlan"), (2, "vlan")]),
+            patch.object(drain, "_ordered_candidates", return_value=[(1, "vlan"), (2, "vlan")]),
             patch.object(drain, "drain_key", side_effect=DeploymentQuiesced("deployment started")) as drain_key,
             patch.object(drain, "_restamp_attempt") as restamp,
         ):
