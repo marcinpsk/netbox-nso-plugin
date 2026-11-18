@@ -679,6 +679,8 @@ class NSODeviceManagement(NetBoxModel):
         "intent_push_attempts",
         "adapter_link_attempt",
         "adapter_link_outcome_attempt",
+        # Written with its outcome number, so that the two cannot disagree.
+        "adapter_link_error",
     )
     # The settlement cursor, its epoch, the stall triple and the link-repair clock. All are
     # written by a sweep through ``.update()`` while it holds this row's lock, and all lose

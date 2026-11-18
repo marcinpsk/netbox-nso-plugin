@@ -1267,6 +1267,26 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")
 
+    def test_a_stale_full_save_does_not_restore_an_error_a_later_attempt_cleared(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+        stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+        # A provisioning save of the copy loaded before the success, which starts no link attempt.
+        stale.onboard_status = "provisioning"
+        save_management(stale)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.onboard_status, "provisioning")
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_new_source_rekey_waits_for_adapter_finalization(self):
         import select
         import threading
