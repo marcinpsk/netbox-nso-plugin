@@ -481,6 +481,35 @@ class TestUnresolvedExecution(_SettlementCase):
         # The expired deadline also stops the carrier commits after the first.
         assert self._cursor(mgmt).settle_cursor_seq == 1
 
+    def test_a_pass_whose_evidence_read_stopped_at_the_deadline_is_not_drained(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import settlement
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, consume_static_route_settlements
+
+        device = _make_device("feedstopped")
+        mgmt = _make_mgmt(device, "feedstopped", 87, adapter=self.adapter)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_resume_pending=True)
+        for _ in range(2 * SETTLE_FEED_PAGE + 1):
+            self.adapter.store.terminal_job(87, job_type="sync")
+        # An earlier stopped pass records the cursor's store and device.
+        assert consume_static_route_settlements(mgmt, deadline=0.0).cursor == 1
+        real_read = settlement._read_device_evidence
+
+        def read_then_another_poll_advances(management, deadline):
+            read = real_read(management, deadline)
+            # Another poll committed all but the last carrier before this pass locked the row.
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_cursor_seq=2 * SETTLE_FEED_PAGE)
+            return read
+
+        with patch.object(settlement, "_read_device_evidence", side_effect=read_then_another_poll_advances):
+            stopped = consume_static_route_settlements(mgmt, deadline=0.0)
+
+        assert (stopped.consumed, stopped.cursor) == (1, 2 * SETTLE_FEED_PAGE + 1)
+        assert stopped.drained is False
+        assert self._cursor(mgmt).settle_resume_pending is True
+
     def test_the_deadline_stops_the_carrier_commits_after_the_first(self):
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.settlement import consume_static_route_settlements

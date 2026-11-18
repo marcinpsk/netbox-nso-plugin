@@ -68,7 +68,7 @@ def consume_static_route_settlements(mgmt, *, deadline: float | None = None) -> 
     consumed = 0
     epoch_reset = False
     try:
-        read = _read_device_evidence(management, deadline)
+        read, feed_stopped = _read_device_evidence(management, deadline)
         with transaction.atomic():
             row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
             fence = request_fence(row)
@@ -82,7 +82,7 @@ def consume_static_route_settlements(mgmt, *, deadline: float | None = None) -> 
         work = [(carrier, None) for carrier in historical] + [(job["id"], job) for job in jobs]
         if not work:
             work = [(None, None)]
-        stalled = stopped = False
+        stalled, stopped = False, feed_stopped
         expected_fence = fence
         seen = set()
         for carrier_id, job in work:
@@ -233,21 +233,24 @@ def _complete_evidence_result(result, read, management, fence, expected_fence, e
 
 
 def _read_device_evidence(management, deadline=None):
-    """Retain the fail-closed cursor walk when the store changes, the backlog is unbounded, or time is up."""
+    """Retain the fail-closed cursor walk when the store changes, the backlog is unbounded, or time is up.
+
+    Return ``(read, stopped)``: *read* is None without evidence, and *stopped* says the deadline ended the read.
+    """
     from .apply_settlement import EvidenceInvariantError, load_deployment_evidence
 
     if management.adapter_device_id is None:
-        return None
+        return None, False
     fence = request_fence(management)
     try:
-        return load_deployment_evidence(management, defer_carriers=True, deadline=deadline)
+        return load_deployment_evidence(management, defer_carriers=True, deadline=deadline), False
     except EvidenceInvariantError as exc:
         logger.warning("Settlement evidence remains unresolved for management %s", management.pk)
         if str(exc) not in {"settlement_feed_not_bounded", "settlement_feed_deadline", "evidence_epoch_changed"}:
             raise
         if str(exc) == "evidence_epoch_changed" and request_fence(management) != fence:
             raise _SettlementReadChanged from exc
-        return None
+        return None, str(exc) == "settlement_feed_deadline"
 
 
 class _SettlementReadChanged(Exception):
