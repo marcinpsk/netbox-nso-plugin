@@ -745,6 +745,34 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
         self.assertEqual(self._rows(), 1)
         self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=other, scope="vlan").count(), 2)
 
+    def test_a_key_whose_discovery_uses_the_deadline_goes_last_so_the_keys_behind_it_are_compacted(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        other, _management = make_managed("job-deadline-compact-d", 19167, index=2)
+        with without_commit_drain():
+            for _ in range(2):
+                with transaction.atomic():
+                    enqueue(other, "vlan")
+        clock = [0.0]
+        unconsumed = drain._unconsumed
+
+        def _read_key(device_id, scope):
+            # Reading the first key's entries uses the whole deadline on every tick.
+            if device_id == self.device.pk:
+                clock[0] = 100.0
+            return unconsumed(device_id, scope)
+
+        rotation = {}
+        with (
+            patch("netbox_nso_plugin.drain._send_clock", lambda: clock[0]),
+            patch("netbox_nso_plugin.drain._unconsumed", _read_key),
+        ):
+            for _tick in range(2):
+                clock[0] = 0.0
+                drain.compact_intent_outbox(deadline=50.0, rotation=rotation)
+        self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=other, scope="vlan").count(), 1)
+
     def test_lock_waits_end_at_the_drain_s_deadline_so_the_sweep_keeps_its_share(self):
         from netbox_nso_plugin import jobs
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState

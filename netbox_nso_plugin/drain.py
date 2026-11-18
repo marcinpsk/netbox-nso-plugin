@@ -873,10 +873,12 @@ def _compactable(row, held) -> bool:
     )
 
 
-def compaction_candidates(limit=None, *, deadline=None, after=None) -> list[tuple[int, str]]:
+def compaction_candidates(limit=None, *, deadline=None, rotation=None) -> list[tuple[int, str]]:
     """Return keys with an eligible contiguous same-kind span, found before *deadline*.
 
-    The keys come in ``(device_id, scope)`` order, from the first key after *after*, and then from the start.
+    The keys come in ``(device_id, scope)`` order, from the first key after the one *rotation* (carried
+    between runs) names, and then from the start. Until discovery finds a candidate, *rotation* names
+    each key it reads, so that a pass whose discovery uses the deadline still moves on.
     """
     from django.db.models import Count, Q
 
@@ -893,6 +895,7 @@ def compaction_candidates(limit=None, *, deadline=None, after=None) -> list[tupl
         .order_by("device_id", "scope")
     )
     keys = grouped.iterator()
+    after = (rotation or {}).get("compacted_after")
     if after is not None:
         later = Q(device_id__gt=after[0]) | Q(device_id=after[0], scope__gt=after[1])
         keys = itertools.chain(grouped.filter(later).iterator(), grouped.exclude(later).iterator())
@@ -900,6 +903,8 @@ def compaction_candidates(limit=None, *, deadline=None, after=None) -> list[tupl
     for device_id, scope, _rows in keys:
         if _past(deadline):
             break
+        if rotation is not None and not candidates:
+            rotation["compacted_after"] = [device_id, scope]
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).only("claim_deletions").first()
         held = {int(record["route_id"]) for record in (state.claim_deletions or [])} if state is not None else set()
         previous_kind = None
@@ -2071,9 +2076,7 @@ def _compact_intent_outbox(limit=None, *, deadline=None, rotation=None) -> None:
 
     *rotation* (carried between runs) keeps the last key the pass reached, and the next pass starts after it.
     """
-    after = (rotation or {}).get("compacted_after")
-    candidates = compaction_candidates(limit, deadline=deadline, after=None if after is None else tuple(after))
-    for index, (device_id, scope) in enumerate(candidates):
+    for index, (device_id, scope) in enumerate(compaction_candidates(limit, deadline=deadline, rotation=rotation)):
         # Discovery shares the deadline, so a pass that found a key compacts at least that key.
         if index and _past(deadline):
             break
