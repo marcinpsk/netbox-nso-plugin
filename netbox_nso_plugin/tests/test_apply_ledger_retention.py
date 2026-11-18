@@ -288,6 +288,13 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(self.adapter.store.feed_requests, [])
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
 
+    @staticmethod
+    def _cursor_after(attempt):
+        from netbox_nso_plugin.apply_retention import _expired_attempts
+
+        retention_at = _expired_attempts(timezone.now()).values_list("retention_at", flat=True).get(pk=attempt.pk)
+        return f"{retention_at.isoformat()}|{attempt.pk}"
+
     def test_an_expired_deadline_stops_before_the_next_device_read_and_keeps_its_place(self):
         from netbox_nso_plugin.apply_retention import prune_apply_ledger
 
@@ -296,10 +303,13 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.adapter.store.add_device(nso_instance="placeholder", nso_device_name="placeholder-3", device_id=1769)
         first, _execution = self.history(days=33)
         later, _execution = self.history(days=32, management=other)
+        cursor = self._cursor_after(first)
 
         result = prune_apply_ledger(execute=True, deadline=0.0)
 
         self.assertEqual((result.examined, result.deleted, result.adapter_unavailable), (1, 1, False))
+        # A restart from the beginning would also find the later attempt, so check the cursor itself.
+        self.assertEqual(result.next_cursor, cursor)
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=first.pk).exists())
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
         resumed = prune_apply_ledger(execute=True, cursor=result.next_cursor)
@@ -311,10 +321,12 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
 
         first, _execution = self.history(days=33)
         later, _execution = self.history(days=32)
+        cursor = self._cursor_after(first)
 
         result = prune_apply_ledger(execute=True, deadline=0.0)
 
         self.assertEqual((result.examined, result.deleted, result.adapter_unavailable), (1, 1, False))
+        self.assertEqual(result.next_cursor, cursor)
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=first.pk).exists())
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
         resumed = prune_apply_ledger(execute=True, cursor=result.next_cursor)
