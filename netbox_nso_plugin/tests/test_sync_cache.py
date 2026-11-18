@@ -409,29 +409,25 @@ class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
             NSODeviceManagement.objects.bulk_create([row])
         return NSODeviceManagement.objects.get(pk=row.pk)
 
-    def test_stale_error_mirror_does_not_abort_the_cache_sweep(self):
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+    def test_a_concurrent_edit_during_the_error_flag_does_not_abort_the_cache_sweep(self):
+        from netbox_nso_plugin import signals
         from netbox_nso_plugin.sync_cache import refresh_sync_caches
 
         first = self._mgmt("cache-race-first", 196)
         second = self._mgmt("cache-race-second", 197)
-        original_build = RendererMutationPlan.build
-        plan_staled = False
+        real_start = signals._start_link_attempt
+        edited = []
 
-        def build_then_stale(*args, **kwargs):
-            nonlocal plan_staled
-            proposed_save = next(iter(kwargs.get("saves", ())), None)
-            plan = original_build(*args, **kwargs)
-            if not plan_staled and proposed_save is not None and proposed_save.instance.pk == first.pk:
-                plan_staled = True
+        def edit_then_start(instance):
+            if instance.pk == first.pk and not edited:
+                edited.append(True)
                 in_thread(lambda: NSODeviceManagement.objects.filter(pk=first.pk).update(last_sync_status="concurrent"))
-            return plan
+            return real_start(instance)
 
         errors = []
         with (
             patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
-            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale),
-            self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING") as captured,
+            patch.object(signals, "_start_link_attempt", side_effect=edit_then_start),
         ):
             try:
                 result = refresh_sync_caches(NSODeviceManagement.objects.order_by("-pk"))
@@ -441,11 +437,12 @@ class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
 
         self.assertEqual(errors, [], f"the cache sweep raised {errors!r}")
         self.assertEqual(result, (2, 0))
-        self.assertTrue(any(f"management row {first.pk}" in message for message in captured.output))
+        self.assertEqual(edited, [True], "the concurrent edit did not run")
         first.refresh_from_db()
         second.refresh_from_db()
+        # The flag writes its own fields under the row lock, so the concurrent edit stands beside it.
         self.assertEqual(first.last_sync_status, "concurrent")
-        self.assertEqual(first.adapter_link_error, "")
+        self.assertTrue(first.adapter_link_error)
         self.assertTrue(second.adapter_link_error)
 
     def test_stale_error_mirror_is_not_reported_as_updated(self):

@@ -335,16 +335,16 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
     def test_a_lock_wait_timeout_on_one_device_retains_only_that_device(self):
         from netbox_nso_plugin.apply_retention import prune_apply_ledger
 
-        from .test_system_job_deadlines import _HeldRowLock, _short_lock_timeout
+        from ._outbox_case import HeldRowLock, short_lock_timeout
 
         _device, other = make_managed("ledger-retention-locked", 1770, index=2)
         other.refresh_from_db()
         self.adapter.store.add_device(nso_instance="placeholder", nso_device_name="placeholder-4", device_id=1770)
         held, _execution = self.history(days=33)
         removable, _execution = self.history(days=32, management=other)
-        _short_lock_timeout(self)
+        short_lock_timeout(self)
 
-        with self.assertLogs("netbox_nso_plugin.jobs", level="WARNING"), _HeldRowLock(self.management):
+        with self.assertLogs("netbox_nso_plugin.jobs", level="WARNING"), HeldRowLock(self.management):
             result = prune_apply_ledger(execute=True)
 
         self.assertEqual((result.examined, result.deleted), (2, 1))

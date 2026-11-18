@@ -25,7 +25,14 @@ from django.utils import timezone
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._candidate_render_case import ACCEPTED_AT
-from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
+from ._outbox_case import (
+    HeldRowLock,
+    content_bulk_update,
+    in_thread,
+    mirror_update,
+    short_lock_timeout,
+    wait_until_postgres_blocks,
+)
 from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
@@ -1214,6 +1221,10 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 self.assertLogs("netbox_nso_plugin.signals", level="WARNING"),
             ):
                 _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+                recorded = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                self.assertEqual(
+                    (recorded.adapter_link_error, recorded.adapter_link_outcome_attempt), ("adapter unavailable", 1)
+                )
                 older_recorded.set()
                 newer.join(10)
         finally:
@@ -1266,6 +1277,97 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_an_attempt_number_that_cannot_be_taken_is_logged_and_does_not_reach_the_saver(self):
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        short_lock_timeout(self)
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+            self.assertLogs("netbox_nso_plugin.signals", level="ERROR") as logs,
+            HeldRowLock(self.mgmt),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        set_scope.assert_not_called()
+        self.assertTrue(any("Could not start an adapter link attempt" in line for line in logs.output), logs.output)
+
+    def test_a_success_that_cannot_be_recorded_is_logged_and_not_recorded_as_a_link_failure(self):
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        holders = []
+
+        def notify(_device_id):
+            # An operator edit takes the row after the adapter work, before the success record.
+            holder = HeldRowLock(self.mgmt)
+            holder.__enter__()
+            holders.append(holder)
+
+        short_lock_timeout(self)
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+                self.assertLogs("netbox_nso_plugin.signals", level="ERROR") as logs,
+            ):
+                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+        finally:
+            for holder in holders:
+                holder.__exit__(None, None, None)
+
+        self.assertTrue(any("Could not record the adapter link outcome" in line for line in logs.output), logs.output)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_control_push_that_sent_nothing_records_no_outcome(self):
+        from dcim.models import Device
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+        address = IPAddress.objects.create(address="192.0.2.77/32")
+        real_footprint = management_lifecycle._control_footprint
+
+        def footprint_then_new_primary(device_id):
+            footprint = real_footprint(device_id)
+            # The device gets a new primary address after the push read its lock footprint.
+            in_thread(lambda: Device.objects.filter(pk=self.device.pk).update(primary_ip4=address))
+            return footprint
+
+        with (
+            patch.object(management_lifecycle, "_control_footprint", side_effect=footprint_then_new_primary),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        set_scope.assert_not_called()
+        notify.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "an earlier failure")
+
+    def test_a_link_sweep_warning_written_during_the_link_is_kept(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        warning = "Adapter identity is ambiguous; repair requires operator action."
+
+        def notify(_device_id):
+            # The link sweep finds an ambiguous identity after the notification.
+            in_thread(lambda: sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning))
+
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, warning)
 
     def test_a_stale_full_save_does_not_restore_an_error_a_later_attempt_cleared(self):
         from netbox_nso_plugin import signals

@@ -1257,12 +1257,12 @@ class TestAHeldTombstoneDoesNotStopTheFleetSweep(_CascadeFlushMixin, Transaction
         from netbox_nso_plugin.models import NSOProvisionTombstone
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
-        from .test_system_job_deadlines import _HeldRowLock, _short_lock_timeout
+        from ._outbox_case import HeldRowLock, short_lock_timeout
 
         held = self._offboarded("provision-held", age=timedelta(hours=2))
         behind = self._offboarded("provision-behind", age=timedelta(hours=1))
-        _short_lock_timeout(self)
-        with _HeldRowLock(held), self.assertLogs("netbox_nso_plugin", level="WARNING"):
+        short_lock_timeout(self)
+        with HeldRowLock(held), self.assertLogs("netbox_nso_plugin", level="WARNING"):
             checked, closed = sweep_provision_tombstones()
 
         self.assertEqual((checked, closed), (2, 1))

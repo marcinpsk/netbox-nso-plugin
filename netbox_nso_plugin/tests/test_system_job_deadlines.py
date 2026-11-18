@@ -25,10 +25,12 @@ from django.utils import timezone
 
 from ._adapter_http import patch_matching_control_state
 from ._outbox_case import (
+    HeldRowLock,
     ReceiptAdapter,
     enqueue,
     make_managed,
     reset_renderer_audit_rotation,
+    short_lock_timeout,
     system_job,
     without_commit_drain,
 )
@@ -40,38 +42,6 @@ def _add_interfaces(device, count, start=0):
         Interface.objects.bulk_create(
             [Interface(device=device, name=f"et-0/0/{index}", type="1000base-t") for index in range(start, count)]
         )
-
-
-class _HeldRowLock:
-    """Hold FOR UPDATE on one row from a second connection, as an operator edit does."""
-
-    def __init__(self, row):
-        self.row = row
-        self.release = threading.Event()
-        self.held = threading.Event()
-        self.pid = None
-        self.thread = threading.Thread(target=self._hold, daemon=True)
-
-    def _hold(self):
-        try:
-            with transaction.atomic():
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_backend_pid()")
-                    self.pid = cursor.fetchone()[0]
-                list(type(self.row).objects.select_for_update(of=("self",)).filter(pk=self.row.pk).order_by())
-                self.held.set()
-                self.release.wait(30)
-        finally:
-            connection.close()
-
-    def __enter__(self):
-        self.thread.start()
-        assert self.held.wait(10), "the holder never took the row lock"
-        return self
-
-    def __exit__(self, *exc):
-        self.release.set()
-        self.thread.join(10)
 
 
 def _rq_test_queue(test_case):
@@ -91,17 +61,6 @@ def _rq_test_queue(test_case):
 
     test_case.addCleanup(delete)
     return queue
-
-
-def _short_lock_timeout(test_case):
-    with connection.cursor() as cursor:
-        cursor.execute("SET lock_timeout = '2s'")
-
-    def reset():
-        with connection.cursor() as cursor:
-            cursor.execute("SET lock_timeout = 0")
-
-    test_case.addCleanup(reset)
 
 
 class TestPushBookkeepingLocksOnlyTheManagementRow(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -132,8 +91,8 @@ class TestPushBookkeepingLocksOnlyTheManagementRow(_CascadeFlushMixin, IntentPus
         from netbox_nso_plugin import signals
 
         _add_interfaces(self.device, 3)
-        _short_lock_timeout(self)
-        with _HeldRowLock(Interface.objects.filter(device=self.device).first()):
+        short_lock_timeout(self)
+        with HeldRowLock(Interface.objects.filter(device=self.device).first()):
             attempt = signals._allocate_push_attempt(self.device.pk, "vlan")
 
         self.assertEqual(attempt, 1)
@@ -146,8 +105,8 @@ class TestPushBookkeepingLocksOnlyTheManagementRow(_CascadeFlushMixin, IntentPus
 
         _add_interfaces(self.device, 3)
         attempt = signals._allocate_push_attempt(self.device.pk, "vlan")
-        _short_lock_timeout(self)
-        with _HeldRowLock(Interface.objects.filter(device=self.device).first()):
+        short_lock_timeout(self)
+        with HeldRowLock(Interface.objects.filter(device=self.device).first()):
             signals._record_push_outcome(self.device.pk, "vlan", attempt, AdapterError("refused", code="refused"))
 
         self.management.refresh_from_db()
@@ -334,7 +293,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             contextlib.ExitStack() as stack,
         ):
             for row in held:
-                stack.enter_context(_HeldRowLock(row))
+                stack.enter_context(HeldRowLock(row))
             for _run in range(runs):
                 system_job(jobs.RefreshDeviceSyncCacheJob).run()
                 if after_each is not None:
@@ -394,13 +353,13 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         def mirror(mgmt, **values):
             if not connection.in_atomic_block:
                 # The repair rolled back its stamp. An operator edit now holds the row.
-                holder = _HeldRowLock(NSODeviceManagement.objects.get(pk=mgmt.pk))
+                holder = HeldRowLock(NSODeviceManagement.objects.get(pk=mgmt.pk))
                 holder.__enter__()
                 holders.append(holder)
             return real_mirror(mgmt, **values)
 
         rotation = {}
-        _short_lock_timeout(self)
+        short_lock_timeout(self)
         try:
             with (
                 # The adapter no longer lists the device, so its mapping is broken.
@@ -457,13 +416,13 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             return real_drain_key(device_id, scope, **kwargs)
 
         rotation = {}
-        _short_lock_timeout(self)
+        short_lock_timeout(self)
         with (
             patch.object(_SlowAdapter, "DELAY", 0),
             patch.object(drain, "drain_key", side_effect=record),
             self.assertLogs("netbox_nso_plugin.drain", level="ERROR"),
-            _HeldRowLock(held[0]),
-            _HeldRowLock(held[1]),
+            HeldRowLock(held[0]),
+            HeldRowLock(held[1]),
         ):
             for _pass in range(3):
                 drain.drain_intent_outbox(limit=1, deadline=time.monotonic() + 30, rotation=rotation)
@@ -483,13 +442,13 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         def fail_then_hold(device_id, scope, **_kwargs):
             # The key's drain fails, and an operator edit then takes its state row.
-            holder = _HeldRowLock(state)
+            holder = HeldRowLock(state)
             holder.__enter__()
             holders.append(holder)
             raise RuntimeError("render failed")
 
         rotation = {}
-        _short_lock_timeout(self)
+        short_lock_timeout(self)
         try:
             with (
                 patch.object(drain, "drain_key", side_effect=fail_then_hold),
@@ -523,12 +482,12 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             return real_drain_key(device_id, scope, **kwargs)
 
         rotation = {}
-        _short_lock_timeout(self)
+        short_lock_timeout(self)
         with (
             patch.object(_SlowAdapter, "DELAY", 0),
             patch.object(drain, "drain_key", side_effect=drain_or_overrun),
             self.assertLogs("netbox_nso_plugin.drain", level="ERROR"),
-            _HeldRowLock(held),
+            HeldRowLock(held),
             self.assertRaises(jobs._RunTimedOut),
         ):
             drain.drain_intent_outbox(deadline=time.monotonic() + 30, rotation=rotation)
@@ -547,7 +506,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         def mirror(mgmt, **values):
             if mgmt.pk == first.pk and not connection.in_atomic_block:
                 # The repair rolled back its stamp. An operator edit now holds the row.
-                holder = _HeldRowLock(NSODeviceManagement.objects.get(pk=mgmt.pk))
+                holder = HeldRowLock(NSODeviceManagement.objects.get(pk=mgmt.pk))
                 holder.__enter__()
                 holders.append(holder)
             return real_mirror(mgmt, **values)
@@ -559,7 +518,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             raise jobs._RunTimedOut
 
         rotation = {}
-        _short_lock_timeout(self)
+        short_lock_timeout(self)
         try:
             with (
                 # The adapter no longer lists the devices, so their mappings are broken.
@@ -622,7 +581,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
                 side_effect=lambda **_kwargs: swept.append(True) or (0, 0),
             ),
             self.assertLogs("netbox_nso_plugin.jobs", level="WARNING") as logs,
-            _HeldRowLock(management),
+            HeldRowLock(management),
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
@@ -646,7 +605,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
                 side_effect=lambda **_kwargs: swept.append(True) or (0, 0),
             ),
             self.assertLogs("netbox_nso_plugin.jobs", level="WARNING") as logs,
-            _HeldRowLock(management),
+            HeldRowLock(management),
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
@@ -667,8 +626,8 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
             patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
-            _HeldRowLock(first),
-            _HeldRowLock(second),
+            HeldRowLock(first),
+            HeldRowLock(second),
         ):
             for _tick in range(2):
                 system_job(jobs.RefreshDeviceSyncCacheJob).run()
@@ -786,7 +745,7 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
             patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", side_effect=sweep),
             # The compaction and the claim of this key each wait on the held state row.
-            _HeldRowLock(state),
+            HeldRowLock(state),
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
@@ -808,7 +767,7 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
             patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
             patch("netbox_nso_plugin.sync_cache.reconcile_device_links", return_value=(0, 0)),
             self.assertLogs("netbox_nso_plugin.drain", level="ERROR") as logs,
-            _HeldRowLock(state),
+            HeldRowLock(state),
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
             elapsed = time.monotonic() - started
@@ -969,7 +928,7 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
 
         held = Job.objects.create(name="nso-test-held-row", job_id=uuid4())
         started = time.monotonic()
-        with _HeldRowLock(held), self.assertRaises(OperationalError) as caught:
+        with HeldRowLock(held), self.assertRaises(OperationalError) as caught:
             with jobs.lock_waits_until(time.monotonic() + 1):
                 Job.objects.filter(pk=held.pk).update(error="held")
         self.assertLess(time.monotonic() - started, 5)
@@ -1211,7 +1170,7 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
                 except Exception:  # noqa: BLE001
                     pass
 
-        with _HeldRowLock(held):
+        with HeldRowLock(held):
             job, elapsed, successors = self._overrun(tick)
 
         self.assertLess(elapsed, 4, "the run went on after RQ's timeout")

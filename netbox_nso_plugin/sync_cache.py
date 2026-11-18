@@ -263,9 +263,16 @@ def _refresh_row(mgmt, by_id, by_identity) -> int:
 
 
 def _flag_link_error(mgmt, message) -> None:
-    """Record an operator-visible link error without firing the post_save adapter push."""
+    """Record an operator-visible link error without firing the post_save adapter push.
+
+    It takes a link attempt number, so that a link callback that started earlier cannot clear it.
+    """
+    from .signals import _record_link_error, _start_link_attempt
+
     if mgmt.adapter_link_error != message:
-        _mirror_management(mgmt, adapter_link_error=message)
+        attempt = _start_link_attempt(mgmt)
+        if attempt is not None:
+            _record_link_error(mgmt, attempt, message)
 
 
 def _broken_links(mapped, by_id, by_identity) -> list[tuple]:

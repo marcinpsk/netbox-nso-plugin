@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.db import transaction
+from django.db import connection, transaction
 
 from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.outbox import CONTRIBUTION_KIND_ORDINARY
@@ -745,3 +745,47 @@ class ReceiptAdapter:
         """Seed what the device already carries, which a push may only narrow when marked."""
         self.on_device.setdefault(adapter_device_id, set()).update(members)
         self._owned.setdefault(adapter_device_id, set()).update(members)
+
+
+class HeldRowLock:
+    """Hold FOR UPDATE on one row from a second connection, as an operator edit does."""
+
+    def __init__(self, row):
+        self.row = row
+        self.release = threading.Event()
+        self.held = threading.Event()
+        self.pid = None
+        self.thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self):
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    self.pid = cursor.fetchone()[0]
+                list(type(self.row).objects.select_for_update(of=("self",)).filter(pk=self.row.pk).order_by())
+                self.held.set()
+                self.release.wait(30)
+        finally:
+            connection.close()
+
+    def __enter__(self):
+        self.thread.start()
+        assert self.held.wait(10), "the holder never took the row lock"
+        return self
+
+    def __exit__(self, *exc):
+        self.release.set()
+        self.thread.join(10)
+
+
+def short_lock_timeout(test_case):
+    """Make this connection's lock waits end after two seconds, until the test ends."""
+    with connection.cursor() as cursor:
+        cursor.execute("SET lock_timeout = '2s'")
+
+    def reset():
+        with connection.cursor() as cursor:
+            cursor.execute("SET lock_timeout = 0")
+
+    test_case.addCleanup(reset)
