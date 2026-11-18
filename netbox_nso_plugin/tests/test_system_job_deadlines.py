@@ -191,6 +191,20 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
         self.assertGreater(self._unconsumed(device), 0)
         self.assertGreater(len(self.adapter.requests), 0)
 
+    def test_a_long_audit_budget_still_gives_each_repair_send_the_send_deadline_at_most(self):
+        from netbox_nso_plugin import delivery, drain, renderer_audit
+
+        device, _management = make_managed("job-deadline-audit-cap", 19176)
+        with without_commit_drain():
+            with transaction.atomic():
+                enqueue(device, "vlan")
+
+        with patch.object(_SlowAdapter, "DELAY", 0), patch.object(delivery, "send", wraps=delivery.send) as send:
+            renderer_audit._drain_repaired(device.pk, ("vlan",), renderer_audit._monotonic() + 230)
+
+        self.assertEqual(self._unconsumed(device), 0)
+        self.assertLessEqual(send.call_args.kwargs["deadline"], drain.SEND_DEADLINE.total_seconds())
+
 
 class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
     def test_a_slow_adapter_defers_the_outbox_tail_and_the_sweep_still_runs(self):
