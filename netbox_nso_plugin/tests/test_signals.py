@@ -1127,7 +1127,9 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
             # A newer attempt started and recorded its outcome.
             in_thread(
                 lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
-                    adapter_link_attempt=F("adapter_link_attempt") + 1, adapter_link_error=value
+                    adapter_link_attempt=F("adapter_link_attempt") + 1,
+                    adapter_link_outcome_attempt=F("adapter_link_attempt") + 1,
+                    adapter_link_error=value,
                 )
             )
 
@@ -1240,6 +1242,25 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
             patch.object(signals, "_start_link_attempt", side_effect=older_records_first),
             patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
             patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_later_attempt_that_records_nothing_does_not_block_an_earlier_success(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def notify(_device_id):
+            # A later attempt takes its number, then stops without an outcome (a stale mapping).
+            in_thread(lambda: signals._start_link_attempt(NSODeviceManagement.objects.get(pk=self.mgmt.pk)))
+
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
         ):
             signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
 

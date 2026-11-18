@@ -678,6 +678,7 @@ _MANAGEMENT_MIRROR_FIELDS = frozenset(
         "adapter_link_error",
         "adapter_link_attempted_at",
         "adapter_link_attempt",
+        "adapter_link_outcome_attempt",
         "settle_cursor_seq",
         "settle_cursor_incarnation",
         "settle_cursor_device_id",
@@ -930,25 +931,24 @@ def _start_link_attempt(instance) -> int | None:
 
 
 def _record_link_error(instance, attempt, message):
-    """Record this attempt's link outcome unless a later attempt has started since."""
+    """Record this attempt's link outcome unless an attempt that started later has recorded its own."""
     from django.db import transaction
 
     with transaction.atomic():
         locked = _locked_link_attempt(instance)
-        if locked is None or locked[0] != attempt:
+        if locked is None or locked[1] >= attempt:
             logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
             return
-        if locked[1] != message:
-            _update_management_mirror(instance, adapter_link_error=message)
+        _update_management_mirror(instance, adapter_link_error=message, adapter_link_outcome_attempt=attempt)
 
 
 def _locked_link_attempt(instance):
-    """Lock the management row and return its ``(adapter_link_attempt, adapter_link_error)``, or None."""
+    """Lock the management row and return its ``(adapter_link_attempt, adapter_link_outcome_attempt)``, or None."""
     return (
         type(instance)
         .objects.select_for_update(of=("self",))
         .filter(pk=instance.pk)
-        .values_list("adapter_link_attempt", "adapter_link_error")
+        .values_list("adapter_link_attempt", "adapter_link_outcome_attempt")
         .first()
     )
 
