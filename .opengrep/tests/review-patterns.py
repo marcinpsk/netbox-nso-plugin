@@ -3791,6 +3791,28 @@ class _RotationInFinallyJob(_PluginSystemJob):
             # ruleid: nso-system-job-carry-in-finally
             self.carry("fleet_rotation", rotation)
 
+    def tick_with_bare_handler_and_else(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            result = audit_renderer_fleet(rotation=rotation)
+        except:  # noqa: E722
+            return None
+        else:
+            return result
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
+    def tick_with_bare_handler(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            return audit_renderer_fleet(rotation=rotation)
+        except:  # noqa: E722
+            return None
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
     def tick_saving_in_else(self):
         rotation = self.carried("fleet_rotation") or {}
         try:
