@@ -502,6 +502,81 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[device.pk, "vlan"]])
 
+    def test_a_drain_lock_skip_stays_in_the_rotation_when_a_later_key_overruns(self):
+        from netbox_nso_plugin import drain, jobs
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        devices = [
+            make_managed(f"job-deadline-drain-overrun-{index}", 19186 + index, index=index)[0] for index in range(2)
+        ]
+        with without_commit_drain():
+            for device in devices:
+                with transaction.atomic():
+                    enqueue(device, "vlan")
+        held = NSOIntentOutboxState.objects.create(device=devices[0], scope="vlan")
+        real_drain_key = drain.drain_key
+
+        def drain_or_overrun(device_id, scope, **kwargs):
+            if device_id == devices[1].pk:
+                # RQ's alarm, as the job's timeout handler raises it.
+                raise jobs._RunTimedOut
+            return real_drain_key(device_id, scope, **kwargs)
+
+        rotation = {}
+        _short_lock_timeout(self)
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch.object(drain, "drain_key", side_effect=drain_or_overrun),
+            self.assertLogs("netbox_nso_plugin.drain", level="ERROR"),
+            _HeldRowLock(held),
+            self.assertRaises(jobs._RunTimedOut),
+        ):
+            drain.drain_intent_outbox(deadline=time.monotonic() + 30, rotation=rotation)
+
+        self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[devices[0].pk, "vlan"]])
+
+    def test_a_repair_lock_skip_stays_in_the_rotation_when_a_later_row_overruns(self):
+        from netbox_nso_plugin import jobs, sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        _first_device, first = make_managed("job-deadline-relink-overrun-a", 19188)
+        _second_device, second = make_managed("job-deadline-relink-overrun-b", 19189, index=2)
+        real_mirror = sync_cache._mirror_management
+        holders = []
+
+        def mirror(mgmt, **values):
+            if mgmt.pk == first.pk and not connection.in_atomic_block:
+                # The repair rolled back its stamp. An operator edit now holds the row.
+                holder = _HeldRowLock(NSODeviceManagement.objects.get(pk=mgmt.pk))
+                holder.__enter__()
+                holders.append(holder)
+            return real_mirror(mgmt, **values)
+
+        def fail_then_overrun(device_id):
+            if device_id == first.device_id:
+                raise RuntimeError("repair failed")
+            # RQ's alarm, as the job's timeout handler raises it.
+            raise jobs._RunTimedOut
+
+        rotation = {}
+        _short_lock_timeout(self)
+        try:
+            with (
+                # The adapter no longer lists the devices, so their mappings are broken.
+                patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+                patch.object(sync_cache, "_mirror_management", side_effect=mirror),
+                patch.object(sync_cache, "invalidate_delivery_baselines", side_effect=fail_then_overrun),
+                self.assertLogs("netbox_nso_plugin.sync_cache", level="ERROR"),
+                self.assertRaises(jobs._RunTimedOut),
+            ):
+                sync_cache.reconcile_device_links([first, second], rotation=rotation)
+        finally:
+            for holder in holders:
+                holder.__exit__(None, None, None)
+
+        self.assertEqual(len(holders), 1, "the fallback stamp did not run")
+        self.assertEqual(list(rotation["lock_skipped"]), [str(first.pk)])
+
     def test_a_refresh_that_uses_its_whole_share_still_leaves_the_link_repair_its_own(self):
         from netbox_nso_plugin import jobs
 

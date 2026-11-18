@@ -368,6 +368,12 @@ def reconcile_device_links(  # noqa: C901
         )
     )
 
+    def skip(pk):
+        # In the carried rotation at once, so that the run's timeout recovery records it too.
+        skipped[pk] = now
+        if rotation is not None:
+            rotation["lock_skipped"] = {str(key): at.isoformat() for key, at in skipped.items()}
+
     attempted = 0
     for index, (mgmt, state, adapter_device) in enumerate(broken):
         if deadline is not None and time.monotonic() >= deadline:
@@ -456,7 +462,7 @@ def reconcile_device_links(  # noqa: C901
             continue
         except Exception as exc:  # noqa: BLE001 — one bad row must not abort the sweep
             if lock_wait_timed_out(exc):
-                skipped[mgmt.pk] = now
+                skip(mgmt.pk)
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue
         finally:
@@ -467,7 +473,7 @@ def reconcile_device_links(  # noqa: C901
                     _mirror_management(mgmt, adapter_link_attempted_at=now)
                 except Exception as exc:  # noqa: BLE001 — a stamp failure must not abort the sweep
                     if lock_wait_timed_out(exc):
-                        skipped[mgmt.pk] = now
+                        skip(mgmt.pk)
                     logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
     if rotation is not None:
         rotation["lock_skipped"] = {str(pk): at.isoformat() for pk, at in skipped.items()}

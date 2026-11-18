@@ -2103,6 +2103,14 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
     limit = DRAIN_BATCH if limit is None else limit
     ordered = _ordered_candidates(limit, skipped)
     candidates = ordered[:limit]
+    pending = set(ordered)
+
+    def keep_skips():
+        # A skip outside this batch still orders its key next time. Keys that no longer owe a send drop out.
+        # Kept at each skip, so that the run's timeout recovery records it too.
+        if rotation is not None:
+            rotation["lock_skipped"] = [[*key, at.isoformat()] for key, at in skipped.items() if key in pending]
+
     for index, (device_id, scope) in enumerate(candidates):
         remaining = None if deadline is None else deadline - _send_clock()
         if remaining is not None and remaining <= 0:
@@ -2119,16 +2127,14 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
             # After a lock timeout, the stamp would wait on the same row.
             if lock_wait_timed_out(exc) or not _restamp_attempt(device_id, scope):
                 skipped[(device_id, scope)] = datetime.datetime.now(tz=datetime.UTC)
+                keep_skips()
             failed += 1
             continue
         if outcome == SUCCEEDED:
             drained += 1
         elif outcome in (FAILED, UNACKNOWLEDGED):
             failed += 1
-    if rotation is not None:
-        # A skip outside this batch still orders its key next time. Keys that no longer owe a send drop out.
-        pending = set(ordered)
-        rotation["lock_skipped"] = [[*key, at.isoformat()] for key, at in skipped.items() if key in pending]
+    keep_skips()
     return drained, failed
 
 
