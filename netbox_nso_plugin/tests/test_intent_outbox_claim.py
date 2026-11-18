@@ -657,6 +657,59 @@ class TestOffboardingAbandonsTheClaim(_ClaimCase):
         assert entries(self.device, "static_route", unconsumed=True)
 
 
+class TestTheSendBudgetFollowsTheRevocationScan(_ClaimCase):
+    """The transport gets what is left of the drain's deadline after the pre-send scan."""
+
+    tag = "scan"
+    adapter_device_id = 7508
+
+    def _drain_with_a_slow_scan(self, scan_seconds):
+        from netbox_nso_plugin import delivery, drain
+
+        route = own_route(self.mgmt, "198.51.100.32/28", "198.51.100.3")
+        with without_commit_drain():
+            _unassign_and_retire(route, self.device)
+        clock = [100.0]
+        real_scan = drain.revocation_hit
+
+        def slow_scan(claim):
+            hit = real_scan(claim)
+            clock[0] += scan_seconds
+            return hit
+
+        config, session = self.adapter.patches()
+        with (
+            config,
+            session,
+            patch("netbox_nso_plugin.drain._send_clock", new=lambda: clock[0]),
+            patch.object(drain, "revocation_hit", side_effect=slow_scan) as scan,
+            patch.object(delivery, "send", wraps=delivery.send) as send,
+        ):
+            outcome = drain.drain_key(self.device.pk, "static_route", deadline=10)
+        scan.assert_called_once()
+        return outcome, send
+
+    def test_the_send_gets_the_time_left_after_the_scan(self):
+        from netbox_nso_plugin import drain
+
+        outcome, send = self._drain_with_a_slow_scan(7)
+
+        assert outcome == drain.SUCCEEDED
+        assert send.call_args.kwargs["deadline"] == 3
+
+    def test_a_scan_that_uses_the_whole_deadline_keeps_the_claim_for_replay(self):
+        from netbox_nso_plugin import drain
+
+        outcome, send = self._drain_with_a_slow_scan(12)
+
+        assert outcome == drain.FAILED
+        send.assert_not_called()
+        assert self.adapter.requests == []
+        row = state_of(self.device, "static_route")
+        assert row.push_seq is not None
+        assert row.last_error_code == "nso_send_deadline"
+
+
 class TestControlOutcomesCannotCollideWithAdapterAnswers(_ClaimCase):
     tag = "answer"
     adapter_device_id = 7509

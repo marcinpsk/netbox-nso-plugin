@@ -936,8 +936,8 @@ def revocation_hit(claim: Claim) -> bool:
     return False
 
 
-def send_claim(claim: Claim, *, deadline=None):
-    """Make the claim's HTTP call and return the adapter's answer.
+def send_claim(claim: Claim, *, deadline_at=None):
+    """Make the claim's HTTP call before the monotonic *deadline_at*, and return the adapter's answer.
 
     Returns a private control sentinel when the device is no longer managed or the pre-send
     scan found a revocation, in both cases without sending. Parking is not a
@@ -962,7 +962,8 @@ def send_claim(claim: Claim, *, deadline=None):
         deletions=claim.deletions,
         marking_mode=claim.marking_mode,
         push_seq=claim.push_seq,
-        deadline=SEND_DEADLINE.total_seconds() if deadline is None else deadline,
+        # Measured after the scan, which can wait on the state-row lock.
+        deadline=_remaining_send_deadline(deadline_at),
     )
 
 
@@ -1609,7 +1610,7 @@ def _drain_once(
     if claimed is None:
         return NOTHING, None
     try:
-        answer = send_claim(claimed, deadline=_remaining_send_deadline(_deadline_at))
+        answer = send_claim(claimed, deadline_at=_deadline_at)
     except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
         return _send_failure_outcome(claimed, exc), None
     if answer is _ABANDONED_SEND and reform > 0:
