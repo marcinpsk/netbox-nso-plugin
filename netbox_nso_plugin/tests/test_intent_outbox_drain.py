@@ -228,7 +228,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
             result = drain._drain_intent_outbox()
 
         assert result == (0, 0)
-        compact.assert_called_once_with(None, deadline=None)
+        compact.assert_called_once_with(None, deadline=None, rotation=None)
         guarded_compact.assert_not_called()
         drain_key.assert_called_once_with(1, "vlan", deadline=None)
         restamp.assert_not_called()
