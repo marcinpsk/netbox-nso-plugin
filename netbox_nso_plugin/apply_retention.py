@@ -43,10 +43,15 @@ class PruneResult:
     deleted: int
     next_cursor: str | None
     adapter_unavailable: bool = False
+    request_limit_reached: bool = False
 
 
 class _AdapterUnavailable(Exception):
     """The adapter cannot answer for any device."""
+
+
+class _RequestLimitReached(Exception):
+    """The run's time limit for adapter requests has passed."""
 
 
 def _valid_execution_evidence(execution, attempt):
@@ -185,6 +190,8 @@ def _remote_generations(management_id):
         adapter_client.raise_evidence_errors(unreleased)
         _page, final_incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
     except adapter_client.AdapterError as exc:
+        if exc.code == "request_limit":
+            raise _RequestLimitReached from exc
         if exc.code in ADAPTER_DOWN_CODES:
             raise _AdapterUnavailable from exc
         logger.warning(
@@ -294,15 +301,22 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
     eligible = deleted = 0
     remote_by_management = {}
     examined = len(candidates)
-    expired = False
+    expired = limited = False
     for index, (attempt_id, management_id, _completed_at) in enumerate(candidates):
         # Only after the first candidate, so that every run makes progress.
         if index and deadline is not None and time.monotonic() >= deadline:
             examined, expired = index, True
             break
-        if management_id not in remote_by_management and not _read_remote(management_id, remote_by_management):
-            examined = index
-            break
+        if management_id not in remote_by_management:
+            try:
+                available = _read_remote(management_id, remote_by_management)
+            except _RequestLimitReached:
+                # Like the deadline: the cursor stays before this record, which no listing judged.
+                examined, limited = index, True
+                break
+            if not available:
+                examined = index
+                break
         remote = remote_by_management[management_id]
         if remote is None:
             continue
@@ -312,6 +326,13 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
             deleted += removed
     if examined < len(candidates):
         next_cursor = _resume_cursor(candidates, examined, cursor)
-        return PruneResult(examined, eligible, deleted, next_cursor, adapter_unavailable=not expired)
+        return PruneResult(
+            examined,
+            eligible,
+            deleted,
+            next_cursor,
+            adapter_unavailable=not (expired or limited),
+            request_limit_reached=limited,
+        )
     next_cursor = f"{candidates[-1][2].isoformat()}|{candidates[-1][0]}" if len(candidates) == batch_size else None
     return PruneResult(len(candidates), eligible, deleted, next_cursor)

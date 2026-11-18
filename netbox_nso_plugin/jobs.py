@@ -409,7 +409,12 @@ class PruneApplyLedgerJob(_PluginSystemJob):
                 result = prune_apply_ledger(execute=True, cursor=cursor, deadline=deadline)
                 cursor = result.next_cursor
                 self.carry("apply_ledger_cursor", cursor)
-                if result.adapter_unavailable or cursor is None or time.monotonic() >= deadline:
+                if (
+                    result.adapter_unavailable
+                    or result.request_limit_reached
+                    or cursor is None
+                    or time.monotonic() >= deadline
+                ):
                     return result
         except DeploymentQuiesced:
             logger.info("PruneApplyLedgerJob: paused for an intent deployment")
