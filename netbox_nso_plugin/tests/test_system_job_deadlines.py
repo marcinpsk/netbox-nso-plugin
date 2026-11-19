@@ -1245,8 +1245,11 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
 
         import requests
 
+        responding = threading.Event()
+
         class _Trickle(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
+                responding.set()
                 self.send_response(200)
                 self.send_header("Content-Length", "100")
                 self.end_headers()
@@ -1264,16 +1267,21 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         url = f"http://127.0.0.1:{server.server_address[1]}/"
+        # No proxy from the environment, and the real class: the suite blocks requests.Session.
+        session = requests.sessions.Session()
+        session.trust_env = False
+        self.addCleanup(session.close)
 
         def tick(_self):
             # One slow response per key, each under a broad handler, as the drain and the sweep run.
             stop = time.monotonic() + 6
             while time.monotonic() < stop:
                 with contextlib.suppress(Exception):
-                    requests.get(url, timeout=(1, 1))
+                    session.get(url, timeout=(1, 1))
 
         job, elapsed, successors = self._overrun(tick)
 
+        self.assertTrue(responding.is_set(), "no request reached the trickling server")
         self.assertLess(elapsed, 4, "the run went on after RQ's timeout")
         self.assertEqual(job.status, "errored")
         self.assertEqual(successors, 1)
