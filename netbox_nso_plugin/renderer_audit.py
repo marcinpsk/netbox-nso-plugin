@@ -448,6 +448,7 @@ def audit_renderer_scopes(
 def _drain_repaired(device_id, scopes, deadline) -> None:
     """Send each repaired key inside the audit deadline; the outbox tick sends the rest."""
     from . import drain
+    from .jobs import lock_waits_until
 
     for index, scope in enumerate(scopes):
         remaining = deadline - _monotonic()
@@ -459,7 +460,8 @@ def _drain_repaired(device_id, scopes, deadline) -> None:
             )
             return
         try:
-            drain.drain_key(device_id, scope, deadline=min(remaining, drain.SEND_DEADLINE.total_seconds()))
+            with lock_waits_until(deadline):
+                drain.drain_key(device_id, scope, deadline=min(remaining, drain.SEND_DEADLINE.total_seconds()))
         except Exception as exc:  # noqa: BLE001 (the outbox tick retries the key)
             logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
 

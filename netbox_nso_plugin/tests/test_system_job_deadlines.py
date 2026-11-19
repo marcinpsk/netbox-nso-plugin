@@ -183,6 +183,32 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(self._unconsumed(device), 0)
         self.assertLessEqual(send.call_args.kwargs["deadline"], drain.SEND_DEADLINE.total_seconds())
 
+    def test_a_held_outbox_row_does_not_hold_a_repair_send_past_the_audit_deadline(self):
+        from netbox_nso_plugin import renderer_audit
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        device, _management = make_managed("job-deadline-audit-lock", 19177)
+        with without_commit_drain():
+            with transaction.atomic():
+                enqueue(device, "vlan")
+        # The job's own session cap, which is far longer than what is left of the audit.
+        with connection.cursor() as cursor:
+            cursor.execute("SET lock_timeout = '10s'")
+        self.addCleanup(lambda: connection.cursor().execute("SET lock_timeout = 0"))
+
+        started = time.monotonic()
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            HeldRowLock(NSOIntentOutboxState.objects.get_or_create(device=device, scope="vlan")[0]),
+            self.assertLogs("netbox_nso_plugin.renderer_audit", level="WARNING") as logs,
+        ):
+            renderer_audit._drain_repaired(device.pk, ("vlan",), renderer_audit._monotonic() + 1)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 5)
+        self.assertTrue(any("Intent outbox drain failed" in line for line in logs.output), logs.output)
+        self.assertGreater(self._unconsumed(device), 0)
+
 
 class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
     def test_a_slow_adapter_defers_the_outbox_tail_and_the_sweep_still_runs(self):
