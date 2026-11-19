@@ -3813,6 +3813,16 @@ class _RotationInFinallyJob(_PluginSystemJob):
             # ruleid: nso-system-job-carry-in-finally
             self.carry("fleet_rotation", rotation)
 
+    def tick_with_conditional_carry(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            return audit_renderer_fleet(rotation=rotation)
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            if rotation:
+                # ruleid: nso-system-job-carry-in-finally
+                self.carry("fleet_rotation", rotation)
+
     def tick_saving_in_else(self):
         rotation = self.carried("fleet_rotation") or {}
         try:
