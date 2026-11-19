@@ -291,6 +291,51 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(self._unconsumed(device), 0, "the drain had no time left after the refresh")
 
+    def test_a_link_repair_whose_adapter_calls_run_long_still_leaves_the_drain_its_own(self):
+        from netbox_nso_plugin import adapter_client, jobs
+
+        device, management = make_managed("job-deadline-repair-share", 19178)
+        with without_commit_drain():
+            with transaction.atomic():
+                enqueue(device, "vlan")
+        refused = []
+
+        def busy_repair(rows, *, snapshot, deadline, rotation):
+            # A link callback that started before the cutoff and keeps calling the adapter.
+            stop = deadline + 10
+            while time.monotonic() < stop:
+                try:
+                    adapter_client.get_device(management.adapter_device_id)
+                except adapter_client.AdapterError as exc:
+                    if exc.code == "request_limit":
+                        refused.append(time.monotonic() - deadline)
+                        break
+                time.sleep(0.05)
+            return 1, 1
+
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=self._listing(management)),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_caches", return_value=(0, 0)),
+            patch("netbox_nso_plugin.sync_cache.reconcile_device_links", side_effect=busy_repair),
+            patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        self.assertEqual(len(refused), 1, "the repair's adapter calls ran past its cutoff")
+        self.assertLess(refused[0], 0.5)
+        self.assertEqual(self._unconsumed(device), 0, "the drain had no time left after the repair")
+
+    def test_a_stage_request_limit_never_extends_the_run_limit(self):
+        from netbox_nso_plugin import adapter_client
+
+        with adapter_client.requests_until(time.monotonic() - 1), adapter_client.requests_until(time.monotonic() + 60):
+            with self.assertRaises(adapter_client.AdapterError) as raised:
+                adapter_client.get_device(1)
+
+        self.assertEqual(raised.exception.code, "request_limit")
+        self.assertEqual(self.adapter.requests, [])
+
     @staticmethod
     def _listing(*managements):
         return [

@@ -161,8 +161,9 @@ _request_limit = contextvars.ContextVar("nso_request_limit", default=None)
 
 @contextmanager
 def requests_until(limit: float):
-    """Refuse every adapter request that would start after the monotonic *limit*."""
-    token = _request_limit.set(limit)
+    """Refuse every adapter request that would start after the monotonic *limit*, or an earlier outer one."""
+    outer = _request_limit.get()
+    token = _request_limit.set(limit if outer is None else min(limit, outer))
     try:
         yield
     finally:

@@ -324,6 +324,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     @_deployment_guarded("device maintenance tick")
     def _run(deadline, refresh_rotation, repair_rotation, outbox_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
+        from .adapter_client import requests_until
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
         from .settlement import sweep_static_route_settlements
@@ -343,7 +344,8 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
             )
         # A row whose mapping is broken can't be mirrored at all — repair it so the next pass
         # has something to mirror.
-        with lock_waits_until(before_drain):
+        # The request limit too, so that a link callback cannot spend the drain's share.
+        with lock_waits_until(before_drain), requests_until(before_drain):
             broken, attempted = reconcile_device_links(
                 rows, snapshot=snapshot, deadline=before_drain, rotation=repair_rotation
             )
