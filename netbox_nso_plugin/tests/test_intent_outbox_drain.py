@@ -204,8 +204,8 @@ class TestTheTickDrainsTheTail(_DrainCase):
             patch.object(jobs, "time") as clock,
             patch.object(jobs.logger, "info") as log,
         ):
-            # The run's request limit and its deadline take the first two readings.
-            clock.monotonic.side_effect = chain((0.0, 0.0, 10.0, 20.0), repeat(21.0))
+            # The request limit, the deadline, the snapshot start and the stage budget take the first four readings.
+            clock.monotonic.side_effect = chain((0.0, 0.0, 0.0, 0.0, 10.0, 20.0), repeat(21.0))
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
         # Rendered, not indexed: a value added to that one `logger.info` shifts every index,

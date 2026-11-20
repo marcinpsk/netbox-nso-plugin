@@ -869,17 +869,23 @@ def _onboard_into_adapter(instance, client) -> bool:
             nso_device_name=current.nso_device_name,
             netbox_device_id=current.device_id,
         )
-        _invalidate_source_admissions(current)
+        invalidated = _invalidate_source_admissions(current)
+        finish_rekey = current.source_rekey_pending and current.adapter_device_id is None
         current.adapter_device_id = result["id"]
         current.adapter_source_epoch = result.get("source_epoch")
         current.source_epoch_aware = result.get("source_epoch") is not None
-        save_management(
-            current,
-            update_fields=["adapter_device_id", "adapter_source_epoch", "source_epoch_aware"],
-        )
+        fields = ["adapter_device_id", "adapter_source_epoch", "source_epoch_aware"]
+        if finish_rekey:
+            if not current.source_epoch_aware:
+                raise RuntimeError("adapter onboard response omitted source_epoch; publication remains fenced")
+            current.source_rekey_pending = False
+            current.reset_pending_source_epoch = current.adapter_source_epoch if invalidated else None
+            fields += ["source_rekey_pending", "reset_pending_source_epoch"]
+        save_management(current, update_fields=fields)
     instance.adapter_device_id = current.adapter_device_id
     instance.adapter_source_epoch = current.adapter_source_epoch
     instance.source_epoch_aware = current.source_epoch_aware
+    instance.source_rekey_pending = current.source_rekey_pending
     return True
 
 
@@ -970,14 +976,26 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         return
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
         return
-    try:
-        attempt = _start_link_attempt(instance)
-    except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
-        logger.exception("Could not start an adapter link attempt for management row %s", instance.pk)
-        return
-    if attempt is None:
-        return
 
+    from .jobs import _RunTimedOut
+
+    attempt = None
+    try:
+        try:
+            attempt = _start_link_attempt(instance)
+        except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
+            logger.exception("Could not start an adapter link attempt for management row %s", instance.pk)
+            return
+        if attempt is not None:
+            _complete_link_attempt(instance, created, attempt)
+    except _RunTimedOut as exc:
+        if attempt is not None and instance.source_rekey_pending:
+            exc.link_attempt = (instance.pk, attempt)
+        raise
+
+
+def _complete_link_attempt(instance, created, attempt):
+    """Link the management row and record the outcome of this attempt."""
     from .adapter_client import AdapterError
 
     try:

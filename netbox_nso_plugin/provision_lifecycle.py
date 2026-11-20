@@ -13,7 +13,7 @@ from django.utils import timezone
 
 from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
-from .jobs import lock_wait_timed_out
+from .jobs import _RunTimedOut, lock_wait_timed_out
 
 logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
@@ -128,8 +128,8 @@ def mark_provision_terminal(provision_attempt_id, evidence: dict) -> bool:
 def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | None = None, rotation=None):
     """Advance matching provision tombstones through the fenced completion states.
 
-    A fleet sweep takes the attempts it swept longest ago first. An attempt whose lock wait timed out
-    keeps no stamp, so *rotation* (carried between runs) keeps when the sweep last reached it.
+    A fleet sweep takes the attempts it swept longest ago first. When a timeout prevents the stamp,
+    *rotation* (carried between runs) keeps when the sweep last reached the attempt.
     """
     from .models import NSOProvisionTombstone
 
@@ -170,6 +170,10 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
         timed_out = False
         try:
             closed += int(_sweep_one(tombstone_id, inventory_cache))
+        except _RunTimedOut:
+            skipped[str(tombstone_id)] = timezone.now()
+            keep_skips()
+            raise
         except DeploymentQuiesced:
             raise
         except Exception as exc:  # noqa: BLE001 - one attempt must not stop the fleet sweep

@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from .jobs import lock_wait_timed_out, skipped_on_lock_timeout
+from .jobs import _RunTimedOut, lock_wait_timed_out, skipped_on_lock_timeout
 from .models import NSODeviceManagement
 
 logger = logging.getLogger(__name__)
@@ -284,24 +284,27 @@ def _flag_link_error(mgmt, message) -> None:
         _record_link_error(mgmt, attempt, message)
 
 
-def _failed_rekey(mgmt) -> bool:
-    """Return whether the latest link attempt recorded a failure and left the rekey pending."""
-    return (
-        mgmt.source_rekey_pending
-        and bool(mgmt.adapter_link_error)
-        and mgmt.adapter_link_attempt == mgmt.adapter_link_outcome_attempt
-    )
+def _retryable_rekey(mgmt, interrupted_attempt) -> bool:
+    """Check for a recorded failure or a timeout in the latest link attempt."""
+    attempt = mgmt.adapter_link_attempt
+    outcome = mgmt.adapter_link_outcome_attempt
+    if outcome < attempt:
+        return attempt == interrupted_attempt
+    return outcome == attempt and bool(mgmt.adapter_link_error)
 
 
-def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
-    """Return rows with a broken mapping or a failed rekey."""
+def _broken_links(mapped, by_id, by_identity, interrupted_rekeys) -> list[tuple]:
+    """Return rows with a broken mapping or a rekey that can be retried."""
     broken = []
     for mgmt in mapped:
         if mgmt.onboard_status:
             continue
         if mgmt.source_rekey_pending:
-            # Keep the pointer so the link callback can rekey the existing adapter row.
-            if _failed_rekey(mgmt):
+            adapter_device = by_id.get(mgmt.adapter_device_id, {})
+            owns_mapping = adapter_device.get("netbox_device_id") == mgmt.device_id
+            if (mgmt.adapter_device_id is None or owns_mapping) and _retryable_rekey(
+                mgmt, interrupted_rekeys.get(str(mgmt.pk))
+            ):
                 broken.append((mgmt, _REKEY_PENDING, None))
             continue
         state, adapter_device = _classify(mgmt, by_id, by_identity)
@@ -356,7 +359,7 @@ def reconcile_device_links(  # noqa: C901
       never push this device's scope onto theirs. Several adapter rows claiming our identity is
       ambiguous: flag it for the operator and write nothing.
     * *unmapped* / *deleted*: no live mapping. Re-save the row. The not-found scope push re-onboards it.
-    * *rekey_pending*: a failed rekey. Re-save the row so the link callback retries it.
+    * *rekey_pending*: a failed or interrupted rekey with a verified owner or no mapping.
 
     Returns ``(broken, attempted)``. Attempts are capped at :data:`MAX_RELINKS_PER_RUN`; rows
     over the cap keep an ``adapter_link_error`` so nothing is silently deferred, and the
@@ -366,7 +369,7 @@ def reconcile_device_links(  # noqa: C901
     row that repaired nothing still spends the cap, on every run. With ``B`` broken rows and
     cap ``C`` every one of them is attempted within ``ceil(B / C)`` ticks — five minutes each.
     A monotonic *deadline* stops the walk; the rows it did not reach sort first next time.
-    A row whose lock wait timed out records no attempt, so *rotation* (carried between runs)
+    A timeout can prevent an attempt stamp, so *rotation* (carried between runs)
     keeps when the walk last reached it, and the walk orders by the later of the two. Otherwise
     a few held rows could use up every tick's deadline.
     """
@@ -374,7 +377,16 @@ def reconcile_device_links(  # noqa: C901
     if by_id is None:
         return 0, 0
 
-    broken = _broken_links(candidates, by_id, by_identity)
+    carried_rekeys = (rotation or {}).get("interrupted_rekeys", {})
+    interrupted_rekeys = {
+        str(mgmt.pk): mgmt.adapter_link_attempt
+        for mgmt in candidates
+        if mgmt.source_rekey_pending
+        and mgmt.adapter_link_outcome_attempt < mgmt.adapter_link_attempt == carried_rekeys.get(str(mgmt.pk))
+    }
+    if rotation is not None and (interrupted_rekeys or carried_rekeys):
+        rotation["interrupted_rekeys"] = interrupted_rekeys
+    broken = _broken_links(candidates, by_id, by_identity, interrupted_rekeys)
     if not broken:
         return 0, 0
 
@@ -422,7 +434,14 @@ def reconcile_device_links(  # noqa: C901
                 if (
                     (current.nso_instance_id, current.nso_device_name, current.adapter_device_id) != expected_source
                     or current.source_rekey_pending != (state is _REKEY_PENDING)
-                    or (state is _REKEY_PENDING and (current.onboard_status or not _failed_rekey(current)))
+                    or (
+                        state is _REKEY_PENDING
+                        and (
+                            current.onboard_status
+                            or current.adapter_link_attempt != mgmt.adapter_link_attempt
+                            or not _retryable_rekey(current, interrupted_rekeys.get(str(current.pk)))
+                        )
+                    )
                 ):
                     raise _LinkReconcileNoOp
                 # A rejected stamp means the frozen plan is stale. Do not repair that row.
@@ -485,6 +504,13 @@ def reconcile_device_links(  # noqa: C901
                     # fresh adapter device that holds none of it.
                     invalidate_delivery_baselines(current.device_id)
                 save_management(current)
+        except _RunTimedOut as exc:
+            skip(mgmt.pk)
+            if rotation is not None and exc.link_attempt is not None:
+                pk, attempt = exc.link_attempt
+                interrupted_rekeys[str(pk)] = attempt
+                rotation["interrupted_rekeys"] = interrupted_rekeys
+            raise
         except _LinkReconcileNoOp:
             continue
         except Exception as exc:  # noqa: BLE001 — one bad row must not abort the sweep
