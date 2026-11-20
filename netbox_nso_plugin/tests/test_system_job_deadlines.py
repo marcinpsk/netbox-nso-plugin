@@ -20,7 +20,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from dcim.models import Interface
-from django.db import connection, transaction
+from django.db import DatabaseError, connection, transaction
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -242,6 +242,28 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
 
         drain_key.assert_not_called()
         self.assertEqual(self._unconsumed(device), 1)
+
+    def test_an_expired_repair_send_budget_skips_lock_setup(self):
+        from netbox_nso_plugin import drain, jobs, renderer_audit
+
+        device, _management = make_managed("job-deadline-audit-expired", 19213)
+        lock_entries = 0
+
+        @contextlib.contextmanager
+        def fail_on_entry(_deadline):
+            nonlocal lock_entries
+            lock_entries += 1
+            raise DatabaseError("Lock setup failed.")
+            yield
+
+        with (
+            patch.object(jobs, "lock_waits_until", fail_on_entry),
+            patch.object(drain, "drain_key", wraps=drain.drain_key) as drain_key,
+        ):
+            renderer_audit._drain_repaired(device.pk, ("vlan", "bgp"), renderer_audit._monotonic() - 1)
+
+        drain_key.assert_not_called()
+        self.assertEqual(lock_entries, 0)
 
     def test_rq_timeout_during_a_provision_poll_skips_the_tombstone_stamp(self):
         from netbox_nso_plugin import adapter_client, jobs
@@ -856,6 +878,36 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertIsNotNone(later.adapter_link_attempted_at)
         job.job.refresh_from_db()
         self.assertIn(str(first.pk), job.job.data["repair_rotation"]["lock_skipped"])
+
+    def test_an_alarm_during_a_deferral_warning_keeps_the_row_out_of_rotation(self):
+        from netbox_nso_plugin import adapter_client, jobs, sync_cache
+
+        _first_device, first = make_managed("job-deadline-relink-attempted", 19214)
+        _second_device, second = make_managed("job-deadline-relink-deferred", 19215, index=2)
+        management_table = second._meta.db_table
+        warning = "Adapter mapping is broken; repair deferred to the next sweep."
+
+        def interrupt_warning(execute, sql, params, many, context):
+            result = execute(sql, params, many, context)
+            if sql.startswith(f'UPDATE "{management_table}"') and params[-1] == second.pk and warning in params:
+                signal.raise_signal(signal.SIGALRM)
+            return result
+
+        adapter_client.reset_session()
+        job = system_job(jobs.RefreshDeviceSyncCacheJob)
+        with (
+            patch.object(self.adapter, "_handle", return_value=make_response(200, [])),
+            patch.object(sync_cache, "MAX_RELINKS_PER_RUN", 1),
+            connection.execute_wrapper(interrupt_warning),
+            without_commit_drain(),
+            self.assertRaises(JobTimeoutException),
+        ):
+            job.run()
+
+        first.refresh_from_db()
+        self.assertIsNotNone(first.adapter_link_attempted_at)
+        job.job.refresh_from_db()
+        self.assertNotIn(str(second.pk), job.job.data.get("repair_rotation", {}).get("lock_skipped", {}))
 
     def test_an_alarm_during_the_fallback_link_stamp_carries_the_rotation(self):
         from netbox_nso_plugin import adapter_client, jobs, sync_cache

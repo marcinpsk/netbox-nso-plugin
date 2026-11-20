@@ -395,11 +395,11 @@ def reconcile_device_links(  # noqa: C901
             # No further writes. Least-recently-attempted order puts these rows first next tick.
             logger.info("Link reconcile deferred %d broken rows to the next tick", len(broken) - index)
             break
+        if attempted >= MAX_RELINKS_PER_RUN:
+            with skipped_on_lock_timeout(f"Link reconcile skipped management row {mgmt.pk}"):
+                _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
+            continue
         try:
-            if attempted >= MAX_RELINKS_PER_RUN:
-                with skipped_on_lock_timeout(f"Link reconcile skipped management row {mgmt.pk}"):
-                    _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
-                continue
             expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
             attempted_this_row = False
             try:
