@@ -39,6 +39,8 @@ SYSTEM_JOB_LOCK_TIMEOUT = "30s"
 #: How long after the run deadline a started settlement poll may still page its evidence feed.
 #: The rest of the timeout is for that poll's reads and writes after the feed.
 SETTLEMENT_FEED_GRACE_SECONDS = 180
+#: The part of the sync-cache budget available to read the adapter inventory.
+SNAPSHOT_SHARE = 5 / 6
 #: The part of the sync-cache budget kept for its last pass, the settlement sweep.
 SETTLEMENT_SWEEP_SHARE = 0.25
 #: The part of the sync-cache budget kept for the outbox compaction and drain, before the sweep's share.
@@ -325,19 +327,25 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     def _run(deadline, refresh_rotation, repair_rotation, outbox_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
         from .adapter_client import requests_until
+        from .delivery import SendDeadlineExceeded, _under_deadline
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
         from .settlement import sweep_static_route_settlements
         from .sync_cache import _snapshot, reconcile_device_links, refresh_sync_caches
 
-        before_sweep = deadline - SYSTEM_JOB_BUDGET_SECONDS * SETTLEMENT_SWEEP_SHARE
-        before_sends = before_sweep - SYSTEM_JOB_BUDGET_SECONDS * OUTBOX_DRAIN_SHARE * OUTBOX_SEND_SHARE
-        before_drain = before_sweep - SYSTEM_JOB_BUDGET_SECONDS * OUTBOX_DRAIN_SHARE
-        before_repair = before_drain - SYSTEM_JOB_BUDGET_SECONDS * LINK_REPAIR_SHARE
         rows = list(NSODeviceManagement.objects.select_related("nso_instance"))
-        # One adapter snapshot for both passes: they ask the same question of the same data,
-        # and a second call could disagree with the first mid-sweep.
-        snapshot = _snapshot(rows)
+        snapshot_started = time.monotonic()
+        snapshot_budget = (deadline - snapshot_started) * SNAPSHOT_SHARE
+        snapshot = rows, None, None
+        if snapshot_budget > 0:
+            with requests_until(snapshot_started + snapshot_budget), contextlib.suppress(SendDeadlineExceeded):
+                snapshot = _under_deadline(lambda _body: _snapshot(rows), snapshot_budget)(None)
+
+        budget = max(0, deadline - time.monotonic())
+        before_sweep = deadline - budget * SETTLEMENT_SWEEP_SHARE
+        before_sends = before_sweep - budget * OUTBOX_DRAIN_SHARE * OUTBOX_SEND_SHARE
+        before_drain = before_sweep - budget * OUTBOX_DRAIN_SHARE
+        before_repair = before_drain - budget * LINK_REPAIR_SHARE
         with lock_waits_until(before_repair):
             checked, updated = refresh_sync_caches(
                 rows, snapshot=snapshot, deadline=before_repair, rotation=refresh_rotation

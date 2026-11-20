@@ -41,6 +41,7 @@ _UNMAPPED = "unmapped"
 _REMAPPED = "remapped"
 _DELETED = "deleted"
 _IDENTITY_CHANGED = "identity_changed"
+_REKEY_PENDING = "rekey_pending"
 
 _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-cache sweep will repair it."
 
@@ -283,17 +284,25 @@ def _flag_link_error(mgmt, message) -> None:
         _record_link_error(mgmt, attempt, message)
 
 
+def _failed_rekey(mgmt) -> bool:
+    """Return whether the latest link attempt recorded a failure and left the rekey pending."""
+    return (
+        mgmt.source_rekey_pending
+        and bool(mgmt.adapter_link_error)
+        and mgmt.adapter_link_attempt == mgmt.adapter_link_outcome_attempt
+    )
+
+
 def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
-    """Return the ``(mgmt, state, adapter_device)`` rows whose mapping no longer resolves."""
+    """Return rows with a broken mapping or a failed rekey."""
     broken = []
     for mgmt in mapped:
-        # A row mid-provision has no adapter device yet by design and its push is gated.
-        # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
-        # the adapter still carries the old one, so it classifies as identity_changed. Dropping
-        # its pointer would let the generic repair re-onboard the new identity while the old
-        # adapter row still holds this netbox_device_id. _sync_source_change owns that fenced
-        # transition, including a dead mapping.
-        if mgmt.onboard_status or mgmt.source_rekey_pending:
+        if mgmt.onboard_status:
+            continue
+        if mgmt.source_rekey_pending:
+            # Keep the pointer so the link callback can rekey the existing adapter row.
+            if _failed_rekey(mgmt):
+                broken.append((mgmt, _REKEY_PENDING, None))
             continue
         state, adapter_device = _classify(mgmt, by_id, by_identity)
         if state is not _MATCHED:
@@ -347,6 +356,7 @@ def reconcile_device_links(  # noqa: C901
       never push this device's scope onto theirs. Several adapter rows claiming our identity is
       ambiguous: flag it for the operator and write nothing.
     * *unmapped* / *deleted*: no live mapping. Re-save the row. The not-found scope push re-onboards it.
+    * *rekey_pending*: a failed rekey. Re-save the row so the link callback retries it.
 
     Returns ``(broken, attempted)``. Attempts are capped at :data:`MAX_RELINKS_PER_RUN`; rows
     over the cap keep an ``adapter_link_error`` so nothing is silently deferred, and the
@@ -396,8 +406,9 @@ def reconcile_device_links(  # noqa: C901
             logger.info("Link reconcile deferred %d broken rows to the next tick", len(broken) - index)
             break
         if attempted >= MAX_RELINKS_PER_RUN:
-            with skipped_on_lock_timeout(f"Link reconcile skipped management row {mgmt.pk}"):
-                _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
+            if state is not _REKEY_PENDING:
+                with skipped_on_lock_timeout(f"Link reconcile skipped management row {mgmt.pk}"):
+                    _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
         expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
         attempted_this_row = False
@@ -409,8 +420,9 @@ def reconcile_device_links(  # noqa: C901
             with intent_transaction(footprint_for_instance(mgmt)):
                 current = type(mgmt).objects.get(pk=mgmt.pk)
                 if (
-                    current.source_rekey_pending
-                    or (current.nso_instance_id, current.nso_device_name, current.adapter_device_id) != expected_source
+                    (current.nso_instance_id, current.nso_device_name, current.adapter_device_id) != expected_source
+                    or current.source_rekey_pending != (state is _REKEY_PENDING)
+                    or (state is _REKEY_PENDING and (current.onboard_status or not _failed_rekey(current)))
                 ):
                     raise _LinkReconcileNoOp
                 # A rejected stamp means the frozen plan is stale. Do not repair that row.
@@ -479,11 +491,8 @@ def reconcile_device_links(  # noqa: C901
             if lock_wait_timed_out(exc):
                 skip(mgmt.pk)
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
-            continue
-        finally:
             if attempted_this_row:
-                # Failed repairs still consume the cap. Keep their attempt stamp
-                # outside the repair transaction so rollback cannot starve the tail.
+                # Keep the attempt stamp if the repair rolled back.
                 try:
                     _mirror_management(mgmt, adapter_link_attempted_at=now)
                 except Exception as exc:  # noqa: BLE001 — a stamp failure must not abort the sweep

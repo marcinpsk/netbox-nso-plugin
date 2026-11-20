@@ -175,11 +175,10 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
         except Exception as exc:  # noqa: BLE001 - one attempt must not stop the fleet sweep
             timed_out = lock_wait_timed_out(exc)
             logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
-        finally:
-            # After a lock timeout, the stamp would wait on the same row.
-            if timed_out or not _stamp_swept(tombstone_id):
-                skipped[str(tombstone_id)] = timezone.now()
-                keep_skips()
+        # After a lock timeout, the stamp would wait on the same row.
+        if timed_out or not _stamp_swept(tombstone_id):
+            skipped[str(tombstone_id)] = timezone.now()
+            keep_skips()
     return checked, closed
 
 

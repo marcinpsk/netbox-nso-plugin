@@ -23,12 +23,14 @@ from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
-from ._adapter_http import patch_matching_control_state
+from ._adapter_http import make_response, patch_matching_control_state
 from ._outbox_case import (
+    CFG,
     HeldRowLock,
     ReceiptAdapter,
     enqueue,
     make_managed,
+    open_provision_attempt,
     reset_renderer_audit_rotation,
     short_lock_timeout,
     system_job,
@@ -183,6 +185,63 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(self._unconsumed(device), 0)
         self.assertLessEqual(send.call_args.kwargs["deadline"], drain.SEND_DEADLINE.total_seconds())
 
+    def test_lock_context_entry_can_use_up_the_repair_send_budget(self):
+        from netbox_nso_plugin import drain, jobs, renderer_audit
+
+        device, _management = make_managed("job-deadline-audit-lock-entry", 19198)
+        with without_commit_drain(), transaction.atomic():
+            enqueue(device, "vlan")
+        now = time.monotonic()
+        deadline = now + 1
+        lock_waits_until = jobs.lock_waits_until
+
+        @contextlib.contextmanager
+        def slow_entry(deadline):
+            nonlocal now
+            with lock_waits_until(deadline):
+                now = deadline + 1
+                yield
+
+        with (
+            patch.object(jobs, "lock_waits_until", slow_entry),
+            patch.object(renderer_audit, "_monotonic", side_effect=lambda: now),
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch.object(drain, "drain_key", wraps=drain.drain_key) as drain_key,
+        ):
+            renderer_audit._drain_repaired(device.pk, ("vlan",), deadline)
+
+        drain_key.assert_not_called()
+        self.assertEqual(self._unconsumed(device), 1)
+
+    def test_rq_timeout_during_a_provision_poll_skips_the_tombstone_stamp(self):
+        from netbox_nso_plugin import adapter_client, jobs
+
+        _device, management = make_managed("job-deadline-tombstone-alarm", 19199)
+        tombstone = open_provision_attempt(management)
+        expected_stamp = tombstone.updated_at
+        alarm_times = []
+
+        def interrupt_poll(method, url, **kwargs):
+            self.assertTrue(url.endswith(f"/provision-attempts/{tombstone.pk}"), url)
+            alarm_times.append(time.monotonic())
+            raise jobs._RunTimedOut
+
+        adapter_client.reset_session()
+        with (
+            patch.object(jobs, "SYSTEM_JOB_LOCK_TIMEOUT", "1s"),
+            patch.object(self.adapter, "_handle", interrupt_poll),
+            HeldRowLock(tombstone),
+            CaptureQueriesContext(connection) as queries,
+            self.assertRaises(jobs._RunTimedOut),
+        ):
+            system_job(jobs.AuditRendererScopesJob).run()
+
+        self.assertEqual(len(alarm_times), 1)
+        self.assertLess(time.monotonic() - alarm_times[0], 0.8)
+        self.assertFalse(any('UPDATE "netbox_nso_plugin_nsoprovisiontombstone"' in query["sql"] for query in queries))
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.updated_at, expected_stamp)
+
     def test_a_held_outbox_row_does_not_hold_a_repair_send_past_the_audit_deadline(self):
         from netbox_nso_plugin import renderer_audit
         from netbox_nso_plugin.models import NSOIntentOutboxState
@@ -211,6 +270,133 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
 
 
 class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
+    def test_the_next_tick_retries_a_rekey_cut_off_before_its_patch(self):
+        from netbox_nso_plugin import adapter_client, jobs
+
+        _device, management = make_managed("job-deadline-rekey-retry", 19200)
+        management.refresh_from_db()
+        prior_outcome = management.adapter_link_outcome_attempt
+        listing = self._listing(management)
+        listing[0]["nso_device_name"] = "old-source"
+        patches = []
+        clock = time.monotonic
+        delay = 0
+        table = management._meta.db_table
+
+        def slow_fence_write(execute, sql, params, many, context):
+            nonlocal delay
+            result = execute(sql, params, many, context)
+            if sql.startswith(f'UPDATE "{table}" SET "source_rekey_pending" ='):
+                delay = 130
+            return result
+
+        def respond(method, url, **kwargs):
+            if method == "GET" and url.endswith("/api/v1/devices"):
+                return make_response(200, listing)
+            if method == "PATCH":
+                patches.append(kwargs["json"])
+                listing[0]["nso_device_name"] = management.nso_device_name
+                return make_response(200, {"source_epoch": 2})
+            return make_response(200, {})
+
+        adapter_client.reset_session()
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 240),
+            patch.object(time, "monotonic", side_effect=lambda: clock() + delay),
+            patch.object(self.adapter, "_handle", respond),
+            without_commit_drain(),
+        ):
+            with connection.execute_wrapper(slow_fence_write):
+                system_job(jobs.RefreshDeviceSyncCacheJob).run()
+            management.refresh_from_db()
+            self.assertTrue(management.source_rekey_pending)
+            self.assertTrue(management.adapter_link_error)
+            self.assertGreater(management.adapter_link_outcome_attempt, prior_outcome)
+            self.assertEqual(patches, [])
+
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        management.refresh_from_db()
+        self.assertFalse(management.source_rekey_pending)
+        self.assertEqual(management.adapter_source_epoch, 2)
+        self.assertEqual(management.adapter_link_error, "")
+        self.assertEqual(
+            patches,
+            [
+                {
+                    "nso_instance": management.nso_instance.adapter_instance_id,
+                    "nso_device_name": management.nso_device_name,
+                }
+            ],
+        )
+
+    def test_a_slow_successful_snapshot_leaves_time_for_the_drain(self):
+        from netbox_nso_plugin import adapter_client, jobs
+
+        device, management = make_managed("job-deadline-snapshot", 19201)
+        with without_commit_drain(), transaction.atomic():
+            enqueue(device, "vlan")
+        clock = time.monotonic
+        delay = 0
+        read_timeouts = []
+        respond = self.adapter._handle
+
+        def slow_inventory(method, url, **kwargs):
+            nonlocal delay
+            if method == "GET" and url.endswith("/api/v1/devices"):
+                read_timeouts.append(kwargs["timeout"][1])
+                delay = 190
+                return make_response(200, self._listing(management))
+            return respond(method, url, **kwargs)
+
+        adapter_client.reset_session()
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 240),
+            patch.object(time, "monotonic", side_effect=lambda: clock() + delay),
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value={**CFG, "timeout": 220}),
+            patch.object(self.adapter, "_handle", slow_inventory),
+            patch.object(_SlowAdapter, "DELAY", 0),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        self.assertEqual(self._unconsumed(device), 0, "the inventory took all the send time")
+        self.assertEqual(len(read_timeouts), 1)
+        self.assertLessEqual(read_timeouts[0], 200)
+
+    def test_a_snapshot_that_exceeds_its_budget_leaves_outbox_compaction_enabled(self):
+        from netbox_nso_plugin import adapter_client, jobs
+
+        device, management = make_managed("job-deadline-snapshot-expired", 19202)
+        for _ in range(2):
+            with without_commit_drain(), transaction.atomic():
+                enqueue(device, "vlan")
+        release = threading.Event()
+        inventory_started = threading.Event()
+        respond = self.adapter._handle
+
+        def unresponsive_inventory(method, url, **kwargs):
+            if method == "GET" and url.endswith("/api/v1/devices"):
+                inventory_started.set()
+                release.wait(2)
+                return make_response(200, self._listing(management))
+            return respond(method, url, **kwargs)
+
+        adapter_client.reset_session()
+        started = time.monotonic()
+        try:
+            with (
+                patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 1.5),
+                patch.object(self.adapter, "_handle", unresponsive_inventory),
+                patch.object(_SlowAdapter, "DELAY", 0),
+            ):
+                system_job(jobs.RefreshDeviceSyncCacheJob).run()
+        finally:
+            release.set()
+
+        self.assertTrue(inventory_started.is_set())
+        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertEqual(self._unconsumed(device), 1)
+
     def test_a_slow_adapter_defers_the_outbox_tail_and_the_sweep_still_runs(self):
         from netbox_nso_plugin import delivery, jobs
 
@@ -626,6 +812,8 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(len(holders), 1, "the fallback stamp did not run")
         self.assertEqual(list(rotation["lock_skipped"]), [str(first.pk)])
+        second.refresh_from_db()
+        self.assertIsNone(second.adapter_link_attempted_at, "the interrupted repair ran its fallback stamp")
 
     def test_a_refresh_that_uses_its_whole_share_still_leaves_the_link_repair_its_own(self):
         from netbox_nso_plugin import jobs
@@ -865,6 +1053,7 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", side_effect=sweep),
             # The compaction and the claim of this key each wait on the held state row.
             HeldRowLock(state),
+            self.assertLogs("netbox_nso_plugin.drain", level="ERROR") as logs,
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
@@ -873,6 +1062,15 @@ class TestCompactionStopsAtTheDeadline(_CascadeFlushMixin, IntentPushResetMixin,
         # Not compacted. The claim's pre-capture audit can queue a repair entry beside them.
         self.assertEqual(len(queued), 2)
         self.assertEqual(NSOIntentOutboxEntry.objects.filter(pk__in=queued).count(), 2)
+        self.assertTrue(
+            any(
+                record.getMessage() == f"intent outbox drain failed for {self.device.pk}/vlan"
+                and record.exc_info
+                and jobs.lock_wait_timed_out(record.exc_info[1])
+                for record in logs.records
+            ),
+            logs.output,
+        )
 
     def test_a_held_state_row_fails_the_compaction_at_the_job_lock_timeout(self):
         from netbox_nso_plugin import jobs
@@ -913,12 +1111,11 @@ class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixi
 
     def setUp(self):
         super().setUp()
-        from netbox_nso_plugin import jobs
-
         reset_renderer_audit_rotation(self)
         patch_matching_control_state(self)
-        # Every pass starts past its deadline, so each run reaches exactly one device.
-        patcher = patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", -1)
+        clock = time.monotonic
+        self.clock_offset = 0
+        patcher = patch.object(time, "monotonic", side_effect=lambda: clock() + self.clock_offset)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.rows = [make_managed("job-rotation", 19170 + index, index=index)[1] for index in range(3)]
@@ -947,12 +1144,14 @@ class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixi
             for row in self.rows
         ]
         polled = []
+
+        def poll(pk, **kwargs):
+            polled.append(pk)
+            self.clock_offset += jobs.SYSTEM_JOB_BUDGET_SECONDS
+
         with (
             patch("netbox_nso_plugin.adapter_client.list_devices", return_value=listing),
-            patch(
-                "netbox_nso_plugin.settlement.settle_static_routes",
-                side_effect=lambda pk, **_kwargs: polled.append(pk),
-            ),
+            patch("netbox_nso_plugin.settlement.settle_static_routes", side_effect=poll),
         ):
             for _run in range(4):
                 system_job(jobs.RefreshDeviceSyncCacheJob).run()
@@ -977,12 +1176,15 @@ class TestTheRotationsSurviveBetweenRuns(_CascadeFlushMixin, IntentPushResetMixi
             for row in self.rows
         ]
         refreshed = []
+
+        def refresh(mgmt, _device):
+            refreshed.append(mgmt.pk)
+            self.clock_offset += jobs.SYSTEM_JOB_BUDGET_SECONDS
+            return []
+
         with (
             patch("netbox_nso_plugin.adapter_client.list_devices", return_value=listing),
-            patch(
-                "netbox_nso_plugin.sync_cache.refresh_sync_cache",
-                side_effect=lambda mgmt, _device: refreshed.append(mgmt.pk) or [],
-            ),
+            patch("netbox_nso_plugin.sync_cache.refresh_sync_cache", side_effect=refresh),
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", return_value=(0, 0)),
         ):
             for _run in range(4):
@@ -1049,6 +1251,10 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         from netbox_nso_plugin import jobs
 
         held = Job.objects.create(name="nso-test-held-row", job_id=uuid4())
+        short_lock_timeout(self)
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW lock_timeout")
+            previous = cursor.fetchone()[0]
         started = time.monotonic()
         with HeldRowLock(held), self.assertRaises(OperationalError) as caught:
             with jobs.lock_waits_until(time.monotonic() + 1):
@@ -1057,7 +1263,7 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         self.assertTrue(jobs.lock_wait_timed_out(caught.exception), caught.exception)
         with connection.cursor() as cursor:
             cursor.execute("SHOW lock_timeout")
-            self.assertEqual(cursor.fetchone()[0], "0")
+            self.assertEqual(cursor.fetchone()[0], previous)
 
     def test_an_advisory_lock_wait_ends_at_the_deadline(self):
         from django.db import OperationalError

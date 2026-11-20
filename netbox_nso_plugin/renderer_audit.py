@@ -451,16 +451,16 @@ def _drain_repaired(device_id, scopes, deadline) -> None:
     from .jobs import lock_waits_until
 
     for index, scope in enumerate(scopes):
-        remaining = deadline - _monotonic()
-        if remaining <= 0:
-            logger.info(
-                "renderer audit left repair sends to the outbox tick device=%s scopes=%s",
-                device_id,
-                scopes[index:],
-            )
-            return
         try:
             with lock_waits_until(deadline):
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    logger.info(
+                        "renderer audit left repair sends to the outbox tick device=%s scopes=%s",
+                        device_id,
+                        scopes[index:],
+                    )
+                    return
                 drain.drain_key(device_id, scope, deadline=min(remaining, drain.SEND_DEADLINE.total_seconds()))
         except Exception as exc:  # noqa: BLE001 (the outbox tick retries the key)
             logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
