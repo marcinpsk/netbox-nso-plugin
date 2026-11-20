@@ -1296,3 +1296,43 @@ rules:
           pattern: self.carry(...)
     paths:
       include: ["netbox_nso_plugin/jobs.py"]
+
+  - id: nso-system-job-progress-stamp-in-finally
+    languages: [python]
+    severity: ERROR
+    message: Keep progress stamps outside finally so an RQ timeout can reach connection recovery.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              try:
+                  ...
+              except ...:
+                  ...
+              finally:
+                  ...
+                  if $TIMED_OUT or not $STAMP:
+                      ...
+                  ...
+          - pattern: |
+              try:
+                  ...
+              except ...:
+                  ...
+              finally:
+                  ...
+                  if $ATTEMPTED:
+                      try:
+                          ...
+                          $STAMP
+                          ...
+                      except ...:
+                          ...
+                  ...
+      - metavariable-pattern:
+          metavariable: $STAMP
+          pattern-either:
+            - pattern: _stamp_swept(...)
+            - pattern: _mirror_management(...)
+      - focus-metavariable: $STAMP
+    paths:
+      include: ["netbox_nso_plugin/provision_lifecycle.py", "netbox_nso_plugin/sync_cache.py"]
