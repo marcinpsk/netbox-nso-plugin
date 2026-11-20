@@ -41,7 +41,6 @@ _UNMAPPED = "unmapped"
 _REMAPPED = "remapped"
 _DELETED = "deleted"
 _IDENTITY_CHANGED = "identity_changed"
-_REKEY_PENDING = "rekey_pending"
 
 _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-cache sweep will repair it."
 
@@ -284,28 +283,17 @@ def _flag_link_error(mgmt, message) -> None:
         _record_link_error(mgmt, attempt, message)
 
 
-def _retryable_rekey(mgmt, interrupted_attempt) -> bool:
-    """Check for a recorded failure or a timeout in the latest link attempt."""
-    attempt = mgmt.adapter_link_attempt
-    outcome = mgmt.adapter_link_outcome_attempt
-    if outcome < attempt:
-        return attempt == interrupted_attempt
-    return outcome == attempt and bool(mgmt.adapter_link_error)
-
-
-def _broken_links(mapped, by_id, by_identity, interrupted_rekeys) -> list[tuple]:
-    """Return rows with a broken mapping or a rekey that can be retried."""
+def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
+    """Return the ``(mgmt, state, adapter_device)`` rows whose mapping no longer resolves."""
     broken = []
     for mgmt in mapped:
-        if mgmt.onboard_status:
-            continue
-        if mgmt.source_rekey_pending:
-            adapter_device = by_id.get(mgmt.adapter_device_id, {})
-            owns_mapping = adapter_device.get("netbox_device_id") == mgmt.device_id
-            if (mgmt.adapter_device_id is None or owns_mapping) and _retryable_rekey(
-                mgmt, interrupted_rekeys.get(str(mgmt.pk))
-            ):
-                broken.append((mgmt, _REKEY_PENDING, None))
+        # A row mid-provision has no adapter device yet by design and its push is gated.
+        # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
+        # the adapter still carries the old one, so it classifies as identity_changed. Dropping
+        # its pointer would let the generic repair re-onboard the new identity while the old
+        # adapter row still holds this netbox_device_id. _sync_source_change owns that fenced
+        # transition, including a dead mapping.
+        if mgmt.onboard_status or mgmt.source_rekey_pending:
             continue
         state, adapter_device = _classify(mgmt, by_id, by_identity)
         if state is not _MATCHED:
@@ -359,7 +347,6 @@ def reconcile_device_links(  # noqa: C901
       never push this device's scope onto theirs. Several adapter rows claiming our identity is
       ambiguous: flag it for the operator and write nothing.
     * *unmapped* / *deleted*: no live mapping. Re-save the row. The not-found scope push re-onboards it.
-    * *rekey_pending*: a failed or interrupted rekey with a verified owner or no mapping.
 
     Returns ``(broken, attempted)``. Attempts are capped at :data:`MAX_RELINKS_PER_RUN`; rows
     over the cap keep an ``adapter_link_error`` so nothing is silently deferred, and the
@@ -377,16 +364,7 @@ def reconcile_device_links(  # noqa: C901
     if by_id is None:
         return 0, 0
 
-    carried_rekeys = (rotation or {}).get("interrupted_rekeys", {})
-    interrupted_rekeys = {
-        str(mgmt.pk): mgmt.adapter_link_attempt
-        for mgmt in candidates
-        if mgmt.source_rekey_pending
-        and mgmt.adapter_link_outcome_attempt < mgmt.adapter_link_attempt == carried_rekeys.get(str(mgmt.pk))
-    }
-    if rotation is not None and (interrupted_rekeys or carried_rekeys):
-        rotation["interrupted_rekeys"] = interrupted_rekeys
-    broken = _broken_links(candidates, by_id, by_identity, interrupted_rekeys)
+    broken = _broken_links(candidates, by_id, by_identity)
     if not broken:
         return 0, 0
 
@@ -417,114 +395,103 @@ def reconcile_device_links(  # noqa: C901
             # No further writes. Least-recently-attempted order puts these rows first next tick.
             logger.info("Link reconcile deferred %d broken rows to the next tick", len(broken) - index)
             break
-        if attempted >= MAX_RELINKS_PER_RUN:
-            if state is not _REKEY_PENDING:
+        try:
+            if attempted >= MAX_RELINKS_PER_RUN:
                 with skipped_on_lock_timeout(f"Link reconcile skipped management row {mgmt.pk}"):
                     _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
-            continue
-        expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
-        attempted_this_row = False
-        try:
-            from .intent_state import footprint_for_instance, intent_transaction
-            from .management_lifecycle import save_management
-            from .signals import _invalidate_source_admissions
+                continue
+            expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
+            attempted_this_row = False
+            try:
+                from .intent_state import footprint_for_instance, intent_transaction
+                from .management_lifecycle import save_management
+                from .signals import _invalidate_source_admissions
 
-            with intent_transaction(footprint_for_instance(mgmt)):
-                current = type(mgmt).objects.get(pk=mgmt.pk)
-                if (
-                    (current.nso_instance_id, current.nso_device_name, current.adapter_device_id) != expected_source
-                    or current.source_rekey_pending != (state is _REKEY_PENDING)
-                    or (
-                        state is _REKEY_PENDING
-                        and (
-                            current.onboard_status
-                            or current.adapter_link_attempt != mgmt.adapter_link_attempt
-                            or not _retryable_rekey(current, interrupted_rekeys.get(str(current.pk)))
-                        )
-                    )
-                ):
-                    raise _LinkReconcileNoOp
-                # A rejected stamp means the frozen plan is stale. Do not repair that row.
-                if not _mirror_management(current, adapter_link_attempted_at=now):
-                    continue
-                attempted += 1
-                attempted_this_row = True
-                if state is _REMAPPED:
-                    logger.warning(
-                        "Adapter device for %s now resolves to id %s (previous mapping: %s). Adopting it.",
-                        current.nso_device_name,
-                        adapter_device["id"],
-                        "none" if current.adapter_device_id is None else current.adapter_device_id,
-                    )
-                    if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
+                with intent_transaction(footprint_for_instance(mgmt)):
+                    current = type(mgmt).objects.get(pk=mgmt.pk)
+                    if (
+                        current.source_rekey_pending
+                        or (current.nso_instance_id, current.nso_device_name, current.adapter_device_id)
+                        != expected_source
+                    ):
+                        raise _LinkReconcileNoOp
+                    # A rejected stamp means the frozen plan is stale. Do not repair that row.
+                    if not _mirror_management(current, adapter_link_attempted_at=now):
                         continue
-                    _invalidate_source_admissions(current)
-                    invalidate_delivery_baselines(current.device_id)
-                elif state is _IDENTITY_CHANGED:
-                    if adapter_device is None:
-                        # Nothing is provable and nothing is written, so nothing may be invalidated:
-                        # blanking here cost the device its whole verified baseline on every sweep.
-                        _flag_link_error(current, "Adapter identity is ambiguous; repair requires operator action.")
-                        continue
-                    if (adapter_device.get("nso_instance"), adapter_device.get("nso_device_name")) == _row_identity(
-                        current
-                    ) and adapter_device.get("netbox_device_id") not in (None, current.device_id):
-                        _flag_link_error(
-                            current,
-                            "Adapter identity belongs to another NetBox device; repair requires operator action.",
-                        )
-                        continue
-                    if adapter_device.get("netbox_device_id") == current.device_id:
+                    attempted += 1
+                    attempted_this_row = True
+                    if state is _REMAPPED:
                         logger.warning(
-                            "Adapter source identity changed for device id %s. Routing through the rekey fence.",
-                            current.adapter_device_id,
+                            "Adapter device for %s now resolves to id %s (previous mapping: %s). Adopting it.",
+                            current.nso_device_name,
+                            adapter_device["id"],
+                            "none" if current.adapter_device_id is None else current.adapter_device_id,
                         )
-                        if not _mirror_management(current, source_rekey_pending=True):
-                            continue
-                    else:
-                        logger.warning(
-                            "Adapter device id %s belongs to another NetBox device. Dropping the stale pointer.",
-                            current.adapter_device_id,
-                        )
-                        if not _mirror_management(current, adapter_device_id=None):
+                        if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
                             continue
                         _invalidate_source_admissions(current)
-                    invalidate_delivery_baselines(current.device_id)
-                elif state is _UNMAPPED:
-                    # The pointer is already null and this branch does not change it. The repair
-                    # that cleared it already invalidated, and a new row never delivered.
-                    logger.warning("Management row %s has no adapter mapping. Re-linking it.", current.pk)
-                elif state is _DELETED:
-                    logger.warning(
-                        "Adapter device id %s for %s was deleted. Re-linking it.",
-                        current.adapter_device_id,
-                        current.nso_device_name,
-                    )
-                    # The row that held every verified baseline is gone. The re-link creates a
-                    # fresh adapter device that holds none of it.
-                    invalidate_delivery_baselines(current.device_id)
-                save_management(current)
-        except _RunTimedOut as exc:
+                        invalidate_delivery_baselines(current.device_id)
+                    elif state is _IDENTITY_CHANGED:
+                        if adapter_device is None:
+                            # Nothing is provable and nothing is written, so nothing may be invalidated:
+                            # blanking here cost the device its whole verified baseline on every sweep.
+                            _flag_link_error(current, "Adapter identity is ambiguous; repair requires operator action.")
+                            continue
+                        if (adapter_device.get("nso_instance"), adapter_device.get("nso_device_name")) == _row_identity(
+                            current
+                        ) and adapter_device.get("netbox_device_id") not in (None, current.device_id):
+                            _flag_link_error(
+                                current,
+                                "Adapter identity belongs to another NetBox device; repair requires operator action.",
+                            )
+                            continue
+                        if adapter_device.get("netbox_device_id") == current.device_id:
+                            logger.warning(
+                                "Adapter source identity changed for device id %s. Routing through the rekey fence.",
+                                current.adapter_device_id,
+                            )
+                            if not _mirror_management(current, source_rekey_pending=True):
+                                continue
+                        else:
+                            logger.warning(
+                                "Adapter device id %s belongs to another NetBox device. Dropping the stale pointer.",
+                                current.adapter_device_id,
+                            )
+                            if not _mirror_management(current, adapter_device_id=None):
+                                continue
+                            _invalidate_source_admissions(current)
+                        invalidate_delivery_baselines(current.device_id)
+                    elif state is _UNMAPPED:
+                        # The pointer is already null and this branch does not change it. The repair
+                        # that cleared it already invalidated, and a new row never delivered.
+                        logger.warning("Management row %s has no adapter mapping. Re-linking it.", current.pk)
+                    elif state is _DELETED:
+                        logger.warning(
+                            "Adapter device id %s for %s was deleted. Re-linking it.",
+                            current.adapter_device_id,
+                            current.nso_device_name,
+                        )
+                        # The row that held every verified baseline is gone. The re-link creates a
+                        # fresh adapter device that holds none of it.
+                        invalidate_delivery_baselines(current.device_id)
+                    save_management(current)
+            except _LinkReconcileNoOp:
+                continue
+            except Exception as exc:  # noqa: BLE001 - one bad row must not abort the sweep
+                if lock_wait_timed_out(exc):
+                    skip(mgmt.pk)
+                logger.exception("Link reconcile failed for management row %s", mgmt.pk)
+                if attempted_this_row:
+                    # Keep the attempt stamp if the repair rolled back.
+                    try:
+                        _mirror_management(mgmt, adapter_link_attempted_at=now)
+                    except Exception as exc:  # noqa: BLE001 - a stamp failure must not abort the sweep
+                        if lock_wait_timed_out(exc):
+                            skip(mgmt.pk)
+                        logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
+        except _RunTimedOut:
             skip(mgmt.pk)
-            if rotation is not None and exc.link_attempt is not None:
-                pk, attempt = exc.link_attempt
-                interrupted_rekeys[str(pk)] = attempt
-                rotation["interrupted_rekeys"] = interrupted_rekeys
             raise
-        except _LinkReconcileNoOp:
-            continue
-        except Exception as exc:  # noqa: BLE001 — one bad row must not abort the sweep
-            if lock_wait_timed_out(exc):
-                skip(mgmt.pk)
-            logger.exception("Link reconcile failed for management row %s", mgmt.pk)
-            if attempted_this_row:
-                # Keep the attempt stamp if the repair rolled back.
-                try:
-                    _mirror_management(mgmt, adapter_link_attempted_at=now)
-                except Exception as exc:  # noqa: BLE001 — a stamp failure must not abort the sweep
-                    if lock_wait_timed_out(exc):
-                        skip(mgmt.pk)
-                    logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
     if rotation is not None:
         rotation["lock_skipped"] = {str(pk): at.isoformat() for pk, at in skipped.items()}
     logger.info("Link reconcile: %d broken, %d repair attempted", len(broken), attempted)

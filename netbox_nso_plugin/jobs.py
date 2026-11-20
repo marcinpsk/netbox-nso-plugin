@@ -124,8 +124,6 @@ def lock_waits_until(deadline: float):
 class _RunTimedOut(BaseException):
     """RQ's timeout as a BaseException, so that no ``except Exception`` in a tick can swallow it."""
 
-    link_attempt: tuple[int, int] | None = None
-
 
 @contextlib.contextmanager
 def _unswallowable_timeout(record):

@@ -166,23 +166,24 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
         if deadline is not None and _monotonic() >= deadline:
             logger.info("provision tombstone sweep deferred %d attempts to the next run", len(attempt_ids) - index)
             break
-        checked += 1
-        timed_out = False
         try:
-            closed += int(_sweep_one(tombstone_id, inventory_cache))
+            checked += 1
+            timed_out = False
+            try:
+                closed += int(_sweep_one(tombstone_id, inventory_cache))
+            except DeploymentQuiesced:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one attempt must not stop the fleet sweep
+                timed_out = lock_wait_timed_out(exc)
+                logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
+            # After a lock timeout, the stamp would wait on the same row.
+            if timed_out or not _stamp_swept(tombstone_id):
+                skipped[str(tombstone_id)] = timezone.now()
+                keep_skips()
         except _RunTimedOut:
             skipped[str(tombstone_id)] = timezone.now()
             keep_skips()
             raise
-        except DeploymentQuiesced:
-            raise
-        except Exception as exc:  # noqa: BLE001 - one attempt must not stop the fleet sweep
-            timed_out = lock_wait_timed_out(exc)
-            logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
-        # After a lock timeout, the stamp would wait on the same row.
-        if timed_out or not _stamp_swept(tombstone_id):
-            skipped[str(tombstone_id)] = timezone.now()
-            keep_skips()
     return checked, closed
 
 

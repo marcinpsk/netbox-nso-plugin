@@ -14,6 +14,7 @@ import contextlib
 import signal
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from unittest.mock import patch
 from uuid import uuid4
@@ -32,11 +33,11 @@ from ._outbox_case import (
     ReceiptAdapter,
     enqueue,
     make_managed,
-    mirror_update,
     open_provision_attempt,
     reset_renderer_audit_rotation,
     short_lock_timeout,
     system_job,
+    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -145,6 +146,32 @@ class _DeadlineCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCas
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         return NSOIntentOutboxEntry.objects.filter(device=device, consumed_by_push_seq__isnull=True).count()
+
+    def _alarm_during_stamp(self, row, matches):
+        def raise_when_blocked(waiting_pid, holder_pid):
+            try:
+                wait_until_postgres_blocks(waiting_pid, "progress stamp")
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT %s = ANY(pg_blocking_pids(%s))", [holder_pid, waiting_pid])
+                    self.assertTrue(cursor.fetchone()[0])
+                    signal.raise_signal(signal.SIGALRM)
+                    # Cancel the SQL before the test releases the row lock.
+                    cursor.execute("SELECT pg_cancel_backend(%s)", [waiting_pid])
+            finally:
+                connection.close()
+
+        def interrupt(execute, sql, params, many, context):
+            if not matches(sql):
+                return execute(sql, params, many, context)
+            waiting_pid = connection.connection.info.backend_pid
+            with HeldRowLock(row) as holder, ThreadPoolExecutor(max_workers=1) as observer:
+                alarm = observer.submit(raise_when_blocked, waiting_pid, holder.pid)
+                try:
+                    return execute(sql, params, many, context)
+                finally:
+                    alarm.result(timeout=6)
+
+        return connection.execute_wrapper(interrupt)
 
 
 class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
@@ -255,6 +282,29 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
             system_job(jobs.AuditRendererScopesJob).run()
         self.assertEqual(polls, [str(tombstone.pk), str(later.pk)])
 
+    def test_an_alarm_during_the_tombstone_stamp_carries_the_rotation(self):
+        from netbox_nso_plugin import adapter_client, jobs
+
+        _device, management = make_managed("job-deadline-tombstone-stamp", 19211)
+        tombstone = open_provision_attempt(management)
+        expected_stamp = tombstone.updated_at
+        evidence = {"status": "running", "provision_attempt_id": str(tombstone.pk)}
+        job = system_job(jobs.AdvanceStaleOnboardingJob)
+
+        adapter_client.reset_session()
+        with (
+            patch.object(self.adapter, "_handle", return_value=make_response(200, evidence)) as poll,
+            self._alarm_during_stamp(tombstone, lambda sql: sql.startswith(f'UPDATE "{tombstone._meta.db_table}"')),
+            self.assertRaises(JobTimeoutException),
+        ):
+            job.run()
+
+        poll.assert_called_once()
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.updated_at, expected_stamp)
+        job.job.refresh_from_db()
+        self.assertIn(str(tombstone.pk), job.job.data["tombstone_rotation"].get("lock_skipped", {}))
+
     def test_a_held_outbox_row_does_not_hold_a_repair_send_past_the_audit_deadline(self):
         from netbox_nso_plugin import renderer_audit
         from netbox_nso_plugin.models import NSOIntentOutboxState
@@ -283,178 +333,6 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
 
 
 class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
-    def test_a_pending_rekey_does_not_patch_a_reused_adapter_id(self):
-        from netbox_nso_plugin import adapter_client, jobs
-
-        _device, management = make_managed("job-deadline-rekey-reused", 19203)
-        other, _other_management = make_managed("job-deadline-rekey-other", 19204, index=2)
-        mirror_update(management, source_rekey_pending=True, adapter_link_error="Rekey failed.")
-        listing = self._listing(management)
-        listing[0].update(nso_device_name="other-source", netbox_device_id=other.pk)
-        writes = []
-        respond = self.adapter._handle
-
-        def reused_inventory(method, url, **kwargs):
-            if method == "GET" and url.endswith("/api/v1/devices"):
-                return make_response(200, listing)
-            if url.endswith(f"/devices/{management.adapter_device_id}") and method == "PATCH":
-                writes.append(kwargs["json"])
-                return make_response(200, {"source_epoch": 2})
-            return respond(method, url, **kwargs)
-
-        adapter_client.reset_session()
-        with patch.object(self.adapter, "_handle", reused_inventory), without_commit_drain():
-            system_job(jobs.RefreshDeviceSyncCacheJob).run()
-
-        self.assertEqual(writes, [])
-        management.refresh_from_db()
-        self.assertTrue(management.source_rekey_pending)
-
-    def test_the_next_tick_retries_a_rekey_interrupted_in_its_callback(self):
-        self._retry_rekey_after_alarm(during_outcome=False)
-
-    def test_the_next_tick_retries_a_rekey_interrupted_while_recording_its_outcome(self):
-        self._retry_rekey_after_alarm(during_outcome=True)
-
-    def _retry_rekey_after_alarm(self, *, during_outcome):
-        from netbox_nso_plugin import adapter_client, jobs
-
-        _device, management = make_managed("job-deadline-rekey-alarm", 19205)
-        listing = self._listing(management)
-        listing[0]["nso_device_name"] = "old-source"
-        patches = []
-        respond = self.adapter._handle
-
-        def interrupt_first_rekey(method, url, **kwargs):
-            if method == "GET" and url.endswith("/api/v1/devices"):
-                return make_response(200, listing)
-            if method == "PATCH":
-                patches.append(kwargs["json"])
-                if len(patches) == 1:
-                    if during_outcome:
-                        return make_response(503, {"error": {"message": "Adapter unavailable."}})
-                    signal.raise_signal(signal.SIGALRM)
-                listing[0]["nso_device_name"] = management.nso_device_name
-                return make_response(200, {"source_epoch": 2})
-            return respond(method, url, **kwargs)
-
-        def interrupt_recording(execute, sql, params, many, context):
-            if during_outcome and patches and sql.startswith("UPDATE ") and '"adapter_link_outcome_attempt" =' in sql:
-                signal.raise_signal(signal.SIGALRM)
-            return execute(sql, params, many, context)
-
-        adapter_client.reset_session()
-        with patch.object(self.adapter, "_handle", interrupt_first_rekey), without_commit_drain():
-            with connection.execute_wrapper(interrupt_recording), self.assertRaises(JobTimeoutException):
-                system_job(jobs.RefreshDeviceSyncCacheJob).run()
-            management.refresh_from_db()
-            self.assertTrue(management.source_rekey_pending)
-            self.assertGreater(management.adapter_link_attempt, management.adapter_link_outcome_attempt)
-            system_job(jobs.RefreshDeviceSyncCacheJob).run()
-
-        management.refresh_from_db()
-        self.assertEqual(len(patches), 2)
-        self.assertFalse(management.source_rekey_pending)
-        self.assertEqual(management.adapter_source_epoch, 2)
-        self.assertEqual(management.adapter_link_attempt, management.adapter_link_outcome_attempt)
-
-    def test_retrying_onboard_for_an_unmapped_source_change_clears_the_fence(self):
-        from netbox_nso_plugin import adapter_client, jobs
-        from netbox_nso_plugin.management_lifecycle import save_management
-
-        _device, management = make_managed("job-deadline-rekey-unmapped", 19206)
-        mirror_update(management, adapter_device_id=None)
-        posts = []
-        respond = self.adapter._handle
-
-        def onboard_on_retry(method, url, **kwargs):
-            if url.endswith("/api/v1/devices"):
-                if method == "GET":
-                    return make_response(200, [])
-                if method == "POST":
-                    posts.append(kwargs["json"]["nso_device_name"])
-                    if len(posts) == 1:
-                        return make_response(503, {"error": {"message": "Adapter unavailable."}})
-                    return make_response(200, {"id": 19206, "source_epoch": 2})
-            return respond(method, url, **kwargs)
-
-        adapter_client.reset_session()
-        with patch.object(self.adapter, "_handle", onboard_on_retry), without_commit_drain():
-            management.nso_device_name = "new-source"
-            save_management(management, update_fields=["nso_device_name"])
-            management.refresh_from_db()
-            self.assertTrue(management.source_rekey_pending)
-            self.assertIsNone(management.adapter_device_id)
-            self.assertTrue(management.adapter_link_error)
-            system_job(jobs.RefreshDeviceSyncCacheJob).run()
-
-        management.refresh_from_db()
-        self.assertEqual(posts, ["new-source", "new-source"])
-        self.assertEqual(management.adapter_device_id, 19206)
-        self.assertEqual(management.adapter_source_epoch, 2)
-        self.assertEqual(management.adapter_link_error, "")
-        self.assertFalse(management.source_rekey_pending)
-
-    def test_the_next_tick_retries_a_rekey_cut_off_before_its_patch(self):
-        from netbox_nso_plugin import adapter_client, jobs
-
-        _device, management = make_managed("job-deadline-rekey-retry", 19200)
-        management.refresh_from_db()
-        prior_outcome = management.adapter_link_outcome_attempt
-        listing = self._listing(management)
-        listing[0]["nso_device_name"] = "old-source"
-        patches = []
-        clock = time.monotonic
-        delay = 0
-        table = management._meta.db_table
-
-        def slow_fence_write(execute, sql, params, many, context):
-            nonlocal delay
-            result = execute(sql, params, many, context)
-            if sql.startswith(f'UPDATE "{table}" SET "source_rekey_pending" ='):
-                delay = 130
-            return result
-
-        def respond(method, url, **kwargs):
-            if method == "GET" and url.endswith("/api/v1/devices"):
-                return make_response(200, listing)
-            if method == "PATCH":
-                patches.append(kwargs["json"])
-                listing[0]["nso_device_name"] = management.nso_device_name
-                return make_response(200, {"source_epoch": 2})
-            return make_response(200, {})
-
-        adapter_client.reset_session()
-        with (
-            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 240),
-            patch.object(time, "monotonic", side_effect=lambda: clock() + delay),
-            patch.object(self.adapter, "_handle", respond),
-            without_commit_drain(),
-        ):
-            with connection.execute_wrapper(slow_fence_write):
-                system_job(jobs.RefreshDeviceSyncCacheJob).run()
-            management.refresh_from_db()
-            self.assertTrue(management.source_rekey_pending)
-            self.assertTrue(management.adapter_link_error)
-            self.assertGreater(management.adapter_link_outcome_attempt, prior_outcome)
-            self.assertEqual(patches, [])
-
-            system_job(jobs.RefreshDeviceSyncCacheJob).run()
-
-        management.refresh_from_db()
-        self.assertFalse(management.source_rekey_pending)
-        self.assertEqual(management.adapter_source_epoch, 2)
-        self.assertEqual(management.adapter_link_error, "")
-        self.assertEqual(
-            patches,
-            [
-                {
-                    "nso_instance": management.nso_instance.adapter_instance_id,
-                    "nso_device_name": management.nso_device_name,
-                }
-            ],
-        )
-
     def test_a_slow_successful_snapshot_leaves_time_for_the_drain(self):
         from netbox_nso_plugin import adapter_client, jobs
 
@@ -978,6 +856,37 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertIsNotNone(later.adapter_link_attempted_at)
         job.job.refresh_from_db()
         self.assertIn(str(first.pk), job.job.data["repair_rotation"]["lock_skipped"])
+
+    def test_an_alarm_during_the_fallback_link_stamp_carries_the_rotation(self):
+        from netbox_nso_plugin import adapter_client, jobs, sync_cache
+
+        _device, management = make_managed("job-deadline-relink-stamp", 19212)
+        job = system_job(jobs.RefreshDeviceSyncCacheJob)
+        repair_failed = False
+
+        def fail_repair(_device_id):
+            nonlocal repair_failed
+            repair_failed = True
+            raise RuntimeError("Repair failed.")
+
+        def locks_management(sql):
+            table = management._meta.db_table
+            return repair_failed and f'FROM "{table}"' in sql and f'FOR UPDATE OF "{table}"' in sql
+
+        adapter_client.reset_session()
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 30),
+            patch.object(self.adapter, "_handle", return_value=make_response(200, [])),
+            patch.object(sync_cache, "invalidate_delivery_baselines", fail_repair),
+            self._alarm_during_stamp(management, locks_management),
+            self.assertRaises(JobTimeoutException),
+        ):
+            job.run()
+
+        management.refresh_from_db()
+        self.assertIsNone(management.adapter_link_attempted_at)
+        job.job.refresh_from_db()
+        self.assertIn(str(management.pk), job.job.data["repair_rotation"].get("lock_skipped", {}))
 
     def test_a_refresh_that_uses_its_whole_share_still_leaves_the_link_repair_its_own(self):
         from netbox_nso_plugin import jobs
