@@ -356,6 +356,23 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
 
 
 class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
+    def test_the_inventory_read_runs_on_the_job_thread(self):
+        """A worker thread would resolve the adapter settings on a database connection of its own."""
+        from netbox_nso_plugin import jobs, sync_cache
+
+        make_managed("job-deadline-snapshot-thread", 19209)
+        threads = []
+        read = sync_cache._snapshot
+
+        def recording(rows):
+            threads.append(threading.current_thread())
+            return read(rows)
+
+        with patch.object(sync_cache, "_snapshot", recording):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        self.assertEqual(threads, [threading.current_thread()])
+
     def test_a_slow_successful_snapshot_leaves_time_for_the_drain(self):
         from netbox_nso_plugin import adapter_client, jobs
 
