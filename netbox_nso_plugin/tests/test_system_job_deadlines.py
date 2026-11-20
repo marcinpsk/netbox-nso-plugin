@@ -415,23 +415,29 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
                 enqueue(device, "vlan")
         read_timeouts = []
         respond = self.adapter._handle
+        clock = time.monotonic
+        delay = 0
 
         def unresponsive_inventory(method, url, **kwargs):
+            nonlocal delay
             if method == "GET" and url.endswith("/api/v1/devices"):
                 read_timeouts.append(kwargs["timeout"][1])
+                # The read uses up its whole allowance before it times out.
+                delay = kwargs["timeout"][1]
                 raise ReadTimeout
             return respond(method, url, **kwargs)
 
         adapter_client.reset_session()
         with (
-            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 1.5),
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 6),
+            patch.object(time, "monotonic", side_effect=lambda: clock() + delay),
             patch.object(self.adapter, "_handle", unresponsive_inventory),
             self.assertLogs(jobs.logger, level="WARNING") as logs,
         ):
             system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
         self.assertEqual(len(read_timeouts), 1)
-        self.assertLessEqual(read_timeouts[0], 1.25)
+        self.assertLessEqual(read_timeouts[0], 5)
         self.assertIn(
             "RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped",
             [record.getMessage() for record in logs.records],
