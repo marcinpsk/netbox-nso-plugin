@@ -20,14 +20,14 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from dcim.models import Interface
-from django.conf import settings
-from django.db import DatabaseError, OperationalError, connection, transaction
+from django.db import DatabaseError, connection, transaction
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
+from requests.exceptions import ReadTimeout
 from rq.timeouts import JobTimeoutException
 
-from ._adapter_http import make_response, make_transport_session, patch_matching_control_state
+from ._adapter_http import make_response, patch_matching_control_state
 from ._outbox_case import (
     CFG,
     HeldRowLock,
@@ -355,48 +355,6 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
         self.assertGreater(self._unconsumed(device), 0)
 
 
-class TestSyncCacheAdapterConnection(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
-    def test_inventory_uses_enabled_adapter_connection_when_worker_lookup_fails(self):
-        from netbox_nso_plugin import adapter_client, jobs
-        from netbox_nso_plugin.models import AdapterConnection
-
-        device, management = make_managed("job-adapter-connection", 19220)
-        adapter_url = "http://configured-adapter.invalid"
-        AdapterConnection.objects.create(url=adapter_url, enabled=True)
-        listing = [
-            {
-                "id": management.adapter_device_id,
-                "nso_instance": management.nso_instance.adapter_instance_id,
-                "nso_device_name": management.nso_device_name,
-                "netbox_device_id": device.pk,
-            }
-        ]
-        session = make_transport_session(make_response(200, listing))
-        filter_connections = AdapterConnection.objects.filter
-
-        def filter_on_main_thread(*args, **kwargs):
-            if threading.current_thread() is not threading.main_thread():
-                raise OperationalError("PostgreSQL refused the worker connection.")
-            return filter_connections(*args, **kwargs)
-
-        plugin_configs = {
-            **settings.PLUGINS_CONFIG,
-            "netbox_nso_plugin": {"adapter_url": CFG["url"], "adapter_token": CFG["token"]},
-        }
-        adapter_client.reset_config_cache()
-        self.addCleanup(adapter_client.reset_config_cache)
-        with (
-            self.settings(PLUGINS_CONFIG=plugin_configs),
-            patch.object(AdapterConnection.objects, "filter", filter_on_main_thread),
-            patch.object(adapter_client.requests, "Session", return_value=session),
-        ):
-            system_job(jobs.RefreshDeviceSyncCacheJob).run()
-
-        session.send.assert_called_once()
-        request = session.send.call_args.args[0]
-        self.assertEqual((request.method, request.url), ("GET", f"{adapter_url}/api/v1/devices"))
-
-
 class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
     def test_a_slow_successful_snapshot_leaves_time_for_the_drain(self):
         from netbox_nso_plugin import adapter_client, jobs
@@ -434,35 +392,33 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
     def test_a_snapshot_that_exceeds_its_budget_leaves_outbox_compaction_enabled(self):
         from netbox_nso_plugin import adapter_client, jobs
 
-        device, management = make_managed("job-deadline-snapshot-expired", 19202)
+        device, _management = make_managed("job-deadline-snapshot-expired", 19202)
         for _ in range(2):
             with without_commit_drain(), transaction.atomic():
                 enqueue(device, "vlan")
-        release = threading.Event()
-        inventory_started = threading.Event()
+        read_timeouts = []
         respond = self.adapter._handle
 
         def unresponsive_inventory(method, url, **kwargs):
             if method == "GET" and url.endswith("/api/v1/devices"):
-                inventory_started.set()
-                release.wait(2)
-                return make_response(200, self._listing(management))
+                read_timeouts.append(kwargs["timeout"][1])
+                raise ReadTimeout
             return respond(method, url, **kwargs)
 
         adapter_client.reset_session()
-        started = time.monotonic()
-        try:
-            with (
-                patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 1.5),
-                patch.object(self.adapter, "_handle", unresponsive_inventory),
-                patch.object(_SlowAdapter, "DELAY", 0),
-            ):
-                system_job(jobs.RefreshDeviceSyncCacheJob).run()
-        finally:
-            release.set()
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 1.5),
+            patch.object(self.adapter, "_handle", unresponsive_inventory),
+            self.assertLogs(jobs.logger, level="WARNING") as logs,
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
-        self.assertTrue(inventory_started.is_set())
-        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertEqual(len(read_timeouts), 1)
+        self.assertLessEqual(read_timeouts[0], 1.25)
+        self.assertIn(
+            "RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped",
+            [record.getMessage() for record in logs.records],
+        )
         self.assertEqual(self._unconsumed(device), 1)
 
     def test_a_slow_adapter_defers_the_outbox_tail_and_the_sweep_still_runs(self):

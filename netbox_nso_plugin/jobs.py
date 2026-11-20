@@ -326,9 +326,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     @_deployment_guarded("device maintenance tick")
     def _run(deadline, refresh_rotation, repair_rotation, outbox_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
-        from . import adapter_client
         from .adapter_client import requests_until
-        from .delivery import SendDeadlineExceeded, _under_deadline
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
         from .settlement import sweep_static_route_settlements
@@ -338,11 +336,11 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         snapshot_started = time.monotonic()
         snapshot_budget = (deadline - snapshot_started) * SNAPSHOT_SHARE
         snapshot = rows, None, None
+        # One adapter snapshot for both passes: they ask the same question of the same data,
+        # and a second call could disagree with the first mid-sweep.
         if snapshot_budget > 0:
-            with requests_until(snapshot_started + snapshot_budget), contextlib.suppress(SendDeadlineExceeded):
-                # Cache the adapter settings so the worker does not open a database connection.
-                adapter_client._resolve_config()
-                snapshot = _under_deadline(lambda _body: _snapshot(rows), snapshot_budget)(None)
+            with requests_until(snapshot_started + snapshot_budget):
+                snapshot = _snapshot(rows)
 
         budget = max(0, deadline - time.monotonic())
         before_sweep = deadline - budget * SETTLEMENT_SWEEP_SHARE
