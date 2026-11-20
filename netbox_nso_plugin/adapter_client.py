@@ -155,6 +155,20 @@ _session_cls = None
 # builds its own (#1503 §4.2, O-P16) and binds it here for the duration of that one call.
 _bound_session = contextvars.ContextVar("nso_bound_session", default=None)
 
+# A monotonic instant after which no request starts; a request's timeouts end at it too.
+_request_limit = contextvars.ContextVar("nso_request_limit", default=None)
+
+
+@contextmanager
+def requests_until(limit: float):
+    """Refuse every adapter request that would start after the monotonic *limit*, or an earlier outer one."""
+    outer = _request_limit.get()
+    token = _request_limit.set(limit if outer is None else min(limit, outer))
+    try:
+        yield
+    finally:
+        _request_limit.reset(token)
+
 
 class AbortableTransport(requests.adapters.HTTPAdapter):
     """An HTTP transport that can end the requests it has in flight (#1503 O-P16).
@@ -603,6 +617,24 @@ def _error_envelope(resp):
     return err if isinstance(err, dict) else {}
 
 
+def _request_timeouts(override, cfg) -> tuple[float, float]:
+    """Return one request's ``(connect, read)`` timeouts, ended at the :func:`requests_until` limit."""
+    # READSEM S4 (R5-5): callers may pass an endpoint-specific (connect, read)
+    # timeout — e.g. the tab's live read-state fetch — instead of the configured one.
+    if override is not None:
+        connect_timeout, read_timeout = override
+    else:
+        read_timeout = cfg["timeout"]
+        connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
+    limit = _request_limit.get()
+    if limit is None:
+        return connect_timeout, read_timeout
+    remaining = limit - time.monotonic()
+    if remaining <= 0:
+        raise AdapterError("The run's time limit for adapter requests has passed.", code="request_limit")
+    return min(connect_timeout, remaining), min(read_timeout, remaining)
+
+
 def _request_response(method, path, **kwargs):
     """Send one adapter request and return the raw response, for callers that read a header."""
     from .native_authorization import refuse_adapter_call_in_mutation_phase
@@ -646,14 +678,7 @@ def _request_response(method, path, **kwargs):
     else:
         verify = True
 
-    # READSEM S4 (R5-5): callers may pass an endpoint-specific (connect, read)
-    # timeout — e.g. the tab's live read-state fetch — instead of the configured one.
-    override = kwargs.pop("timeout", None)
-    if override is not None:
-        connect_timeout, read_timeout = override
-    else:
-        read_timeout = cfg["timeout"]
-        connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
+    connect_timeout, read_timeout = _request_timeouts(kwargs.pop("timeout", None), cfg)
     try:
         session = _get_session()
         resp = session.request(

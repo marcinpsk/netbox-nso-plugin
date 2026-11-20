@@ -269,10 +269,87 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         for _index in range(DEFAULT_BATCH_SIZE + 1):
             self.history()
         job = Job.objects.create(name=jobs.PruneApplyLedgerJob.name, job_id=uuid4())
-        with patch.object(jobs, "PRUNE_TIME_BUDGET_SECONDS", 0):
+        with patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 0):
             jobs.PruneApplyLedgerJob(job).run()
-        self.assertEqual(NSOApplyAttempt.objects.count(), 1)
+        # An expired budget still examines the first record, and only that one.
+        self.assertEqual(NSOApplyAttempt.objects.count(), DEFAULT_BATCH_SIZE)
         self.assertIsNotNone(job.data["apply_ledger_cursor"])
+
+    def test_the_daily_job_sends_no_adapter_request_after_its_request_limit(self):
+        from core.models import Job
+
+        from netbox_nso_plugin import jobs
+
+        attempt, _execution = self.history()
+        job = Job.objects.create(name=jobs.PruneApplyLedgerJob.name, job_id=uuid4())
+        with patch.object(jobs, "SYSTEM_JOB_REQUEST_LIMIT_SECONDS", 0):
+            jobs.PruneApplyLedgerJob(job).run()
+
+        self.assertEqual(self.adapter.store.feed_requests, [])
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+
+    @staticmethod
+    def _cursor_after(attempt):
+        from netbox_nso_plugin.apply_retention import _expired_attempts
+
+        retention_at = _expired_attempts(timezone.now()).values_list("retention_at", flat=True).get(pk=attempt.pk)
+        return f"{retention_at.isoformat()}|{attempt.pk}"
+
+    def test_an_expired_deadline_stops_before_the_next_device_read_and_keeps_its_place(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        _device, other = make_managed("ledger-retention-deadline", 1769, index=2)
+        other.refresh_from_db()
+        self.adapter.store.add_device(nso_instance="placeholder", nso_device_name="placeholder-3", device_id=1769)
+        first, _execution = self.history(days=33)
+        later, _execution = self.history(days=32, management=other)
+        cursor = self._cursor_after(first)
+
+        result = prune_apply_ledger(execute=True, deadline=0.0)
+
+        self.assertEqual((result.examined, result.deleted, result.adapter_unavailable), (1, 1, False))
+        # A restart from the beginning would also find the later attempt, so check the cursor itself.
+        self.assertEqual(result.next_cursor, cursor)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=first.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
+        resumed = prune_apply_ledger(execute=True, cursor=result.next_cursor)
+        self.assertEqual(resumed.deleted, 1)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
+
+    def test_an_expired_deadline_stops_before_the_next_record_of_an_already_read_device(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        first, _execution = self.history(days=33)
+        later, _execution = self.history(days=32)
+        cursor = self._cursor_after(first)
+
+        result = prune_apply_ledger(execute=True, deadline=0.0)
+
+        self.assertEqual((result.examined, result.deleted, result.adapter_unavailable), (1, 1, False))
+        self.assertEqual(result.next_cursor, cursor)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=first.pk).exists())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
+        resumed = prune_apply_ledger(execute=True, cursor=result.next_cursor)
+        self.assertEqual(resumed.deleted, 1)
+
+    def test_a_lock_wait_timeout_on_one_device_retains_only_that_device(self):
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        from ._outbox_case import HeldRowLock, short_lock_timeout
+
+        _device, other = make_managed("ledger-retention-locked", 1770, index=2)
+        other.refresh_from_db()
+        self.adapter.store.add_device(nso_instance="placeholder", nso_device_name="placeholder-4", device_id=1770)
+        held, _execution = self.history(days=33)
+        removable, _execution = self.history(days=32, management=other)
+        short_lock_timeout(self)
+
+        with self.assertLogs("netbox_nso_plugin.jobs", level="WARNING"), HeldRowLock(self.management):
+            result = prune_apply_ledger(execute=True)
+
+        self.assertEqual((result.examined, result.deleted), (2, 1))
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=held.pk).exists())
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
 
     def test_adapter_outage_on_one_device_retains_only_that_device(self):
         _device, other = make_managed("ledger-retention-other", 1768, index=2)
@@ -367,6 +444,31 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
         _stamp, attempt_id = result.next_cursor.split("|", 1)
         self.assertEqual(attempt_id, str(removable.pk))
+
+    def test_a_passed_request_limit_stops_before_the_next_device_and_keeps_its_place(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        removable, _execution = self.history(days=33)
+        _device, other = make_managed("ledger-retention-1768", 1768, index=2)
+        other.refresh_from_db()
+        later, _execution = self.history(days=32, management=other)
+        real = adapter_client.get_settlement_feed
+
+        def feed(device_id, **kwargs):
+            if device_id == 1768:
+                raise adapter_client.AdapterError("The run's time limit has passed.", code="request_limit")
+            return real(device_id, **kwargs)
+
+        with patch.object(adapter_client, "get_settlement_feed", side_effect=feed):
+            result = prune_apply_ledger(execute=True, cursor=None)
+        self.assertEqual((result.examined, result.deleted, result.adapter_unavailable), (1, 1, False))
+        self.assertTrue(result.request_limit_reached)
+        _stamp, attempt_id = result.next_cursor.split("|", 1)
+        self.assertEqual(attempt_id, str(removable.pk))
+        resumed = prune_apply_ledger(execute=True, cursor=result.next_cursor)
+        self.assertEqual(resumed.deleted, 1)
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=later.pk).exists())
 
     def test_prune_command_fails_when_the_adapter_is_unreachable(self):
         attempt, _execution = self.history()

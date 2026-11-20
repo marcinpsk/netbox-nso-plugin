@@ -464,6 +464,91 @@ class TestUnresolvedExecution(_SettlementCase):
         assert (result.stalled, result.consumed, result.cursor) == (False, SETTLE_FEED_PAGE, SETTLE_FEED_PAGE)
         assert self._cursor(mgmt).settle_cursor_seq == SETTLE_FEED_PAGE
 
+    def test_the_feed_deadline_stops_the_evidence_feed_read_like_the_bound(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, sweep_static_route_settlements
+
+        device = _make_device("feeddeadline")
+        mgmt = _make_mgmt(device, "feeddeadline", 83, adapter=self.adapter)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_resume_pending=True)
+        for _ in range(2 * SETTLE_FEED_PAGE + 1):
+            self.adapter.store.terminal_job(83, job_type="sync")
+
+        assert sweep_static_route_settlements(feed_deadline=0.0) == (1, 0)
+
+        requests = [request for request in self.adapter.store.feed_requests if request[0] == 83]
+        assert (83, SETTLE_FEED_PAGE, SETTLE_FEED_PAGE) not in requests, requests
+        # The expired deadline also stops the carrier commits after the first.
+        assert self._cursor(mgmt).settle_cursor_seq == 1
+
+    def test_a_pass_whose_evidence_read_stopped_at_the_deadline_is_not_drained(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import settlement
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, consume_static_route_settlements
+
+        device = _make_device("feedstopped")
+        mgmt = _make_mgmt(device, "feedstopped", 87, adapter=self.adapter)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_resume_pending=True)
+        for _ in range(2 * SETTLE_FEED_PAGE + 1):
+            self.adapter.store.terminal_job(87, job_type="sync")
+        # An earlier stopped pass records the cursor's store and device.
+        assert consume_static_route_settlements(mgmt, deadline=0.0).cursor == 1
+        real_read = settlement._read_device_evidence
+
+        def read_then_another_poll_advances(management, deadline):
+            read = real_read(management, deadline)
+            # Another poll committed all but the last carrier before this pass locked the row.
+            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_cursor_seq=2 * SETTLE_FEED_PAGE)
+            return read
+
+        with patch.object(settlement, "_read_device_evidence", side_effect=read_then_another_poll_advances):
+            stopped = consume_static_route_settlements(mgmt, deadline=0.0)
+
+        assert (stopped.consumed, stopped.cursor) == (1, 2 * SETTLE_FEED_PAGE + 1)
+        assert stopped.drained is False
+        assert self._cursor(mgmt).settle_resume_pending is True
+
+    def test_the_deadline_stops_the_carrier_commits_after_the_first(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("commitdeadline")
+        mgmt = _make_mgmt(device, "commitdeadline", 85, adapter=self.adapter)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(settle_resume_pending=True)
+        for _ in range(3):
+            self.adapter.store.terminal_job(85, job_type="sync")
+
+        stopped = consume_static_route_settlements(mgmt, deadline=0.0)
+
+        assert (stopped.consumed, stopped.drained, stopped.cursor) == (1, False, 1)
+        row = self._cursor(mgmt)
+        assert (row.settle_cursor_seq, row.settle_resume_pending) == (1, True)
+        resumed = consume_static_route_settlements(mgmt)
+        assert (resumed.consumed, resumed.drained, resumed.cursor) == (2, True, 3)
+        assert self._cursor(mgmt).settle_resume_pending is False
+
+    def test_the_deadline_still_commits_one_new_carrier_after_the_historical_ones(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("historydeadline")
+        mgmt = _make_mgmt(device, "historydeadline", 86, adapter=self.adapter)
+        store = self.adapter.store
+        settled = store.terminal_job(86, job_type="sync")
+        assert consume_static_route_settlements(mgmt).cursor == 1
+        for _ in range(2):
+            store.terminal_job(86, job_type="sync")
+
+        # The committed carrier comes back as history, which never moves the cursor.
+        with patch("netbox_nso_plugin.settlement._historical_carriers", return_value=[settled["id"]]):
+            stopped = consume_static_route_settlements(mgmt, deadline=0.0)
+
+        assert (stopped.consumed, stopped.drained, stopped.cursor) == (1, False, 2)
+        assert self._cursor(mgmt).settle_cursor_seq == 2
+
     def test_backlog_beyond_the_evidence_bound_still_stalls_on_an_unresolved_apply(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
+import itertools
 import logging
 import time
 from contextlib import contextmanager
@@ -872,14 +873,19 @@ def _compactable(row, held) -> bool:
     )
 
 
-def compaction_candidates(limit=None) -> list[tuple[int, str]]:
-    """Return keys with an eligible contiguous same-kind span."""
-    from django.db.models import Count
+def compaction_candidates(limit=None, *, deadline=None, rotation=None) -> list[tuple[int, str]]:
+    """Return keys with an eligible contiguous same-kind span, found before *deadline*.
+
+    The keys come in ``(device_id, scope)`` order, from the first key after the one *rotation* (carried
+    between runs) names, and then from the start. Until discovery finds a candidate, *rotation* names
+    each key it reads, so that a pass whose discovery uses the deadline still moves on.
+    """
+    from django.db.models import Count, Q
 
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
     limit = DRAIN_BATCH if limit is None else limit
-    if limit == 0:
+    if limit == 0 or _past(deadline):
         return []
     grouped = (
         NSOIntentOutboxEntry.objects.filter(consumed_by_push_seq__isnull=True)
@@ -888,12 +894,23 @@ def compaction_candidates(limit=None) -> list[tuple[int, str]]:
         .filter(rows__gt=1)
         .order_by("device_id", "scope")
     )
+    keys = grouped.iterator()
+    after = (rotation or {}).get("compacted_after")
+    if after is not None:
+        later = Q(device_id__gt=after[0]) | Q(device_id=after[0], scope__gt=after[1])
+        keys = itertools.chain(grouped.filter(later).iterator(), grouped.exclude(later).iterator())
     candidates = []
-    for device_id, scope, _rows in grouped.iterator():
+    for device_id, scope, _rows in keys:
+        if _past(deadline):
+            break
+        if rotation is not None and not candidates:
+            rotation["compacted_after"] = [device_id, scope]
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).only("claim_deletions").first()
         held = {int(record["route_id"]) for record in (state.claim_deletions or [])} if state is not None else set()
         previous_kind = None
         for row in _unconsumed(device_id, scope).only("kind", "transitions").order_by("id").iterator():
+            if _past(deadline):
+                return candidates
             if not _compactable(row, held):
                 previous_kind = None
             elif row.kind == previous_kind:
@@ -932,8 +949,8 @@ def revocation_hit(claim: Claim) -> bool:
     return False
 
 
-def send_claim(claim: Claim, *, deadline=None):
-    """Make the claim's HTTP call and return the adapter's answer.
+def send_claim(claim: Claim, *, deadline_at=None):
+    """Make the claim's HTTP call before the monotonic *deadline_at*, and return the adapter's answer.
 
     Returns a private control sentinel when the device is no longer managed or the pre-send
     scan found a revocation, in both cases without sending. Parking is not a
@@ -958,13 +975,19 @@ def send_claim(claim: Claim, *, deadline=None):
         deletions=claim.deletions,
         marking_mode=claim.marking_mode,
         push_seq=claim.push_seq,
-        deadline=SEND_DEADLINE.total_seconds() if deadline is None else deadline,
+        # Measured after the scan, which can wait on the state-row lock.
+        deadline=_remaining_send_deadline(deadline_at),
     )
 
 
 def _send_clock() -> float:
     """Return the monotonic clock used for a shared send deadline."""
     return time.monotonic()
+
+
+def _past(deadline) -> bool:
+    """Whether a monotonic *deadline* is set and has passed."""
+    return deadline is not None and _send_clock() >= deadline
 
 
 def _remaining_send_deadline(deadline_at) -> float:
@@ -1463,19 +1486,24 @@ def _stamp_attempt(device_id, scope) -> None:
         state.save()
 
 
-def _restamp_attempt(device_id, scope) -> None:
+def _restamp_attempt(device_id, scope) -> bool:
     """Stamp a key whose drain RAISED, in a transaction of its own (O1.33).
 
     The claim stamps itself before anything can refuse, but that write rolls back with the
     transaction it belongs to, so a key raising inside the claim (a render that blows up, a
     fold that hits a non-retryable error) leaves no stamp at all and stays at the head of
     every bounded pass, starving the keys behind it. The compact-retry path already
-    re-stamps for the same reason.
+    re-stamps for the same reason. Returns False when the stamp's lock wait timed out, so that
+    the caller can rotate the key another way.
     """
+    from .jobs import lock_wait_timed_out
+
     try:
         _stamp_attempt(device_id, scope)
-    except Exception:  # noqa: BLE001 (a key that cannot even be stamped must not abort the pass)
+    except Exception as exc:  # noqa: BLE001 (a key that cannot even be stamped must not abort the pass)
         logger.exception("intent outbox attempt stamp failed for %s/%s", device_id, scope)
+        return not lock_wait_timed_out(exc)
+    return True
 
 
 def _claim_or_compact(device_id, scope, *, mode, force):
@@ -1550,7 +1578,6 @@ def _claim_refusal_outcome(device_id, scope, refusal) -> str:
     return REFUSED
 
 
-@_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
     scope,
@@ -1569,12 +1596,30 @@ def _drain_once(
     ``_chained`` marks a pass the drain started for latency, not one the caller asked for:
     its claim is nobody's operation to name, so it never records into an open capture.
     """
+    if _deadline_at is None:
+        # Before the admission, so that the time it takes counts against the caller's budget.
+        _deadline_at = _send_clock() + (SEND_DEADLINE.total_seconds() if deadline is None else deadline)
+    return _drain_admitted(
+        device_id,
+        scope,
+        mode=mode,
+        force=force,
+        chain=chain,
+        reform=reform,
+        deadline=deadline,
+        _deadline_at=_deadline_at,
+        _chained=_chained,
+        _audit=_audit,
+    )
+
+
+@_deployment_guarded("intent drain")
+def _drain_admitted(device_id, scope, *, mode, force, chain, reform, deadline, _deadline_at, _chained, _audit):
+    """Run :func:`_drain_once` under the deployment admission."""
     _refuse_in_transaction("drain")
     from .renderer_audit import audit_renderer_scopes
 
     audit_deadline = None
-    if _deadline_at is None:
-        _deadline_at = _send_clock() + (SEND_DEADLINE.total_seconds() if deadline is None else deadline)
     if _audit and _deadline_at is not None:
         audit_started_at = time.monotonic()
         audit_deadline = audit_started_at + _remaining_send_deadline(_deadline_at)
@@ -1600,7 +1645,7 @@ def _drain_once(
     if claimed is None:
         return NOTHING, None
     try:
-        answer = send_claim(claimed, deadline=_remaining_send_deadline(_deadline_at))
+        answer = send_claim(claimed, deadline_at=_deadline_at)
     except Exception as exc:  # noqa: BLE001 (the operation is replayed, so the failure is data)
         return _send_failure_outcome(claimed, exc), None
     if answer is _ABANDONED_SEND and reform > 0:
@@ -1955,18 +2000,26 @@ def _pending(device_id, scope) -> bool:
     return _work_pending(state)
 
 
-def drain_candidates(limit=None) -> list[tuple[int, str]]:
+def drain_candidates(limit=None, *, lock_skipped=None) -> list[tuple[int, str]]:
     """Return the keys this pass may claim, least recently attempted first.
 
     Re-queried, never taken from a caller's row objects: the tick's link repair writes the
     database while leaving those objects holding ``None`` or a dead adapter id, so a reused
     list would skip a device repaired this tick or push to an id that no longer exists.
+    *lock_skipped* maps a key to when its lock wait last timed out, which counts as an attempt.
     """
+    limit = DRAIN_BATCH if limit is None else limit
+    return _ordered_candidates(limit, lock_skipped)[:limit]
+
+
+def _ordered_candidates(limit, lock_skipped) -> list[tuple[int, str]]:
+    """Return every key the candidate queries read, in drain order. The first *limit* are the batch."""
     from django.db.models import F, OuterRef, Q, Subquery
 
     from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
-    limit = DRAIN_BATCH if limit is None else limit
+    # A lock-skipped key moves back after the database's order, so each query reads one more row for each.
+    fetch = limit + len(lock_skipped or {})
     fresh = _db_now() - LEASE
     state_for_entry = NSOIntentOutboxState.objects.filter(
         device_id=OuterRef("device_id"),
@@ -1985,48 +2038,66 @@ def drain_candidates(limit=None) -> list[tuple[int, str]]:
         )
         .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
         .order_by(F("attempted_at").asc(nulls_first=True), "device_id", "scope")
-        .distinct()[:limit]
+        .distinct()[:fetch]
     )
     state_keys = list(
         NSOIntentOutboxState.objects.filter(device__nso_management__adapter_device_id__isnull=False)
         .filter(Q(push_seq__isnull=False) | ~Q(queued_deletions=[]))
         .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
         .order_by(F("last_drain_attempted_at").asc(nulls_first=True), "device_id", "scope")
-        .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))[:limit]
+        .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))[:fetch]
     )
 
     by_key = {}
     for row in [*entry_keys, *state_keys]:
         key = (row["device_id"], row["scope"])
-        by_key[key] = row["attempted_at"]
+        attempted, skipped = row["attempted_at"], (lock_skipped or {}).get(key)
+        by_key[key] = skipped if skipped is not None and (attempted is None or skipped > attempted) else attempted
     # Never-attempted keys sort before keys with a recorded attempt.
     ordered = [
         (attempted is not None, attempted or datetime.datetime.min.replace(tzinfo=datetime.UTC), key)
         for key, attempted in by_key.items()
     ]
     ordered.sort(key=lambda item: (item[0], item[1], item[2]))
-    return [key for _stamped, _at, key in ordered[:limit]]
+    return [key for _stamped, _at, key in ordered]
 
 
-def compact_intent_outbox(limit=None) -> None:
+def compact_intent_outbox(limit=None, *, deadline: float | None = None, rotation: dict | None = None) -> None:
     """Compact the bounded candidate set unless a deployment has paused it."""
     try:
         with _deployment_operation("intent outbox compaction"):
-            _compact_intent_outbox(limit)
+            _compact_intent_outbox(limit, deadline=deadline, rotation=rotation)
     except DeploymentQuiesced:
         logger.info("intent outbox compaction is paused for a deployment")
 
 
-def _compact_intent_outbox(limit=None) -> None:
-    """Compact an admitted candidate set without contacting the adapter."""
-    for device_id, scope in compaction_candidates(limit):
+def _compact_intent_outbox(limit=None, *, deadline=None, rotation=None) -> None:
+    """Compact an admitted candidate set without contacting the adapter, stopping between keys at *deadline*.
+
+    *rotation* (carried between runs) keeps the last key the pass reached, and the next pass starts after it.
+    """
+    for index, (device_id, scope) in enumerate(compaction_candidates(limit, deadline=deadline, rotation=rotation)):
+        # Discovery shares the deadline, so a pass that found a key compacts at least that key.
+        if index and _past(deadline):
+            break
+        if rotation is not None:
+            # Before the attempt, so that a key whose lock wait times out does not stay first.
+            rotation["compacted_after"] = [device_id, scope]
         try:
             compact(device_id, scope)
         except Exception:  # noqa: BLE001 (one key's compaction must not abort the fleet pass)
             logger.exception("intent outbox compaction failed for %s/%s", device_id, scope)
+    if _past(deadline):
+        logger.info("intent outbox compaction deferred at the run deadline; remaining keys wait for the next tick")
 
 
-def drain_intent_outbox(limit=None) -> tuple[int, int]:
+def drain_intent_outbox(
+    limit=None,
+    *,
+    deadline: float | None = None,
+    compaction_deadline: float | None = None,
+    rotation: dict | None = None,
+) -> tuple[int, int]:
     """Appendix O's tick pass. Returns ``(drained, failed)``.
 
     Bounded, candidate-filtered and starvation-free: a key is attempted only when it owes a
@@ -2036,35 +2107,71 @@ def drain_intent_outbox(limit=None) -> tuple[int, int]:
     Compaction runs first, over its OWN candidates: a key whose claim is stuck on a
     replayable failure is not drainable and would never be compacted otherwise, which is
     exactly the case where a burst accumulates.
+
+    A monotonic *deadline* stops the pass between keys and bounds each key's send. An earlier
+    *compaction_deadline* also ends compaction's lock waits, so that the sends keep the rest.
+    A key whose lock wait timed out records no attempt, so *rotation* (carried between runs)
+    keeps when the pass last reached it, and the next pass orders it as an attempt. It also
+    keeps the last key compaction reached.
     """
-    return _drain_intent_outbox(limit)
+    return _drain_intent_outbox(limit, deadline=deadline, compaction_deadline=compaction_deadline, rotation=rotation)
 
 
-def _drain_intent_outbox(limit=None) -> tuple[int, int]:
+def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None, rotation=None) -> tuple[int, int]:
     """Run one tick with a new deployment admission for each bounded stage."""
+    from .jobs import lock_wait_timed_out, lock_waits_until
+
     try:
         with _deployment_operation("intent outbox tick"):
-            _compact_intent_outbox(limit)
+            if compaction_deadline is None:
+                _compact_intent_outbox(limit, deadline=deadline, rotation=rotation)
+            else:
+                with lock_waits_until(compaction_deadline):
+                    _compact_intent_outbox(limit, deadline=compaction_deadline, rotation=rotation)
     except DeploymentQuiesced:
         logger.info("the intent outbox tick is paused for a deployment")
         return 0, 0
 
+    skipped = {
+        (int(device_id), scope): datetime.datetime.fromisoformat(at)
+        for device_id, scope, at in (rotation or {}).get("lock_skipped", [])
+    }
     drained = failed = 0
-    for device_id, scope in drain_candidates(limit):
+    limit = DRAIN_BATCH if limit is None else limit
+    ordered = _ordered_candidates(limit, skipped)
+    candidates = ordered[:limit]
+    pending = set(ordered)
+
+    def keep_skips():
+        # A skip outside this batch still orders its key next time. Keys that no longer owe a send drop out.
+        # Kept at each skip, so that the run's timeout recovery records it too.
+        if rotation is not None:
+            rotation["lock_skipped"] = [[*key, at.isoformat()] for key, at in skipped.items() if key in pending]
+
+    for index, (device_id, scope) in enumerate(candidates):
+        remaining = None if deadline is None else deadline - _send_clock()
+        if remaining is not None and remaining <= 0:
+            logger.info("the intent outbox tick deferred %d keys to the next tick", len(candidates) - index)
+            break
         try:
-            outcome = drain_key(device_id, scope)
+            budget = None if remaining is None else min(SEND_DEADLINE.total_seconds(), remaining)
+            outcome = drain_key(device_id, scope, deadline=budget)
         except DeploymentQuiesced:
             logger.info("the intent outbox tick stopped because a deployment started")
             break
-        except Exception:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
+        except Exception as exc:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
-            _restamp_attempt(device_id, scope)
+            # After a lock timeout, the stamp would wait on the same row.
+            if lock_wait_timed_out(exc) or not _restamp_attempt(device_id, scope):
+                skipped[(device_id, scope)] = datetime.datetime.now(tz=datetime.UTC)
+                keep_skips()
             failed += 1
             continue
         if outcome == SUCCEEDED:
             drained += 1
         elif outcome in (FAILED, UNACKNOWLEDGED):
             failed += 1
+    keep_skips()
     return drained, failed
 
 

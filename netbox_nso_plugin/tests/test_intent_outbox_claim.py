@@ -104,6 +104,35 @@ class TestPreCaptureDeadline(_ClaimCase):
         self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
         self.assertEqual(self.adapter.requests, [])
 
+    def test_the_deployment_admission_spends_the_send_budget_too(self):
+        from netbox_nso_plugin import delivery, deployment, drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        own_vlan(self.mgmt, 812, "admission-budget")
+        clock = [100.0]
+        admissions = []
+        real_is_quiesced = deployment.is_quiesced
+
+        def slow_admission():
+            # Only the drain's own admission is slow.
+            if not admissions:
+                clock[0] += 0.6
+            admissions.append(True)
+            return real_is_quiesced()
+
+        config, session = self.adapter.patches()
+        with (
+            config,
+            session,
+            patch("netbox_nso_plugin.drain._send_clock", new=lambda: clock[0]),
+            patch.object(deployment, "is_quiesced", side_effect=slow_admission),
+            self.assertRaises(delivery.SendDeadlineExceeded),
+        ):
+            drain.drain_key(self.device.pk, "vlan", deadline=0.5)
+
+        self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
+        self.assertEqual(self.adapter.requests, [])
+
 
 class TestClaimFoldsEveryEntryOnce(_ClaimCase):
     """O1.6 (R8-B1): N saves cost one claim, and a batched pass truncates keys, not folds."""
@@ -655,6 +684,59 @@ class TestOffboardingAbandonsTheClaim(_ClaimCase):
         row = state_of(self.device, "static_route")
         assert (row.push_seq, row.claim_deletions, row.queued_deletions) == (None, [], claimed.deletions)
         assert entries(self.device, "static_route", unconsumed=True)
+
+
+class TestTheSendBudgetFollowsTheRevocationScan(_ClaimCase):
+    """The transport gets what is left of the drain's deadline after the pre-send scan."""
+
+    tag = "scan"
+    adapter_device_id = 7508
+
+    def _drain_with_a_slow_scan(self, scan_seconds):
+        from netbox_nso_plugin import delivery, drain
+
+        route = own_route(self.mgmt, "198.51.100.32/28", "198.51.100.3")
+        with without_commit_drain():
+            _unassign_and_retire(route, self.device)
+        clock = [100.0]
+        real_scan = drain.revocation_hit
+
+        def slow_scan(claim):
+            hit = real_scan(claim)
+            clock[0] += scan_seconds
+            return hit
+
+        config, session = self.adapter.patches()
+        with (
+            config,
+            session,
+            patch("netbox_nso_plugin.drain._send_clock", new=lambda: clock[0]),
+            patch.object(drain, "revocation_hit", side_effect=slow_scan) as scan,
+            patch.object(delivery, "send", wraps=delivery.send) as send,
+        ):
+            outcome = drain.drain_key(self.device.pk, "static_route", deadline=10)
+        scan.assert_called_once()
+        return outcome, send
+
+    def test_the_send_gets_the_time_left_after_the_scan(self):
+        from netbox_nso_plugin import drain
+
+        outcome, send = self._drain_with_a_slow_scan(7)
+
+        assert outcome == drain.SUCCEEDED
+        assert send.call_args.kwargs["deadline"] == 3
+
+    def test_a_scan_that_uses_the_whole_deadline_keeps_the_claim_for_replay(self):
+        from netbox_nso_plugin import drain
+
+        outcome, send = self._drain_with_a_slow_scan(12)
+
+        assert outcome == drain.FAILED
+        send.assert_not_called()
+        assert self.adapter.requests == []
+        row = state_of(self.device, "static_route")
+        assert row.push_seq is not None
+        assert row.last_error_code == "nso_send_deadline"
 
 
 class TestControlOutcomesCannotCollideWithAdapterAnswers(_ClaimCase):

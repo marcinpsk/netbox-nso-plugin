@@ -6,6 +6,7 @@ The durable provision tombstone owns completion even when the dashboard is close
 NSO tab and the hourly system job both invoke the same fenced tombstone sweep.
 """
 
+import time
 from unittest.mock import patch
 
 from dcim.models import Device
@@ -14,7 +15,7 @@ from django.test import TestCase
 from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-from ._outbox_case import open_provision_attempt
+from ._outbox_case import open_provision_attempt, system_job
 from .test_django_views import ViewTestBase
 from .test_onboarding import _device
 
@@ -118,7 +119,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             # The mapping push is an on_commit callback. Execute it inside the test transaction.
             self.captureOnCommitCallbacks(execute=True),
         ):
-            checked, advanced = advance_stale_onboarding_rows()
+            checked, advanced = advance_stale_onboarding_rows(deadline=time.monotonic() + 600)
 
         self.assertEqual((checked, advanced), (2, 1))
         done.refresh_from_db()
@@ -144,7 +145,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             return _SUCCEEDED_OK
 
         with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=fake_get_attempt):
-            checked, advanced = advance_stale_onboarding_rows()
+            checked, advanced = advance_stale_onboarding_rows(deadline=time.monotonic() + 600)
 
         self.assertEqual(checked, 2)
         self.assertEqual(advanced, 1)  # only the good row
@@ -242,7 +243,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         from netbox_nso_plugin.jobs import AdvanceStaleOnboardingJob
 
         with patch("netbox_nso_plugin.onboarding.advance_stale_onboarding_rows", return_value=(0, 0)) as sweep:
-            AdvanceStaleOnboardingJob.run(None)  # self unused by run()
+            system_job(AdvanceStaleOnboardingJob).run()
         sweep.assert_called_once()
 
     def test_system_job_pauses_once_without_logging_a_failed_poll(self):
@@ -257,7 +258,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
                 self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logged,
                 patch("netbox_nso_plugin.adapter_client.get_provision_attempt") as get_provision_attempt,
             ):
-                result = AdvanceStaleOnboardingJob.run(None)
+                result = system_job(AdvanceStaleOnboardingJob).run()
         finally:
             resume()
 
