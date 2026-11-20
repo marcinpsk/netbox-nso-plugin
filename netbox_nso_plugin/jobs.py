@@ -326,6 +326,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     @_deployment_guarded("device maintenance tick")
     def _run(deadline, refresh_rotation, repair_rotation, outbox_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
+        from . import adapter_client
         from .adapter_client import requests_until
         from .delivery import SendDeadlineExceeded, _under_deadline
         from .drain import compact_intent_outbox, drain_intent_outbox
@@ -339,6 +340,8 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         snapshot = rows, None, None
         if snapshot_budget > 0:
             with requests_until(snapshot_started + snapshot_budget), contextlib.suppress(SendDeadlineExceeded):
+                # Cache the adapter settings so the worker does not open a database connection.
+                adapter_client._resolve_config()
                 snapshot = _under_deadline(lambda _body: _snapshot(rows), snapshot_budget)(None)
 
         budget = max(0, deadline - time.monotonic())

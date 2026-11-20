@@ -20,13 +20,14 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from dcim.models import Interface
-from django.db import DatabaseError, connection, transaction
+from django.conf import settings
+from django.db import DatabaseError, OperationalError, connection, transaction
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rq.timeouts import JobTimeoutException
 
-from ._adapter_http import make_response, patch_matching_control_state
+from ._adapter_http import make_response, make_transport_session, patch_matching_control_state
 from ._outbox_case import (
     CFG,
     HeldRowLock,
@@ -352,6 +353,48 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
         self.assertLess(elapsed, 5)
         self.assertTrue(any("Intent outbox drain failed" in line for line in logs.output), logs.output)
         self.assertGreater(self._unconsumed(device), 0)
+
+
+class TestSyncCacheAdapterConnection(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def test_inventory_uses_enabled_adapter_connection_when_worker_lookup_fails(self):
+        from netbox_nso_plugin import adapter_client, jobs
+        from netbox_nso_plugin.models import AdapterConnection
+
+        device, management = make_managed("job-adapter-connection", 19220)
+        adapter_url = "http://configured-adapter.invalid"
+        AdapterConnection.objects.create(url=adapter_url, enabled=True)
+        listing = [
+            {
+                "id": management.adapter_device_id,
+                "nso_instance": management.nso_instance.adapter_instance_id,
+                "nso_device_name": management.nso_device_name,
+                "netbox_device_id": device.pk,
+            }
+        ]
+        session = make_transport_session(make_response(200, listing))
+        filter_connections = AdapterConnection.objects.filter
+
+        def filter_on_main_thread(*args, **kwargs):
+            if threading.current_thread() is not threading.main_thread():
+                raise OperationalError("PostgreSQL refused the worker connection.")
+            return filter_connections(*args, **kwargs)
+
+        plugin_configs = {
+            **settings.PLUGINS_CONFIG,
+            "netbox_nso_plugin": {"adapter_url": CFG["url"], "adapter_token": CFG["token"]},
+        }
+        adapter_client.reset_config_cache()
+        self.addCleanup(adapter_client.reset_config_cache)
+        with (
+            self.settings(PLUGINS_CONFIG=plugin_configs),
+            patch.object(AdapterConnection.objects, "filter", filter_on_main_thread),
+            patch.object(adapter_client.requests, "Session", return_value=session),
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+
+        session.send.assert_called_once()
+        request = session.send.call_args.args[0]
+        self.assertEqual((request.method, request.url), ("GET", f"{adapter_url}/api/v1/devices"))
 
 
 class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
