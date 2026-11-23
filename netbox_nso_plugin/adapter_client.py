@@ -161,12 +161,24 @@ _request_limit = contextvars.ContextVar("nso_request_limit", default=None)
 
 @contextmanager
 def requests_until(limit: float):
-    """Refuse every adapter request that would start after the monotonic *limit*, or an earlier outer one."""
+    """Refuse every adapter request that would start after the monotonic *limit*, or an earlier outer one.
+
+    A request still in flight at the limit is cut off: its timeouts measure the gap between bytes, so they cannot.
+    """
     outer = _request_limit.get()
-    token = _request_limit.set(limit if outer is None else min(limit, outer))
+    limit = limit if outer is None else min(limit, outer)
+    transport = AbortableTransport()
+    session = new_session(transport=transport)
+    cutoff = threading.Timer(max(0.0, limit - time.monotonic()), transport.abort)
+    cutoff.daemon = True
+    token = _request_limit.set(limit)
     try:
-        yield
+        with bound_session(session):
+            cutoff.start()
+            yield
     finally:
+        cutoff.cancel()
+        session.close()
         _request_limit.reset(token)
 
 
@@ -184,6 +196,8 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         self._live: set = set()
         self._instrumented: set = set()
         self._instrumented_connections: weakref.WeakSet = weakref.WeakSet()
+        # http.client drops conn.sock when a response will close the connection; the read still uses it.
+        self._sockets: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._aborted = False
         super().__init__(*args, **kwargs)
 
@@ -227,6 +241,8 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
             conn = checkout(timeout)
             with self._lock:
                 self._live.add(conn)
+                if conn.sock is not None:
+                    self._sockets[conn] = conn.sock
                 _checkout_stack().append(conn)
                 fresh = conn not in self._instrumented_connections
                 self._instrumented_connections.add(conn)
@@ -234,7 +250,7 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
             if fresh:
                 self._instrument_connection(conn)
             if aborted:
-                self._shutdown(conn)
+                self._shutdown(conn.sock)
             return conn
 
         def _put_conn(conn):
@@ -253,17 +269,17 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         def _connect():
             result = connect()
             with self._lock:
+                self._sockets[conn] = conn.sock
                 aborted = self._aborted
             if aborted:
-                self._shutdown(conn)
+                self._shutdown(conn.sock)
             return result
 
         conn.connect = _connect
 
     @staticmethod
-    def _shutdown(conn) -> None:
-        """Shut down *conn* when it has a socket, leaving descriptor ownership with its pool."""
-        sock = conn.sock
+    def _shutdown(sock) -> None:
+        """Shut down *sock* when there is one, leaving descriptor ownership with its pool."""
         if sock is None:
             return
         with suppress(OSError):
@@ -274,9 +290,9 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         """Shut down the socket of every request in flight, so its reader comes back."""
         with self._lock:
             self._aborted = True
-            live = list(self._live)
-        for conn in live:
-            self._shutdown(conn)
+            sockets = [conn.sock or self._sockets.get(conn) for conn in self._live]
+        for sock in sockets:
+            self._shutdown(sock)
 
 
 def new_session(transport=None):

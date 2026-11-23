@@ -41,6 +41,7 @@ from ._outbox_case import (
     wait_until_postgres_blocks,
     without_commit_drain,
 )
+from ._settlement_adapter import LoopbackOnlySession
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -443,6 +444,65 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             [record.getMessage() for record in logs.records],
         )
         self.assertEqual(self._unconsumed(device), 1)
+
+    def test_a_snapshot_that_keeps_sending_past_its_cutoff_is_unavailable(self):
+        """An HTTP/1.0 answer hands the socket to the response, and the cutoff must still reach it."""
+        for index, protocol in enumerate(("HTTP/1.1", "HTTP/1.0")):
+            with self.subTest(protocol=protocol):
+                self._assert_trickled_snapshot_is_cut(protocol, 19216 + index)
+
+    def _assert_trickled_snapshot_is_cut(self, protocol, adapter_device_id):
+        import http.server
+        import socketserver
+
+        from netbox_nso_plugin import adapter_client, jobs
+
+        make_managed(f"job-deadline-snapshot-trickle-{adapter_device_id}", adapter_device_id)
+        responding = threading.Event()
+        # A valid empty listing, one byte every 0.1 s: each read returns well inside its timeout.
+        body = b"[" + b" " * 80 + b"]"
+
+        class _Trickle(http.server.BaseHTTPRequestHandler):
+            protocol_version = protocol
+
+            def do_GET(self):
+                responding.set()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                with contextlib.suppress(OSError):
+                    for byte in body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.1)
+
+            def log_message(self, *args):
+                pass
+
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Trickle)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        cfg = {**CFG, "url": f"http://127.0.0.1:{server.server_address[1]}"}
+
+        adapter_client.reset_session()
+        started = time.monotonic()
+        with (
+            patch("netbox_nso_plugin.adapter_client.requests.Session", LoopbackOnlySession),
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=cfg),
+            self.assertLogs(jobs.logger, level="WARNING") as logs,
+        ):
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(responding.is_set(), "no request reached the trickling server")
+        self.assertLess(elapsed, self.BUDGET + 1, "the inventory read ran past its cutoff")
+        self.assertIn(
+            "RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped",
+            [record.getMessage() for record in logs.records],
+        )
 
     def test_a_slow_adapter_defers_the_outbox_tail_and_the_sweep_still_runs(self):
         from netbox_nso_plugin import delivery, jobs
