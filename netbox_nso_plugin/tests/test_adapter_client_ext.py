@@ -511,12 +511,23 @@ class TestTheRequestLimitCutsOnlyReads(unittest.TestCase):
     def test_a_settlement_read_sent_as_a_post_is_cut_like_a_get(self):
         from netbox_nso_plugin import adapter_client
 
-        started = time.monotonic()
-        with adapter_client.requests_until(started + 0.5), self.assertRaises(adapter_client.AdapterError) as ctx:
-            adapter_client.get_deployment_evidence(7, [])
+        reads = {
+            "deployment evidence": lambda: adapter_client.get_deployment_evidence(7, []),
+            "settlement observation": lambda: adapter_client.get_settlement_observation(
+                7, job_id=1, after_settle_seq=0, apply_attempt_ids=[]
+            ),
+        }
+        for name, read in reads.items():
+            with self.subTest(name):
+                started = time.monotonic()
+                with (
+                    adapter_client.requests_until(started + 0.5),
+                    self.assertRaises(adapter_client.AdapterError) as ctx,
+                ):
+                    read()
 
-        self.assertEqual(ctx.exception.code, "request_limit")
-        self.assertLess(time.monotonic() - started, 1.5)
+                self.assertEqual(ctx.exception.code, "request_limit")
+                self.assertLess(time.monotonic() - started, 1.5)
 
     def test_a_write_still_arriving_at_the_limit_runs_to_its_answer(self):
         """Cutting a write the adapter may already have applied would leave its outcome unknown."""
