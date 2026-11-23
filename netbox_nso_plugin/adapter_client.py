@@ -163,7 +163,7 @@ _request_limit = contextvars.ContextVar("nso_request_limit", default=None)
 def requests_until(limit: float):
     """Refuse every adapter request that would start after the monotonic *limit*, or an earlier outer one.
 
-    A request still in flight at the limit is cut off: its timeouts measure the gap between bytes, so they cannot.
+    A response still arriving at the limit is cut off: its timeouts measure the gap between bytes, so they cannot.
     """
     outer = _request_limit.get()
     limit = limit if outer is None else min(limit, outer)
@@ -722,6 +722,12 @@ def _request_response(method, path, **kwargs):
         raise AdapterError(
             f"Adapter unreachable ({type(exc).__name__}); see the server log.", code="nso_unreachable"
         ) from exc
+    limit = _request_limit.get()
+    if limit is not None and time.monotonic() >= limit:
+        # The cutoff can end a body that has no length at a clean EOF, so a late answer may be truncated.
+        raise AdapterError(
+            "The adapter answered after the run's time limit for adapter requests.", code="request_limit"
+        )
 
     if not resp.ok:
         err = _error_envelope(resp)

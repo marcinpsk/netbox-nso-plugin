@@ -446,12 +446,16 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(self._unconsumed(device), 1)
 
     def test_a_snapshot_that_keeps_sending_past_its_cutoff_is_unavailable(self):
-        """An HTTP/1.0 answer hands the socket to the response, and the cutoff must still reach it."""
-        for index, protocol in enumerate(("HTTP/1.1", "HTTP/1.0")):
-            with self.subTest(protocol=protocol):
-                self._assert_trickled_snapshot_is_cut(protocol, 19216 + index)
+        """An HTTP/1.0 answer hands the socket to the response, and the cutoff must still reach it.
 
-    def _assert_trickled_snapshot_is_cut(self, protocol, adapter_device_id):
+        Without a Content-Length the body ends at EOF, so a cut before its first byte looks like an empty listing.
+        """
+        cases = (("HTTP/1.1", True, 0), ("HTTP/1.0", True, 0), ("HTTP/1.0", False, 5))
+        for index, (protocol, framed, stall) in enumerate(cases):
+            with self.subTest(protocol=protocol, framed=framed):
+                self._assert_trickled_snapshot_is_cut(protocol, framed, stall, 19216 + index)
+
+    def _assert_trickled_snapshot_is_cut(self, protocol, framed, stall, adapter_device_id):
         import http.server
         import socketserver
 
@@ -469,9 +473,12 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
                 responding.set()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
+                if framed:
+                    self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 with contextlib.suppress(OSError):
+                    self.wfile.flush()
+                    time.sleep(stall)
                     for byte in body:
                         self.wfile.write(bytes([byte]))
                         self.wfile.flush()
