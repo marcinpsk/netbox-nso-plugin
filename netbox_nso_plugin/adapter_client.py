@@ -158,12 +158,17 @@ _bound_session = contextvars.ContextVar("nso_bound_session", default=None)
 # A monotonic instant after which no request starts; a request's timeouts end at it too.
 _request_limit = contextvars.ContextVar("nso_request_limit", default=None)
 
+# The session that requests_until cuts off at its limit. Only a read uses it: a cut write has an unknown outcome.
+_read_session = contextvars.ContextVar("nso_read_session", default=None)
+_CUT_METHODS = frozenset({"GET", "HEAD"})
+
 
 @contextmanager
 def requests_until(limit: float):
     """Refuse every adapter request that would start after the monotonic *limit*, or an earlier outer one.
 
-    A response still arriving at the limit is cut off: its timeouts measure the gap between bytes, so they cannot.
+    A read still arriving at the limit is cut off: its timeouts measure the gap between bytes, so they cannot.
+    A write runs to its own timeouts, because the adapter may already have applied it.
     """
     outer = _request_limit.get()
     limit = limit if outer is None else min(limit, outer)
@@ -172,13 +177,14 @@ def requests_until(limit: float):
     cutoff = threading.Timer(max(0.0, limit - time.monotonic()), transport.abort)
     cutoff.daemon = True
     token = _request_limit.set(limit)
+    read_token = _read_session.set(session)
     try:
-        with bound_session(session):
-            cutoff.start()
-            yield
+        cutoff.start()
+        yield
     finally:
         cutoff.cancel()
         session.close()
+        _read_session.reset(read_token)
         _request_limit.reset(token)
 
 
@@ -319,13 +325,16 @@ def bound_session(session):
         _bound_session.reset(token)
 
 
-def _get_session():
-    """Return this context's bound session, or the process-wide pooled one."""
+def _get_session(method=None):
+    """Return this context's bound session, the requests_until session for a read, or the process-wide pooled one."""
     global _session, _session_cls
 
     bound = _bound_session.get()
     if bound is not None:
         return bound
+    read = _read_session.get()
+    if read is not None and method in _CUT_METHODS:
+        return read
     if _session is None or _session_cls is not requests.Session:
         _session = new_session()
         _session_cls = requests.Session
@@ -651,6 +660,30 @@ def _request_timeouts(override, cfg) -> tuple[float, float]:
     return min(connect_timeout, remaining), min(read_timeout, remaining)
 
 
+def _cut_read_error(method):
+    """Return the request_limit error for a read that ended at or after the limit, where the cutoff may have cut it."""
+    limit = _request_limit.get()
+    if method in _CUT_METHODS and limit is not None and time.monotonic() >= limit:
+        return AdapterError(
+            "The adapter's answer reached the run's time limit for adapter requests.", code="request_limit"
+        )
+    return None
+
+
+def _send(method, url, **kwargs):
+    """Send one request on this context's session. A read that the request limit cut raises request_limit."""
+    try:
+        resp = _get_session(method).request(method, url, **kwargs)
+    except requests.RequestException as exc:
+        if (cut := _cut_read_error(method)) is not None:
+            raise cut from exc
+        raise
+    # The cutoff can end a body that has no length at a clean EOF, so a late answer may be truncated.
+    if (cut := _cut_read_error(method)) is not None:
+        raise cut
+    return resp
+
+
 def _request_response(method, path, **kwargs):
     """Send one adapter request and return the raw response, for callers that read a header."""
     from .native_authorization import refuse_adapter_call_in_mutation_phase
@@ -696,10 +729,7 @@ def _request_response(method, path, **kwargs):
 
     connect_timeout, read_timeout = _request_timeouts(kwargs.pop("timeout", None), cfg)
     try:
-        session = _get_session()
-        resp = session.request(
-            method, url, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs
-        )
+        resp = _send(method, url, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs)
     except requests.exceptions.ReadTimeout as exc:
         # Connected but no response within the read window — the adapter is up but
         # hung (e.g. blocked event loop). Surface this distinctly so it is NOT
@@ -722,12 +752,6 @@ def _request_response(method, path, **kwargs):
         raise AdapterError(
             f"Adapter unreachable ({type(exc).__name__}); see the server log.", code="nso_unreachable"
         ) from exc
-    limit = _request_limit.get()
-    if limit is not None and time.monotonic() >= limit:
-        # The cutoff can end a body that has no length at a clean EOF, so a late answer may be truncated.
-        raise AdapterError(
-            "The adapter answered after the run's time limit for adapter requests.", code="request_limit"
-        )
 
     if not resp.ok:
         err = _error_envelope(resp)
