@@ -160,7 +160,8 @@ _request_limit = contextvars.ContextVar("nso_request_limit", default=None)
 
 # The session that requests_until cuts off at its limit. Only a read uses it: a cut write has an unknown outcome.
 _read_session = contextvars.ContextVar("nso_read_session", default=None)
-_CUT_METHODS = frozenset({"GET", "HEAD"})
+# A request with these methods is a read unless its caller says otherwise; a read sent as a POST passes read=True.
+_READ_METHODS = frozenset({"GET", "HEAD"})
 
 
 @contextmanager
@@ -325,16 +326,16 @@ def bound_session(session):
         _bound_session.reset(token)
 
 
-def _get_session(method=None):
+def _get_session(read=False):
     """Return this context's bound session, the requests_until session for a read, or the process-wide pooled one."""
     global _session, _session_cls
 
     bound = _bound_session.get()
     if bound is not None:
         return bound
-    read = _read_session.get()
-    if read is not None and method in _CUT_METHODS:
-        return read
+    cut_off = _read_session.get()
+    if read and cut_off is not None:
+        return cut_off
     if _session is None or _session_cls is not requests.Session:
         _session = new_session()
         _session_cls = requests.Session
@@ -660,32 +661,35 @@ def _request_timeouts(override, cfg) -> tuple[float, float]:
     return min(connect_timeout, remaining), min(read_timeout, remaining)
 
 
-def _cut_read_error(method):
+def _cut_read_error(read):
     """Return the request_limit error for a read that ended at or after the limit, where the cutoff may have cut it."""
     limit = _request_limit.get()
-    if method in _CUT_METHODS and limit is not None and time.monotonic() >= limit:
+    if read and limit is not None and time.monotonic() >= limit:
         return AdapterError(
             "The adapter's answer reached the run's time limit for adapter requests.", code="request_limit"
         )
     return None
 
 
-def _send(method, url, **kwargs):
+def _send(method, url, *, read, **kwargs):
     """Send one request on this context's session. A read that the request limit cut raises request_limit."""
     try:
-        resp = _get_session(method).request(method, url, **kwargs)
+        resp = _get_session(read).request(method, url, **kwargs)
     except requests.RequestException as exc:
-        if (cut := _cut_read_error(method)) is not None:
+        if (cut := _cut_read_error(read)) is not None:
             raise cut from exc
         raise
     # The cutoff can end a body that has no length at a clean EOF, so a late answer may be truncated.
-    if (cut := _cut_read_error(method)) is not None:
+    if (cut := _cut_read_error(read)) is not None:
         raise cut
     return resp
 
 
-def _request_response(method, path, **kwargs):
-    """Send one adapter request and return the raw response, for callers that read a header."""
+def _request_response(method, path, *, read=None, **kwargs):
+    """Send one adapter request and return the raw response, for callers that read a header.
+
+    *read* defaults to whether *method* is GET or HEAD; requests_until cuts off only a read.
+    """
     from .native_authorization import refuse_adapter_call_in_mutation_phase
 
     refuse_adapter_call_in_mutation_phase(method)
@@ -728,8 +732,12 @@ def _request_response(method, path, **kwargs):
         verify = True
 
     connect_timeout, read_timeout = _request_timeouts(kwargs.pop("timeout", None), cfg)
+    if read is None:
+        read = method in _READ_METHODS
     try:
-        resp = _send(method, url, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs)
+        resp = _send(
+            method, url, read=read, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs
+        )
     except requests.exceptions.ReadTimeout as exc:
         # Connected but no response within the read window — the adapter is up but
         # hung (e.g. blocked event loop). Surface this distinctly so it is NOT
@@ -2082,6 +2090,7 @@ def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
     resp = _request_response(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/deployment-evidence",
+        read=True,
         json={"apply_attempt_ids": [str(attempt_id) for attempt_id in apply_attempt_ids]},
     )
     return _settlement_response(resp, "DeviceDeploymentEvidenceOut", adapter_device_id)
@@ -2094,7 +2103,9 @@ def get_settlement_observation(adapter_device_id, *, job_id, after_settle_seq, a
         "after_settle_seq": after_settle_seq,
         "apply_attempt_ids": sorted({str(attempt_id) for attempt_id in apply_attempt_ids}),
     }
-    resp = _request_response("POST", f"/api/v1/devices/{adapter_device_id}/settlement-observation", json=request)
+    resp = _request_response(
+        "POST", f"/api/v1/devices/{adapter_device_id}/settlement-observation", read=True, json=request
+    )
     observation = _settlement_response(resp, "SettlementObservationOut", adapter_device_id)
     job = observation["job"]
     absent = observation["absent"]["job_id"]

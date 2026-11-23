@@ -480,7 +480,7 @@ class TestTheRequestLimitCutsOnlyReads(unittest.TestCase):
                         self.wfile.flush()
                         time.sleep(0.05)
 
-            do_GET = do_PATCH = _answer
+            do_GET = do_PATCH = do_POST = _answer
 
             def log_message(self, *args):
                 pass
@@ -504,6 +504,16 @@ class TestTheRequestLimitCutsOnlyReads(unittest.TestCase):
         started = time.monotonic()
         with adapter_client.requests_until(started + 0.5), self.assertRaises(adapter_client.AdapterError) as ctx:
             adapter_client.get_device(7)
+
+        self.assertEqual(ctx.exception.code, "request_limit")
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_a_settlement_read_sent_as_a_post_is_cut_like_a_get(self):
+        from netbox_nso_plugin import adapter_client
+
+        started = time.monotonic()
+        with adapter_client.requests_until(started + 0.5), self.assertRaises(adapter_client.AdapterError) as ctx:
+            adapter_client.get_deployment_evidence(7, [])
 
         self.assertEqual(ctx.exception.code, "request_limit")
         self.assertLess(time.monotonic() - started, 1.5)
