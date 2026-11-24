@@ -1462,6 +1462,29 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertNotIn("Device linked to the adapter.", rendered)
         self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
 
+    def test_a_link_repair_of_an_nso_instance_an_operator_corrected_writes_nothing(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        real_broken = sync_cache._broken_links
+
+        def broken_then_corrected(*args):
+            broken = real_broken(*args)
+            # An operator corrects the NSO instance's adapter id after the sweep classified the row.
+            NSOInstance.objects.filter(pk=self.nso_instance.pk).update(adapter_instance_id="signal-race-corrected")
+            return broken
+
+        rows = list(NSODeviceManagement.objects.select_related("nso_instance").filter(pk=self.mgmt.pk))
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch.object(sync_cache, "_broken_links", side_effect=broken_then_corrected),
+        ):
+            sync_cache.reconcile_device_links(rows)
+
+        self.mgmt.refresh_from_db()
+        self.assertIsNone(self.mgmt.adapter_link_attempted_at)
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_a_link_sweep_warning_about_an_nso_instance_an_operator_corrected_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance

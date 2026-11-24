@@ -399,20 +399,16 @@ def reconcile_device_links(  # noqa: C901
                 _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
         try:
-            expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
+            from .intent_state import footprint_for_instance, intent_transaction
+            from .management_lifecycle import save_management
+            from .signals import _invalidate_source_admissions, _link_mapping
+
+            expected_source = _link_mapping(mgmt)
             attempted_this_row = False
             try:
-                from .intent_state import footprint_for_instance, intent_transaction
-                from .management_lifecycle import save_management
-                from .signals import _invalidate_source_admissions
-
                 with intent_transaction(footprint_for_instance(mgmt)):
-                    current = type(mgmt).objects.get(pk=mgmt.pk)
-                    if (
-                        current.source_rekey_pending
-                        or (current.nso_instance_id, current.nso_device_name, current.adapter_device_id)
-                        != expected_source
-                    ):
+                    current = type(mgmt).objects.select_related("nso_instance").get(pk=mgmt.pk)
+                    if current.source_rekey_pending or _link_mapping(current) != expected_source:
                         raise _LinkReconcileNoOp
                     # A rejected stamp means the frozen plan is stale. Do not repair that row.
                     if not _mirror_management(current, adapter_link_attempted_at=now):
