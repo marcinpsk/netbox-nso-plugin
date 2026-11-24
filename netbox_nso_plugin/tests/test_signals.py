@@ -1528,6 +1528,21 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")
 
+    def test_a_link_sweep_warning_does_not_replace_the_error_of_a_rekey_armed_after_it(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        # A repair arms the rekey fence after the sweep classified the row, and its adapter patch fails.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            source_rekey_pending=True, adapter_link_error="The rekey failed."
+        )
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "The rekey failed.")
+
     def test_a_link_sweep_warning_about_a_mapping_a_link_replaced_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.adapter_client import AdapterError
