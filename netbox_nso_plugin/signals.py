@@ -1088,6 +1088,11 @@ def _link_to_adapter(instance, created) -> bool:
         # The row or its addresses changed under the push. The renderer audit sends the new control state.
         logger.info("Adapter link for management row %s sent no control state; it records no outcome", instance.pk)
         return False
+    mapped = type(instance).objects.filter(pk=instance.pk).values_list("adapter_device_id", flat=True).first()
+    if mapped != instance.adapter_device_id:
+        # The push read the row again, so it may have sent to the new mapping. Confirm neither.
+        logger.info("Adapter link for management row %s saw its mapping change; it records no outcome", instance.pk)
+        return False
 
     notify_result = client.sync_notify(instance.adapter_device_id)
     if notify_result and notify_result.get("job_id"):

@@ -1352,6 +1352,29 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(self.mgmt.adapter_link_attempt, before.adapter_link_attempt + 1)
         self.assertEqual(self.mgmt.adapter_link_outcome_attempt, before.adapter_link_outcome_attempt)
 
+    def test_a_link_whose_mapping_changes_after_its_control_push_confirms_nothing(self):
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        real_push = management_lifecycle.push_management_control
+
+        def push_then_remap(device_id):
+            pushed = real_push(device_id)
+            # A repair adopts adapter device 8 after this attempt pushed control state to 7.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            return pushed
+
+        with (
+            patch.object(management_lifecycle, "push_management_control", side_effect=push_then_remap),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            outcome = _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        notify.assert_not_called()
+
     def test_a_link_retry_that_sent_nothing_is_reported_as_unconfirmed(self):
         from dcim.models import Device
         from django.contrib.auth import get_user_model
