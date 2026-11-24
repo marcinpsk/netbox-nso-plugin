@@ -1493,16 +1493,14 @@ def _restamp_attempt(device_id, scope) -> bool:
     transaction it belongs to, so a key raising inside the claim (a render that blows up, a
     fold that hits a non-retryable error) leaves no stamp at all and stays at the head of
     every bounded pass, starving the keys behind it. The compact-retry path already
-    re-stamps for the same reason. Returns False when the stamp's lock wait timed out, so that
-    the caller can rotate the key another way.
+    re-stamps for the same reason. Returns False when the stamp failed, so that the caller can
+    rotate the key another way.
     """
-    from .jobs import lock_wait_timed_out
-
     try:
         _stamp_attempt(device_id, scope)
-    except Exception as exc:  # noqa: BLE001 (a key that cannot even be stamped must not abort the pass)
+    except Exception:  # noqa: BLE001 (a key that cannot even be stamped must not abort the pass)
         logger.exception("intent outbox attempt stamp failed for %s/%s", device_id, scope)
-        return not lock_wait_timed_out(exc)
+        return False
     return True
 
 

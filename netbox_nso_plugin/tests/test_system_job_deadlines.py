@@ -938,6 +938,28 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[device.pk, "vlan"]])
 
+    def test_a_key_whose_fallback_stamp_fails_on_an_unusable_connection_is_lock_skipped(self):
+        from django.db import OperationalError
+
+        from netbox_nso_plugin import drain
+
+        device, _management = make_managed("job-deadline-drain-restamp-broken", 19220)
+        with without_commit_drain():
+            with transaction.atomic():
+                enqueue(device, "vlan")
+
+        rotation = {}
+        unusable = OperationalError("the connection is not usable")
+        with (
+            # A cleanup statement replaced the claim's error, and the fallback stamp fails the same way.
+            patch.object(drain, "drain_key", side_effect=unusable),
+            patch.object(drain, "_stamp_attempt", side_effect=unusable),
+            self.assertLogs("netbox_nso_plugin.drain", level="ERROR"),
+        ):
+            drain.drain_intent_outbox(deadline=time.monotonic() + 30, rotation=rotation)
+
+        self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[device.pk, "vlan"]])
+
     def test_a_repair_lock_skip_stays_in_the_rotation_when_a_later_row_overruns(self):
         from netbox_nso_plugin import jobs, sync_cache
         from netbox_nso_plugin.models import NSODeviceManagement
