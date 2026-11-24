@@ -3763,30 +3763,27 @@ class NSOIntentResyncView(AuthorizedView):
 class NSOAdapterLinkRetryView(AuthorizedView):
     """POST: retry linking a managed device to the adapter after a failed onboard/scope/sync.
 
-    Re-fires ``sync_scope_to_adapter`` by re-saving the management row (the same recovery the
-    async-onboarding status advance uses), which onboards/adopts the adapter device, pushes scope
-    and sends sync-notify. On success the row's ``adapter_link_error`` is cleared and
-    ``adapter_device_id`` set; on a repeated failure the error is refreshed for the tab banner.
+    Runs one adapter link attempt, the same one a management-row save queues, which onboards or
+    adopts the adapter device, pushes scope and sends sync-notify. On success the row's
+    ``adapter_link_error`` is cleared and ``adapter_device_id`` set; on a repeated failure the error
+    is refreshed for the tab banner. The message reports this attempt's own outcome.
     """
 
     policy = EndpointPolicy(Management("change"), "adapter_action")
 
     def post(self, request, pk):
         """Re-attempt the adapter link for the device, then redirect to the NSO tab."""
-        from .management_lifecycle import save_management
+        from .signals import _sync_committed_scope_to_adapter
 
         mgmt = self.target.management
-        started = mgmt.adapter_link_attempt
-        save_management(mgmt)
-        mgmt.refresh_from_db()
-        if mgmt.adapter_link_attempt <= started or mgmt.adapter_link_outcome_attempt != mgmt.adapter_link_attempt:
-            # The latest attempt recorded no outcome, so the banner is not evidence.
+        outcome = _sync_committed_scope_to_adapter(type(mgmt), mgmt.pk, False)
+        if outcome is None:
             messages.warning(
                 request,
                 "The adapter link attempt did not finish, so the link is not confirmed. Retry the link.",
             )
-        elif mgmt.adapter_link_error:
-            messages.error(request, f"Still couldn't link this device to the adapter: {mgmt.adapter_link_error}")
+        elif outcome:
+            messages.error(request, f"Still couldn't link this device to the adapter: {outcome}")
         else:
             messages.success(request, "Device linked to the adapter.")
         return redirect(_device_nso_tab_url(mgmt.device.pk))

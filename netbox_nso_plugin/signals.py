@@ -982,20 +982,23 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
     provision job hasn't finished) or ``provision_failed``, the NSO node may not exist
     yet, so mapping/scope/sync would fail or race. The status-advance view clears the
     status to "" on success and re-saves, which fires this handler normally.
+
+    Return this attempt's outcome: "" when it linked, the error message when it failed, or None
+    when it stopped without an outcome.
     """
     try:
         instance = sender.objects.select_related("nso_instance", "device").get(pk=instance_pk)
     except sender.DoesNotExist:
-        return
+        return None
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
-        return
+        return None
     try:
         attempt = _start_link_attempt(instance)
     except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
         logger.exception("Could not start an adapter link attempt for management row %s", instance.pk)
-        return
+        return None
     if attempt is None:
-        return
+        return None
 
     from .adapter_client import AdapterError
 
@@ -1022,11 +1025,13 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
 
         if not connection.needs_rollback:
             _record_link_outcome(instance, attempt, message)
-    else:
-        if linked:
-            # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
-            # goes away. The row is read again under its lock: an older attempt can record its error after this load.
-            _record_link_outcome(instance, attempt, "")
+        return message
+    if not linked:
+        return None
+    # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
+    # goes away. The row is read again under its lock: an older attempt can record its error after this load.
+    _record_link_outcome(instance, attempt, "")
+    return ""
 
 
 def _link_to_adapter(instance, created) -> bool:
