@@ -479,11 +479,12 @@ def reconcile_device_links(  # noqa: C901
                 if attempted_this_row:
                     # Keep the attempt stamp if the repair rolled back.
                     try:
-                        _mirror_management(mgmt, adapter_link_attempted_at=now)
-                    except Exception as exc:  # noqa: BLE001 - a stamp failure must not abort the sweep
-                        if lock_wait_timed_out(exc):
-                            skip(mgmt.pk)
+                        stamped = _mirror_management(mgmt, adapter_link_attempted_at=now)
+                    except Exception:  # noqa: BLE001 - a stamp failure must not abort the sweep
+                        stamped = False
                         logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
+                    if not stamped:
+                        skip(mgmt.pk)
         except _RunTimedOut:
             skip(mgmt.pk)
             raise
