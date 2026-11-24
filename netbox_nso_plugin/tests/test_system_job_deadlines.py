@@ -1740,6 +1740,28 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(successors, 1)
         self.assertEqual(job.data, {"fleet_rotation": {"after_device_id": 7}})
 
+    def test_an_overrun_that_a_cleanup_error_replaces_and_the_tick_returns_still_reschedules(self):
+        from django.db import OperationalError
+
+        from netbox_nso_plugin import jobs
+
+        def tick(job_self):
+            job_self.rotation("fleet_rotation")["after_device_id"] = 7
+            try:
+                try:
+                    time.sleep(3)
+                finally:
+                    # A cleanup statement on the connection the alarm interrupted fails in its place.
+                    raise OperationalError("the connection is not usable")
+            except Exception:  # noqa: BLE001
+                pass
+
+        job, _elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob)
+
+        self.assertEqual(job.status, "errored")
+        self.assertEqual(successors, 1)
+        self.assertEqual(job.data, {"fleet_rotation": {"after_device_id": 7}})
+
     def test_a_lock_wait_bound_keeps_the_exception_in_flight_when_its_reset_fails(self):
         from netbox_nso_plugin import jobs
 

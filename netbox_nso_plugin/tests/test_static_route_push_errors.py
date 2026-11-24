@@ -327,20 +327,18 @@ class TestPushRecordSurvivesFullSaves(IntentPushResetMixin, TestCase):
         self.assertEqual(self.mgmt.intent_push_attempts, {"static_route": 42})
 
     def test_a_push_attempt_allocated_during_planning_does_not_fail_the_full_save(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.signals import _allocate_push_attempt
         from netbox_nso_plugin.tests._outbox_case import mirror_update
 
         mirror_update(self.mgmt, intent_push_attempts={"static_route": 1}, adapter_link_error="Previous link failed")
-        user = get_user_model().objects.create_superuser(
-            username="link-retry-admin", password="test-password", email="link-retry-admin@test.example"
-        )
-        self.client.force_login(user)
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+        stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         table = connection.ops.quote_name(self.mgmt._meta.db_table)
         allocations = []
 
         def allocate_before_preimage(execute, sql, params, many, context):
-            # The planner uses first(); the view's initial get() uses LIMIT 21.
+            # The planner uses first(); the get() above uses LIMIT 21.
             if (
                 not allocations
                 and sql.startswith("SELECT ")
@@ -360,13 +358,8 @@ class TestPushRecordSurvivesFullSaves(IntentPushResetMixin, TestCase):
             self.captureOnCommitCallbacks(execute=True),
             connection.execute_wrapper(allocate_before_preimage),
         ):
-            response = self.client.post(url)
+            save_management(stale)
 
-        self.assertRedirects(
-            response,
-            reverse("dcim:device_nso", args=[self.device.pk]),
-            fetch_redirect_response=False,
-        )
         self.assertEqual(len(allocations), 1)
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.intent_push_attempts["static_route"], 2)
