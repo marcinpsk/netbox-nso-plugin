@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """The deployment gate middleware under NetBox's BASE_PATH."""
 
+from django.db import connection
 from django.http import HttpResponse
 from django.test import RequestFactory, TransactionTestCase, override_settings
 
@@ -17,7 +18,7 @@ class TestTheDeploymentGateUnderABasePath(_CascadeFlushMixin, TransactionTestCas
         reached = []
 
         def view(request):
-            reached.append(request.path_info)
+            reached.append((request.path_info, connection.in_atomic_block))
             return HttpResponse("ran")
 
         quiesce()
@@ -37,4 +38,5 @@ class TestTheDeploymentGateUnderABasePath(_CascadeFlushMixin, TransactionTestCas
         response, reached = self._post_while_quiesced("/netbox/api/plugins/nso/sync-complete/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(reached, ["/netbox/api/plugins/nso/sync-complete/"])
+        # The callback bypasses the middleware: no request transaction wraps it.
+        self.assertEqual(reached, [("/netbox/api/plugins/nso/sync-complete/", False)])
