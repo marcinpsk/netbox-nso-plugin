@@ -794,6 +794,29 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertIn(str(management.pk), rotation["lock_skipped"])
 
+    def test_a_failed_repair_whose_fallback_stamp_the_writer_rejects_is_lock_skipped(self):
+        from netbox_nso_plugin import sync_cache
+
+        _device, management = make_managed("job-deadline-relink-fallback-rejected", 19222)
+        real_mirror = sync_cache._mirror_management
+
+        def mirror(mgmt, **values):
+            if not connection.in_atomic_block:
+                # The repair rolled back its stamp, and the writer rejects the fallback stamp's stale plan.
+                return False
+            return real_mirror(mgmt, **values)
+
+        rotation = {}
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch.object(sync_cache, "_mirror_management", side_effect=mirror),
+            patch.object(sync_cache, "invalidate_delivery_baselines", side_effect=RuntimeError("repair failed")),
+            self.assertLogs("netbox_nso_plugin.sync_cache", level="ERROR"),
+        ):
+            sync_cache.reconcile_device_links([management], rotation=rotation)
+
+        self.assertIn(str(management.pk), rotation["lock_skipped"])
+
     def test_lock_skipped_keys_that_fill_a_batch_still_let_the_next_key_in(self):
         from netbox_nso_plugin import drain
 

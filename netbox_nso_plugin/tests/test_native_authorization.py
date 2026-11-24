@@ -230,7 +230,7 @@ _RAW_SQL_ALLOWLIST = (
     "jobs.py:_bounded_lock_waits:execute",
     "jobs.py:_bounded_lock_waits:execute",
     "jobs.py:lock_waits_until:execute",
-    "jobs.py:lock_waits_until:execute",
+    "jobs.py:lock_waits_until.reset:execute",
     "jobs.py:lock_waits_until.bounded:execute",
     "jobs.py:lock_waits_until.bounded:execute",
     "native_authorization.py:_backstop:execute",
