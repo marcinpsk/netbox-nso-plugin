@@ -3779,8 +3779,8 @@ class NSOAdapterLinkRetryView(AuthorizedView):
         started = mgmt.adapter_link_attempt
         save_management(mgmt)
         mgmt.refresh_from_db()
-        if mgmt.adapter_link_outcome_attempt <= started:
-            # No attempt from this retry on recorded an outcome, so the banner is not evidence.
+        if mgmt.adapter_link_attempt <= started or mgmt.adapter_link_outcome_attempt != mgmt.adapter_link_attempt:
+            # The latest attempt recorded no outcome, so the banner is not evidence.
             messages.warning(
                 request,
                 "The adapter link attempt did not finish, so the link is not confirmed. Retry the link.",

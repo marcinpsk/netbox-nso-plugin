@@ -1384,6 +1384,46 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertNotIn("Device linked to the adapter.", rendered)
         self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
 
+    def test_a_link_retry_that_sent_nothing_does_not_report_an_earlier_attempt_s_success(self):
+        from dcim.models import Device
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import management_lifecycle, signals
+
+        address = IPAddress.objects.create(address="192.0.2.79/32")
+        real_footprint = management_lifecycle._control_footprint
+        real_start = signals._start_link_attempt
+
+        def complete_another_attempt_first(instance):
+            # Another request's attempt starts and succeeds after this view read the row.
+            def other():
+                signals._record_link_error(instance, real_start(instance), "")
+
+            in_thread(other)
+            return real_start(instance)
+
+        def footprint_then_new_primary(device_id):
+            footprint = real_footprint(device_id)
+            in_thread(lambda: Device.objects.filter(pk=self.device.pk).update(primary_ip4=address))
+            return footprint
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-2"))
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=complete_another_attempt_first),
+            patch.object(management_lifecycle, "_control_footprint", side_effect=footprint_then_new_primary),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+
     def test_a_link_sweep_warning_about_an_nso_instance_an_operator_corrected_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
