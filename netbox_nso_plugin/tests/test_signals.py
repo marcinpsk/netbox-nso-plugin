@@ -1517,6 +1517,24 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(self.mgmt.adapter_link_error, "")
         self.assertEqual(self.mgmt.adapter_link_attempt, attempt_before)
 
+    def test_a_link_sweep_warning_about_a_mapping_replaced_after_its_attempt_started_is_discarded(self):
+        from netbox_nso_plugin import signals, sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        real_record = signals._record_link_error
+
+        def remap_then_record(instance, attempt, message, **kwargs):
+            # A link adopts a new adapter device after the warning took its attempt number.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            return real_record(instance, attempt, message, **kwargs)
+
+        with patch.object(signals, "_record_link_error", side_effect=remap_then_record):
+            sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_a_link_sweep_warning_about_a_source_a_rekey_replaced_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.models import NSODeviceManagement
