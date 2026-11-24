@@ -418,11 +418,11 @@ class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
         real_start = signals._start_link_attempt
         edited = []
 
-        def edit_then_start(instance):
+        def edit_then_start(instance, **kwargs):
             if instance.pk == first.pk and not edited:
                 edited.append(True)
                 in_thread(lambda: NSODeviceManagement.objects.filter(pk=first.pk).update(last_sync_status="concurrent"))
-            return real_start(instance)
+            return real_start(instance, **kwargs)
 
         errors = []
         with (

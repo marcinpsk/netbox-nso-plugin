@@ -277,7 +277,7 @@ def _flag_link_error(mgmt, message) -> None:
         return
     if current.adapter_link_error == message and current.adapter_link_outcome_attempt >= current.adapter_link_attempt:
         return
-    attempt = _start_link_attempt(mgmt)
+    attempt = _start_link_attempt(mgmt, mapping=classified)
     if attempt is not None:
         _record_link_error(mgmt, attempt, message, mapping=classified)
 

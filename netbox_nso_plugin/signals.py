@@ -917,13 +917,18 @@ def _update_management_mirror(instance, **values):
     update_mirror_fields(instance, **values)
 
 
-def _start_link_attempt(instance) -> int | None:
-    """Take the next adapter link attempt number of the row, or None when the row is gone."""
+def _start_link_attempt(instance, *, mapping=None) -> int | None:
+    """Take the next adapter link attempt number of the row, or None when the row is gone.
+
+    With *mapping*, also None when the row's :func:`_link_mapping` changed.
+    """
     from django.db import transaction
 
     with transaction.atomic():
         locked = _locked_link_attempt(instance)
         if locked is None:
+            return None
+        if mapping is not None and _link_mapping(_current_link_row(instance)) != mapping:
             return None
         current = locked[0] + 1
         _update_management_mirror(instance, adapter_link_attempt=current)
@@ -942,17 +947,21 @@ def _record_link_error(instance, attempt, message, *, mapping=None):
         if locked is None or locked[1] >= attempt:
             logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
             return
-        if mapping is not None:
-            current = type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
-            if _link_mapping(current) != mapping:
-                logger.info("Discarded a link outcome about an earlier mapping of management row %s", instance.pk)
-                return
+        if mapping is not None and _link_mapping(_current_link_row(instance)) != mapping:
+            logger.info("Discarded a link outcome about an earlier mapping of management row %s", instance.pk)
+            return
         _update_management_mirror(instance, adapter_link_error=message, adapter_link_outcome_attempt=attempt)
+
+
+def _current_link_row(instance):
+    """Read the row again with its NSO instance, under the row lock the caller holds."""
+    return type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
 
 
 def _link_mapping(mgmt) -> tuple:
     """Return the fields that the link sweep classifies a management row's adapter mapping by."""
     return (
+        mgmt.onboard_status,
         mgmt.device_id,
         mgmt.nso_instance_id,
         mgmt.nso_instance.adapter_instance_id,
