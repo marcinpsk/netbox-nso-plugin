@@ -1328,6 +1328,7 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
 
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+        before = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         address = IPAddress.objects.create(address="192.0.2.77/32")
         real_footprint = management_lifecycle._control_footprint
 
@@ -1348,6 +1349,8 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         notify.assert_not_called()
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "an earlier failure")
+        self.assertEqual(self.mgmt.adapter_link_attempt, before.adapter_link_attempt + 1)
+        self.assertEqual(self.mgmt.adapter_link_outcome_attempt, before.adapter_link_outcome_attempt)
 
     def test_a_link_retry_that_sent_nothing_is_reported_as_unconfirmed(self):
         from dcim.models import Device
