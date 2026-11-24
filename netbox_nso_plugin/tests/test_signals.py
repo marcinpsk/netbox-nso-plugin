@@ -1497,6 +1497,37 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")
 
+    def test_a_link_sweep_warning_about_a_mapping_replaced_after_its_first_check_is_discarded(self):
+        from netbox_nso_plugin import signals, sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        real_start = signals._start_link_attempt
+
+        def remap_then_start(instance):
+            # A link adopts a new adapter device after the sweep's unlocked check.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            return real_start(instance)
+
+        with patch.object(signals, "_start_link_attempt", side_effect=remap_then_start):
+            sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_about_a_source_a_rekey_replaced_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        # A repair patched the adapter's source identity in place: only the source epoch advanced.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=5)
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_a_link_sweep_warning_about_a_mapping_a_link_replaced_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.adapter_client import AdapterError

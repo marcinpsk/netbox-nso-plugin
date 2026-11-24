@@ -958,6 +958,7 @@ def _link_mapping(mgmt) -> tuple:
         mgmt.nso_instance.adapter_instance_id,
         mgmt.nso_device_name,
         mgmt.adapter_device_id,
+        mgmt.adapter_source_epoch,
     )
 
 
