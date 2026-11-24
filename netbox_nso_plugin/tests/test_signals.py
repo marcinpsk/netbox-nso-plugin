@@ -1558,6 +1558,19 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")
 
+    def test_a_link_sweep_warning_about_a_previous_adapter_store_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        # A read adopts a rebuilt adapter store; its ids and source epochs can repeat.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_incarnation="signal-race-rebuilt")
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_a_link_sweep_warning_about_a_mapping_a_link_replaced_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.adapter_client import AdapterError
