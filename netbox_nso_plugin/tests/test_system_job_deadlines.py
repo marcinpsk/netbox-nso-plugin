@@ -918,6 +918,26 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(tried, [devices[0].pk, devices[1].pk])
 
+    def test_a_key_whose_fallback_stamp_the_timeout_interrupts_stays_in_the_rotation(self):
+        from netbox_nso_plugin import drain, jobs
+
+        device, _management = make_managed("job-deadline-drain-restamp-alarm", 19219)
+        with without_commit_drain():
+            with transaction.atomic():
+                enqueue(device, "vlan")
+
+        rotation = {}
+        with (
+            patch.object(drain, "drain_key", side_effect=RuntimeError("render failed")),
+            # RQ's alarm during the fallback stamp, after the claim rolled back.
+            patch.object(drain, "_restamp_attempt", side_effect=jobs._RunTimedOut),
+            self.assertLogs("netbox_nso_plugin.drain", level="ERROR"),
+            self.assertRaises(jobs._RunTimedOut),
+        ):
+            drain.drain_intent_outbox(deadline=time.monotonic() + 30, rotation=rotation)
+
+        self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[device.pk, "vlan"]])
+
     def test_a_repair_lock_skip_stays_in_the_rotation_when_a_later_row_overruns(self):
         from netbox_nso_plugin import jobs, sync_cache
         from netbox_nso_plugin.models import NSODeviceManagement
