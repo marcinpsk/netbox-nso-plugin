@@ -7524,6 +7524,8 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         return reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
 
     def test_retry_success_clears_error_and_links(self):
+        from django.contrib.messages import get_messages
+
         mirror_update(
             self.mgmt,
             adapter_device_id=None,
@@ -7539,6 +7541,9 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         ):
             resp = self.client.post(self._url())
         self.assertEqual(resp.status_code, 302)  # redirect to the NSO tab
+        self.assertEqual(
+            [str(message) for message in get_messages(resp.wsgi_request)], ["Device linked to the adapter."]
+        )
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")  # cleared on success
         self.assertEqual(self.mgmt.adapter_device_id, 321)  # now linked
@@ -7605,6 +7610,8 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         self.assertEqual(self.mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
 
     def test_retry_failure_refreshes_error(self):
+        from django.contrib.messages import get_messages
+
         mirror_update(
             self.mgmt,
             adapter_device_id=None,
@@ -7617,6 +7624,10 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         ):
             resp = self.client.post(self._url())
         self.assertEqual(resp.status_code, 302)
+        self.assertEqual(
+            [str(message) for message in get_messages(resp.wsgi_request)],
+            ["Still couldn't link this device to the adapter: The NSO adapter request failed. See the server log."],
+        )
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
         self.assertIsNone(self.mgmt.adapter_device_id)  # still unlinked
