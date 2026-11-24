@@ -36,6 +36,8 @@ SYSTEM_JOB_BUDGET_SECONDS = SYSTEM_JOB_TIMEOUT_SECONDS - 360
 SYSTEM_JOB_REQUEST_LIMIT_SECONDS = SYSTEM_JOB_TIMEOUT_SECONDS - 60
 #: The longest one lock wait in a run may take. A longer wait fails that unit of work, and a later run retries it.
 SYSTEM_JOB_LOCK_TIMEOUT = "30s"
+#: Seconds between repeats of RQ's timeout alarm until the run ends, in case a handler caught it.
+_TIMEOUT_REPEAT_SECONDS = 0.5
 #: How long after the run deadline a started settlement poll may still page its evidence feed.
 #: The rest of the timeout is for that poll's reads and writes after the feed.
 SETTLEMENT_FEED_GRACE_SECONDS = 180
@@ -149,6 +151,7 @@ def _unswallowable_timeout(record):
     def end_the_run(signum, frame):
         nonlocal fired
         fired = True
+        signal.setitimer(signal.ITIMER_REAL, _TIMEOUT_REPEAT_SECONDS)
         raise _RunTimedOut
 
     previous = signal.signal(signal.SIGALRM, end_the_run)
@@ -164,6 +167,12 @@ def _unswallowable_timeout(record):
     except BaseException as exc:
         if not fired:
             raise
+        while True:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                break
+            except _RunTimedOut:
+                continue
         # The alarm can stop a statement in flight, and NetBox's terminate and reschedule need the connection.
         if not connection.in_atomic_block:
             connection.close()

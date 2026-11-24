@@ -1663,6 +1663,8 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
                     raise OperationalError("the connection is not usable")
             except Exception:  # noqa: BLE001
                 pass
+            # Work after the handler that caught the timeout.
+            time.sleep(3)
 
         job, elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob)
 
