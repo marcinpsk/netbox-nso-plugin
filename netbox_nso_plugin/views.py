@@ -3776,9 +3776,16 @@ class NSOAdapterLinkRetryView(AuthorizedView):
         from .management_lifecycle import save_management
 
         mgmt = self.target.management
+        started = mgmt.adapter_link_attempt
         save_management(mgmt)
         mgmt.refresh_from_db()
-        if mgmt.adapter_link_error:
+        if mgmt.adapter_link_outcome_attempt <= started:
+            # No attempt from this retry on recorded an outcome, so the banner is not evidence.
+            messages.warning(
+                request,
+                "The adapter link attempt did not finish, so the link is not confirmed. Retry the link.",
+            )
+        elif mgmt.adapter_link_error:
             messages.error(request, f"Still couldn't link this device to the adapter: {mgmt.adapter_link_error}")
         else:
             messages.success(request, "Device linked to the adapter.")

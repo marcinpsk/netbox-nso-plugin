@@ -1349,6 +1349,38 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "an earlier failure")
 
+    def test_a_link_retry_that_sent_nothing_is_reported_as_unconfirmed(self):
+        from dcim.models import Device
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import management_lifecycle
+
+        address = IPAddress.objects.create(address="192.0.2.78/32")
+        real_footprint = management_lifecycle._control_footprint
+
+        def footprint_then_new_primary(device_id):
+            footprint = real_footprint(device_id)
+            # The device gets a new primary address after the push read its lock footprint.
+            in_thread(lambda: Device.objects.filter(pk=self.device.pk).update(primary_ip4=address))
+            return footprint
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin"))
+        with (
+            patch.object(management_lifecycle, "_control_footprint", side_effect=footprint_then_new_primary),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        set_scope.assert_not_called()
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+
     def test_a_link_sweep_warning_about_a_mapping_a_link_replaced_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.adapter_client import AdapterError
