@@ -11,7 +11,7 @@ import time
 from abc import abstractmethod
 
 from core.choices import JobIntervalChoices
-from django.db import OperationalError, connection
+from django.db import DatabaseError, OperationalError, connection
 from netbox.jobs import JobRunner, system_job
 from rq.timeouts import JobTimeoutException
 
@@ -113,12 +113,19 @@ def lock_waits_until(deadline: float):
             )
         return execute(sql, params, many, context)
 
+    def reset():
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous])
+
     try:
         with connection.execute_wrapper(bounded):
             yield
-    finally:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT set_config('lock_timeout', %s, false)", [previous])
+    except BaseException:
+        # A reset that fails on a connection the error left unusable must not replace that error.
+        with contextlib.suppress(DatabaseError):
+            reset()
+        raise
+    reset()
 
 
 class _RunTimedOut(BaseException):
@@ -151,6 +158,9 @@ def _unswallowable_timeout(record):
         finally:
             if not fired:
                 record()
+        if fired:
+            # A handler in the run caught what the alarm raised, for example as a cleanup error that replaced it.
+            raise _RunTimedOut
     except BaseException as exc:
         if not fired:
             raise

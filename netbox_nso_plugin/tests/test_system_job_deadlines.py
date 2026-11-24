@@ -1648,6 +1648,42 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(successors, 1)
         self.assertEqual(job.data, {"fleet_rotation": {"after_device_id": 7}})
 
+    def test_an_overrun_that_a_cleanup_error_replaces_still_records_the_rotation_and_reschedules(self):
+        from django.db import OperationalError
+
+        from netbox_nso_plugin import jobs
+
+        def tick(job_self):
+            job_self.rotation("fleet_rotation")["after_device_id"] = 7
+            try:
+                try:
+                    time.sleep(3)
+                finally:
+                    # A cleanup statement on the connection the alarm interrupted fails in its place.
+                    raise OperationalError("the connection is not usable")
+            except Exception:  # noqa: BLE001
+                pass
+
+        job, elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob)
+
+        self.assertLess(elapsed, 3, "the run went on after RQ's timeout")
+        self.assertEqual(job.status, "errored")
+        self.assertEqual(successors, 1)
+        self.assertEqual(job.data, {"fleet_rotation": {"after_device_id": 7}})
+
+    def test_a_lock_wait_bound_keeps_the_exception_in_flight_when_its_reset_fails(self):
+        from netbox_nso_plugin import jobs
+
+        class _InFlight(Exception):
+            pass
+
+        self.addCleanup(connection.close)
+        with self.assertRaises(_InFlight):
+            with jobs.lock_waits_until(time.monotonic() + 30):
+                # The alarm can leave the connection unusable, so the reset statement fails.
+                connection.connection.close()
+                raise _InFlight
+
     def test_an_overrun_inside_a_statement_still_records_every_rotation(self):
         from netbox_nso_plugin import jobs
 
