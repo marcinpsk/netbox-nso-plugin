@@ -1349,6 +1349,34 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "an earlier failure")
 
+    def test_a_link_sweep_warning_about_a_mapping_a_link_replaced_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        # The sweep classified mapping 7 as broken before the link replaced it.
+        classified = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+
+        def set_scope(adapter_device_id, *args, **kwargs):
+            if adapter_device_id == 7:
+                raise AdapterError("Device not found", code="not_found")
+            return {"device_id": adapter_device_id}
+
+        def notify(_device_id):
+            in_thread(lambda: sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE))
+
+        with (
+            patch(f"{_MOD}.onboard_device", return_value={"id": 8}),
+            patch(f"{_MOD}.set_scope", side_effect=set_scope),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_device_id, 8)
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_a_link_sweep_warning_written_during_the_link_is_kept(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.models import NSODeviceManagement

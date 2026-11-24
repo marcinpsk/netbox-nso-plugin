@@ -267,20 +267,33 @@ def _flag_link_error(mgmt, message) -> None:
 
     It takes a link attempt number, so that a link callback that started earlier cannot clear it.
     The same warning is written again only while an attempt that started after its outcome is in flight.
+    A warning about a mapping that changed after *mgmt* was read is discarded: it no longer describes the row.
     """
+    from django.db import transaction
+
     from .signals import _record_link_error, _start_link_attempt
 
-    current = (
-        type(mgmt)
-        .objects.filter(pk=mgmt.pk)
-        .values_list("adapter_link_error", "adapter_link_attempt", "adapter_link_outcome_attempt")
-        .first()
-    )
-    if current is None or (current[0] == message and current[2] >= current[1]):
-        return
-    attempt = _start_link_attempt(mgmt)
-    if attempt is not None:
-        _record_link_error(mgmt, attempt, message)
+    classified = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
+    with transaction.atomic():
+        current = (
+            type(mgmt)
+            .objects.select_for_update(of=("self",))
+            .filter(pk=mgmt.pk)
+            .values_list(
+                "nso_instance_id",
+                "nso_device_name",
+                "adapter_device_id",
+                "adapter_link_error",
+                "adapter_link_attempt",
+                "adapter_link_outcome_attempt",
+            )
+            .first()
+        )
+        if current is None or current[:3] != classified or (current[3] == message and current[5] >= current[4]):
+            return
+        attempt = _start_link_attempt(mgmt)
+        if attempt is not None:
+            _record_link_error(mgmt, attempt, message)
 
 
 def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
