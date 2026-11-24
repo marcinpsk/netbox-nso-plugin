@@ -883,7 +883,40 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         ):
             drain.drain_intent_outbox(deadline=time.monotonic() + 30, rotation=rotation)
 
-        self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[devices[0].pk, "vlan"]])
+        self.assertEqual(
+            [entry[:2] for entry in rotation["lock_skipped"]], [[devices[0].pk, "vlan"], [devices[1].pk, "vlan"]]
+        )
+
+    def test_a_key_whose_claim_the_timeout_interrupts_rotates_behind_an_untouched_key(self):
+        from netbox_nso_plugin import drain, jobs
+
+        devices = [
+            make_managed(f"job-deadline-drain-alarm-{index}", 19217 + index, index=index)[0] for index in range(2)
+        ]
+        with without_commit_drain():
+            for device in devices:
+                with transaction.atomic():
+                    enqueue(device, "vlan")
+        tried = []
+        real_drain_key = drain.drain_key
+
+        def overrun_the_first_claim(device_id, scope, **kwargs):
+            tried.append(device_id)
+            if len(tried) == 1:
+                # RQ's alarm during the claim: its attempt stamp rolls back with it.
+                raise jobs._RunTimedOut
+            return real_drain_key(device_id, scope, **kwargs)
+
+        rotation = {}
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch.object(drain, "drain_key", side_effect=overrun_the_first_claim),
+        ):
+            with self.assertRaises(jobs._RunTimedOut):
+                drain.drain_intent_outbox(limit=1, deadline=time.monotonic() + 30, rotation=rotation)
+            drain.drain_intent_outbox(limit=1, deadline=time.monotonic() + 30, rotation=rotation)
+
+        self.assertEqual(tried, [devices[0].pk, devices[1].pk])
 
     def test_a_repair_lock_skip_stays_in_the_rotation_when_a_later_row_overruns(self):
         from netbox_nso_plugin import jobs, sync_cache

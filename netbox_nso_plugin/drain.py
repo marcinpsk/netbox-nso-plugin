@@ -2119,7 +2119,7 @@ def drain_intent_outbox(
 
 def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None, rotation=None) -> tuple[int, int]:
     """Run one tick with a new deployment admission for each bounded stage."""
-    from .jobs import lock_wait_timed_out, lock_waits_until
+    from .jobs import _RunTimedOut, lock_wait_timed_out, lock_waits_until
 
     try:
         with _deployment_operation("intent outbox tick"):
@@ -2159,6 +2159,11 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
         except DeploymentQuiesced:
             logger.info("the intent outbox tick stopped because a deployment started")
             break
+        except _RunTimedOut:
+            # The claim's attempt stamp rolls back. The run's timeout recovery records this skip instead.
+            skipped[(device_id, scope)] = datetime.datetime.now(tz=datetime.UTC)
+            keep_skips()
+            raise
         except Exception as exc:  # noqa: BLE001 (one key's adapter must not abort the fleet pass)
             logger.exception("intent outbox drain failed for %s/%s", device_id, scope)
             # After a lock timeout, the stamp would wait on the same row.
