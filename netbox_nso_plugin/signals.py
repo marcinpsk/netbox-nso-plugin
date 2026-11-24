@@ -930,8 +930,11 @@ def _start_link_attempt(instance) -> int | None:
     return current
 
 
-def _record_link_error(instance, attempt, message):
-    """Record this attempt's link outcome unless an attempt that started later has recorded its own."""
+def _record_link_error(instance, attempt, message, *, mapping=None):
+    """Record this attempt's link outcome unless an attempt that started later has recorded its own.
+
+    With *mapping*, the outcome describes that :func:`_link_mapping` and is discarded when the row's mapping changed.
+    """
     from django.db import transaction
 
     with transaction.atomic():
@@ -939,7 +942,23 @@ def _record_link_error(instance, attempt, message):
         if locked is None or locked[1] >= attempt:
             logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
             return
+        if mapping is not None:
+            current = type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
+            if _link_mapping(current) != mapping:
+                logger.info("Discarded a link outcome about an earlier mapping of management row %s", instance.pk)
+                return
         _update_management_mirror(instance, adapter_link_error=message, adapter_link_outcome_attempt=attempt)
+
+
+def _link_mapping(mgmt) -> tuple:
+    """Return the fields that the link sweep classifies a management row's adapter mapping by."""
+    return (
+        mgmt.device_id,
+        mgmt.nso_instance_id,
+        mgmt.nso_instance.adapter_instance_id,
+        mgmt.nso_device_name,
+        mgmt.adapter_device_id,
+    )
 
 
 def _locked_link_attempt(instance):

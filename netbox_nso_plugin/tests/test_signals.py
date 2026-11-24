@@ -1384,6 +1384,18 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertNotIn("Device linked to the adapter.", rendered)
         self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
 
+    def test_a_link_sweep_warning_about_an_nso_instance_an_operator_corrected_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        NSOInstance.objects.filter(pk=self.nso_instance.pk).update(adapter_instance_id="signal-race-corrected")
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
     def test_a_link_sweep_warning_about_a_mapping_a_link_replaced_is_discarded(self):
         from netbox_nso_plugin import sync_cache
         from netbox_nso_plugin.adapter_client import AdapterError

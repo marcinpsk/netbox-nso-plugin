@@ -269,31 +269,17 @@ def _flag_link_error(mgmt, message) -> None:
     The same warning is written again only while an attempt that started after its outcome is in flight.
     A warning about a mapping that changed after *mgmt* was read is discarded: it no longer describes the row.
     """
-    from django.db import transaction
+    from .signals import _link_mapping, _record_link_error, _start_link_attempt
 
-    from .signals import _record_link_error, _start_link_attempt
-
-    classified = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
-    with transaction.atomic():
-        current = (
-            type(mgmt)
-            .objects.select_for_update(of=("self",))
-            .filter(pk=mgmt.pk)
-            .values_list(
-                "nso_instance_id",
-                "nso_device_name",
-                "adapter_device_id",
-                "adapter_link_error",
-                "adapter_link_attempt",
-                "adapter_link_outcome_attempt",
-            )
-            .first()
-        )
-        if current is None or current[:3] != classified or (current[3] == message and current[5] >= current[4]):
-            return
-        attempt = _start_link_attempt(mgmt)
-        if attempt is not None:
-            _record_link_error(mgmt, attempt, message)
+    classified = _link_mapping(mgmt)
+    current = type(mgmt).objects.select_related("nso_instance").filter(pk=mgmt.pk).first()
+    if current is None or _link_mapping(current) != classified:
+        return
+    if current.adapter_link_error == message and current.adapter_link_outcome_attempt >= current.adapter_link_attempt:
+        return
+    attempt = _start_link_attempt(mgmt)
+    if attempt is not None:
+        _record_link_error(mgmt, attempt, message, mapping=classified)
 
 
 def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
