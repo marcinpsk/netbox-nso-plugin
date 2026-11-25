@@ -939,22 +939,26 @@ def _start_link_attempt(instance, *, mapping=None) -> int | None:
     return current
 
 
-def _record_link_error(instance, attempt, message, *, mapping=None):
+def _record_link_error(instance, attempt, message, *, mapping=None) -> bool:
     """Record this attempt's link outcome unless an attempt that started later has recorded its own.
 
     With *mapping*, the outcome describes that :func:`_link_mapping` and is discarded when the row's mapping changed.
+    Return False when the row is gone.
     """
     from django.db import transaction
 
     with transaction.atomic():
         locked = _locked_link_attempt(instance)
-        if locked is None or locked[1] >= attempt:
+        if locked is None:
+            return False
+        if locked[1] >= attempt:
             logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
-            return
+            return True
         if mapping is not None and _link_mapping(_current_link_row(instance)) != mapping:
             logger.info("Discarded a link outcome about an earlier mapping of management row %s", instance.pk)
-            return
+            return True
         _update_management_mirror(instance, adapter_link_error=message, adapter_link_outcome_attempt=attempt)
+    return True
 
 
 def _current_link_row(instance):
@@ -1120,16 +1124,15 @@ def _link_to_adapter(instance, created) -> bool:
 
 
 def _record_link_outcome(instance, attempt, message) -> bool:
-    """Record the callback's outcome, and return False when the write failed.
+    """Record the callback's outcome, and return False when the write failed or the row is gone.
 
     A write failure is logged: it is not an adapter link failure.
     """
     try:
-        _record_link_error(instance, attempt, message)
+        return _record_link_error(instance, attempt, message)
     except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
         logger.exception("Could not record the adapter link outcome for management row %s", instance.pk)
         return False
-    return True
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")

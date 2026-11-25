@@ -1353,6 +1353,33 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
             ["The adapter linked this device, but NetBox could not save the result. Retry the link."],
         )
 
+    def test_a_link_retry_whose_row_is_deleted_before_the_record_does_not_report_a_link(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        def notify(_device_id):
+            # The management row is deleted after the adapter work, before the success record.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).delete())
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-deleted"))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        self.assertFalse(NSODeviceManagement.objects.filter(pk=self.mgmt.pk).exists())
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(
+            rendered,
+            ["The adapter linked this device, but NetBox could not save the result. Retry the link."],
+        )
+
     def test_a_control_push_that_sent_nothing_records_no_outcome(self):
         from dcim.models import Device
         from ipam.models import IPAddress
