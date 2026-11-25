@@ -230,7 +230,7 @@ class TestTheTickDrainsTheTail(_DrainCase):
         assert result == (0, 0)
         compact.assert_called_once_with(None, deadline=None, rotation=None)
         guarded_compact.assert_not_called()
-        drain_key.assert_called_once_with(1, "vlan", deadline=None)
+        drain_key.assert_called_once_with(1, "vlan", deadline_at=None)
         restamp.assert_not_called()
 
     def test_the_tick_enters_the_deployment_gate_once_before_compaction(self):

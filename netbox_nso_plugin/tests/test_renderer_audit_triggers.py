@@ -81,7 +81,7 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
                 "vlan",
                 mode=delivery.MODE_NORMAL,
                 force=False,
-                deadline=7,
+                _deadline_at=drain._send_clock() + 7,
             )
 
         self.assertEqual((outcome, answer), (drain.NOTHING, None))

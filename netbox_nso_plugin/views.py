@@ -3235,7 +3235,7 @@ def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
         raise ApplyRefused from exc
 
 
-def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, int], dict[str, int]]:
+def _push_direct_snapshots(mgmt, registry, remaining_budget, prepare_deadline) -> tuple[dict[str, int], dict[str, int]]:
     """Prepare switching snapshots and return selection and source revisions."""
     from . import delivery, drain
     from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed
@@ -3245,7 +3245,7 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, 
     source_revisions = {}
     for entry in (candidate for candidate in registry.values() if not candidate.in_protocol):
         try:
-            deadline = remaining_budget()
+            remaining_budget()
         except ApplyDeadlineExpired as exc:
             raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_NOT_STARTED) from exc
         try:
@@ -3254,7 +3254,7 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, 
                 entry.key,
                 mode=delivery.MODE_NORMAL,
                 force=True,
-                deadline=deadline,
+                deadline_at=prepare_deadline,
             )
         except (
             AdapterError,
@@ -3329,14 +3329,14 @@ def _prepare_apply(mgmt):
         for entry in (candidate for candidate in registry.values() if candidate.in_protocol):
             if entry.key == "snmp":
                 continue
-            deadline = remaining_budget()
+            remaining_budget()
             try:
                 response = drain.push_now(
                     mgmt.device_id,
                     entry.key,
                     mode=delivery.MODE_STORE_ONLY,
                     force=True,
-                    deadline=deadline,
+                    deadline_at=prepare_deadline,
                 )
             except (
                 AdapterError,
@@ -3393,7 +3393,9 @@ def _prepare_apply(mgmt):
     _audit_capture(mgmt, tuple(registry), "views._prepare_apply.finalize", remaining_budget)
 
     # Switching preparations select the exact adapter slot returned by each POST.
-    direct_selected, direct_source_revisions = _push_direct_snapshots(mgmt, registry, remaining_budget)
+    direct_selected, direct_source_revisions = _push_direct_snapshots(
+        mgmt, registry, remaining_budget, prepare_deadline
+    )
 
     if not static_route_stored:
         logger.warning(

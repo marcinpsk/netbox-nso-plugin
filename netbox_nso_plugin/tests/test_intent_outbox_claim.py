@@ -625,7 +625,6 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
                 mode=delivery.MODE_NORMAL,
                 force=False,
                 chain=1,
-                deadline=None,
                 deadline_at=None,
                 chained=False,
             )

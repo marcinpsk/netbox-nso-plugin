@@ -364,7 +364,9 @@ def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, 
 
         if mode != MODE_NORMAL or mark:
             raise ValueError("switching preparation requires normal unmarked delivery")
-        response = drain.push_now(device_id, key, force=True, deadline=SEND_DEADLINE.total_seconds())
+        response = drain.push_now(
+            device_id, key, force=True, deadline_at=drain._send_clock() + SEND_DEADLINE.total_seconds()
+        )
         if response is None:
             raise adapter_client.AdapterError("Switching preparation failed.", code="preparation_failed")
         return response

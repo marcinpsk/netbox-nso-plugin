@@ -1544,7 +1544,7 @@ def drain_key(
     return outcome
 
 
-def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadline=None):
+def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadline_at=None):
     """Drain one key synchronously and return the adapter's answer, or ``None``.
 
     The forced-push sites use this: a forced call is its own logical operation, never
@@ -1552,7 +1552,7 @@ def push_now(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False, deadli
     read the answer (the Apply's promotion gate, the fleet resync's stored count). ``None``
     means the operation was not acknowledged, which is what those callers act on.
     """
-    outcome, answer = _drain_once(device_id, scope, mode=mode, force=force, deadline=deadline)
+    outcome, answer = _drain_once(device_id, scope, mode=mode, force=force, _deadline_at=deadline_at)
     return answer if outcome == SUCCEEDED else None
 
 
@@ -1584,7 +1584,6 @@ def _drain_once(
     force,
     chain=DRAIN_CHAIN_MAX,
     reform=1,
-    deadline=None,
     _deadline_at=None,
     _chained=False,
     _audit=True,
@@ -1596,7 +1595,7 @@ def _drain_once(
     """
     if _deadline_at is None:
         # Before the admission, so that the time it takes counts against the caller's budget.
-        _deadline_at = _send_clock() + (SEND_DEADLINE.total_seconds() if deadline is None else deadline)
+        _deadline_at = _send_clock() + SEND_DEADLINE.total_seconds()
     return _drain_admitted(
         device_id,
         scope,
@@ -1604,7 +1603,6 @@ def _drain_once(
         force=force,
         chain=chain,
         reform=reform,
-        deadline=deadline,
         _deadline_at=_deadline_at,
         _chained=_chained,
         _audit=_audit,
@@ -1612,7 +1610,7 @@ def _drain_once(
 
 
 @_deployment_guarded("intent drain")
-def _drain_admitted(device_id, scope, *, mode, force, chain, reform, deadline, _deadline_at, _chained, _audit):
+def _drain_admitted(device_id, scope, *, mode, force, chain, reform, _deadline_at, _chained, _audit):
     """Run :func:`_drain_once` under the deployment admission."""
     _refuse_in_transaction("drain")
     from .renderer_audit import audit_renderer_scopes
@@ -1657,7 +1655,6 @@ def _drain_admitted(device_id, scope, *, mode, force, chain, reform, deadline, _
             force=force,
             chain=chain,
             reform=reform - 1,
-            deadline=deadline,
             _deadline_at=_deadline_at,
             _chained=_chained,
             _audit=False,
@@ -1673,7 +1670,6 @@ def _drain_admitted(device_id, scope, *, mode, force, chain, reform, deadline, _
             mode=mode,
             force=force,
             chain=chain,
-            deadline=deadline,
             deadline_at=_deadline_at,
             chained=_chained,
         )
@@ -1682,7 +1678,7 @@ def _drain_admitted(device_id, scope, *, mode, force, chain, reform, deadline, _
     return outcome, answer
 
 
-def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chained):
+def _after_success(claimed, *, mode, force, chain, deadline_at, chained):
     """Resolve any operation still owed after a successful preparatory pass."""
     device_id, scope = claimed.device_id, claimed.scope
     answered_other_work = _answered_other_work(claimed, mode, force)
@@ -1708,7 +1704,6 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
             mode=mode,
             force=force,
             chain=chain - 1,
-            deadline=deadline,
             _deadline_at=deadline_at,
             _chained=chained,
             _audit=False,
@@ -1724,7 +1719,6 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
                 mode=mode,
                 force=False,
                 chain=chain - 1,
-                deadline=deadline,
                 _deadline_at=deadline_at,
                 _chained=True,
                 _audit=False,
