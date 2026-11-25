@@ -3777,7 +3777,12 @@ class NSOAdapterLinkRetryView(AuthorizedView):
 
         mgmt = self.target.management
         outcome = _sync_committed_scope_to_adapter(type(mgmt), mgmt.pk, False)
-        if outcome is LINK_NOT_RECORDED:
+        if outcome is LINK_NOT_RECORDED and not type(mgmt).objects.filter(pk=mgmt.pk).exists():
+            messages.warning(
+                request,
+                "The adapter linked this device, but its NSO management record was deleted, so NetBox saved no result.",
+            )
+        elif outcome is LINK_NOT_RECORDED:
             messages.warning(
                 request, "The adapter linked this device, but NetBox could not save the result. Retry the link."
             )

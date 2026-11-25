@@ -1377,7 +1377,7 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         rendered = [str(message) for message in get_messages(response.wsgi_request)]
         self.assertEqual(
             rendered,
-            ["The adapter linked this device, but NetBox could not save the result. Retry the link."],
+            ["The adapter linked this device, but its NSO management record was deleted, so NetBox saved no result."],
         )
 
     def test_a_control_push_that_sent_nothing_records_no_outcome(self):
