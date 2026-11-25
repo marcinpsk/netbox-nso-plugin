@@ -490,6 +490,24 @@ class TestTheSweepStandsDownOnAGlobalOutage(_SettlementCase):
             "a slow inventory read stopped the settlement sweep although the adapter answers"
         )
 
+    def test_a_snapshot_with_no_budget_left_still_polls(self):
+        from netbox_nso_plugin import jobs
+
+        device = _make_device("nobudget")
+        mgmt = _make_mgmt(device, "nobudget", 23, adapter=self.adapter)
+        sr = _route("10.50.0.0/16", "10.50.0.1", devices=[device])
+        _own(sr, mgmt, generation=211)
+        self.adapter.store.terminal_job(23, results=[_result(sr.pk, 211)])
+
+        # The run's budget is gone before the inventory read starts, so the tick proves no outage.
+        with patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 0):
+            self._tick()
+
+        assert ("GET", "/api/v1/devices") not in self.adapter.store.requests
+        assert {request[0] for request in self.adapter.store.feed_requests} == {23}, (
+            "a run with no snapshot budget left stopped the settlement sweep"
+        )
+
 
 class TestADrainErrorCannotStopTheSweep(_SettlementCase):
     """The sweep is the retry clock, so no earlier pass of the tick may abort it.

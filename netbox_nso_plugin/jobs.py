@@ -355,7 +355,8 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         snapshot_started = time.monotonic()
         snapshot_budget = (deadline - snapshot_started) * SNAPSHOT_SHARE
         snapshot = rows, None, None
-        snapshot_cut = False
+        # True when the run's time, not the adapter, ended the snapshot: that proves no outage.
+        snapshot_cut = snapshot_budget <= 0
         # One adapter snapshot for both passes: they ask the same question of the same data,
         # and a second call could disagree with the first mid-sweep.
         if snapshot_budget > 0:
