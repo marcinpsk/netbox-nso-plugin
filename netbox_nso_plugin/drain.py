@@ -2023,7 +2023,7 @@ def _ordered_candidates(limit, lock_skipped) -> list[tuple[int, str]]:
         device_id=OuterRef("device_id"),
         scope=OuterRef("scope"),
     ).order_by()
-    entry_keys = list(
+    entries = (
         NSOIntentOutboxEntry.objects.filter(
             consumed_by_push_seq__isnull=True,
             device__nso_management__adapter_device_id__isnull=False,
@@ -2036,18 +2036,25 @@ def _ordered_candidates(limit, lock_skipped) -> list[tuple[int, str]]:
         )
         .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
         .order_by(F("attempted_at").asc(nulls_first=True), "device_id", "scope")
-        .distinct()[:fetch]
+        .distinct()
     )
-    state_keys = list(
+    states = (
         NSOIntentOutboxState.objects.filter(device__nso_management__adapter_device_id__isnull=False)
         .filter(Q(push_seq__isnull=False) | ~Q(queued_deletions=[]))
         .filter(Q(claimed_at__isnull=True) | Q(claimed_at__lte=fresh))
         .order_by(F("last_drain_attempted_at").asc(nulls_first=True), "device_id", "scope")
-        .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))[:fetch]
+        .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))
     )
+    rows = [*entries[:fetch], *states[:fetch]]
+    if lock_skipped:
+        # Every skipped key that still owes a send, also one past the window, so that the caller keeps its skip.
+        skipped_keys = Q()
+        for device_id, scope in lock_skipped:
+            skipped_keys |= Q(device_id=device_id, scope=scope)
+        rows += [*entries.filter(skipped_keys), *states.filter(skipped_keys)]
 
     by_key = {}
-    for row in [*entry_keys, *state_keys]:
+    for row in rows:
         key = (row["device_id"], row["scope"])
         attempted, skipped = row["attempted_at"], (lock_skipped or {}).get(key)
         by_key[key] = skipped if skipped is not None and (attempted is None or skipped > attempted) else attempted

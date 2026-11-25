@@ -835,6 +835,30 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual(candidates[0], (devices[2].pk, "vlan"))
 
+    def test_a_lock_skip_past_the_query_window_stays_in_the_rotation(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        devices = [
+            make_managed(f"job-deadline-drain-window-{index}", 19240 + index, index=index)[0] for index in range(4)
+        ]
+        with without_commit_drain():
+            for device in devices:
+                with transaction.atomic():
+                    enqueue(device, "vlan")
+        start = timezone.now() - timedelta(hours=1)
+        skipped, first, second, last = devices
+        for minutes, device in ((3, skipped), (1, first), (2, second), (4, last)):
+            NSOIntentOutboxState.objects.create(
+                device=device, scope="vlan", last_drain_attempted_at=start + timedelta(minutes=minutes)
+            )
+        rotation = {"lock_skipped": [[skipped.pk, "vlan", (start + timedelta(minutes=5)).isoformat()]]}
+
+        with patch.object(drain, "drain_key", return_value=drain.SUCCEEDED):
+            drain.drain_intent_outbox(limit=1, deadline=time.monotonic() + 30, rotation=rotation)
+
+        self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[skipped.pk, "vlan"]])
+
     def test_two_held_keys_ahead_of_a_one_key_batch_still_let_the_next_key_in(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState
