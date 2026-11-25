@@ -3885,6 +3885,45 @@ def stamp_tombstone_on_unwind_without_handler(tombstone_id):
             keep_skips()
 
 
+def stamp_tombstone_directly_on_unwind(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        _stamp_swept(tombstone_id)
+
+
+def stamp_tombstone_directly_on_unwind_with_handler(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception:
+        log_failure()
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        _stamp_swept(tombstone_id)
+
+
+def stamp_tombstone_directly_on_unwind_with_else(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception:
+        log_failure()
+    else:
+        log_success()
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        _stamp_swept(tombstone_id)
+
+
+def stamp_tombstone_directly_after_poll(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    finally:
+        log_poll()
+    # ok: nso-system-job-progress-stamp-in-finally
+    _stamp_swept(tombstone_id)
+
+
 def stamp_tombstone_after_poll_without_handler(tombstone_id):
     try:
         sweep_one(tombstone_id)
