@@ -3777,7 +3777,7 @@ class NSOAdapterLinkRetryView(AuthorizedView):
 
         mgmt = self.target.management
         outcome = _sync_committed_scope_to_adapter(type(mgmt), mgmt.pk, False)
-        if outcome in (None, LINK_NOT_RECORDED) and not type(mgmt).objects.filter(pk=mgmt.pk).exists():
+        if outcome != "" and not type(mgmt).objects.filter(pk=mgmt.pk).exists():
             messages.warning(
                 request,
                 "The NSO management record of this device was deleted during the link attempt, "

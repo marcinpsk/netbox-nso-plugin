@@ -1385,6 +1385,36 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         rendered = [str(message) for message in get_messages(response.wsgi_request)]
         self.assertEqual(rendered, [DELETED_DURING_LINK])
 
+    def test_a_link_retry_whose_unmapped_row_is_deleted_before_onboarding_does_not_report_a_failure(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=None)
+        real_start = signals._start_link_attempt
+
+        def start_then_delete(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).delete())
+            return attempt
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-deleted-onboard"))
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_delete),
+            patch(f"{_MOD}.onboard_device", return_value={"id": 7}) as onboard,
+            self.assertLogs("netbox_nso_plugin.signals", level="WARNING"),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        onboard.assert_not_called()
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(rendered, [DELETED_DURING_LINK])
+
     def test_a_link_retry_whose_row_is_deleted_before_the_record_does_not_report_a_link(self):
         from django.contrib.auth import get_user_model
         from django.contrib.messages import get_messages
