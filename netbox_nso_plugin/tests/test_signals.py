@@ -1584,6 +1584,33 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         onboard.assert_not_called()
         self.assertIsNone(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id)
 
+    def test_a_dead_rekey_whose_row_starts_provisioning_registers_nothing(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True)
+        real_start = signals._start_link_attempt
+
+        def start_then_provision(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            # An asynchronous provision takes the row before the rekey reads it under its lock.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning"))
+            return attempt
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_provision),
+            patch(f"{_MOD}.patch_device", side_effect=AdapterError("Device not found", code="not_found")),
+            patch(f"{_MOD}.onboard_device", return_value={"id": 71, "source_epoch": 5}) as onboard,
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 71}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        onboard.assert_not_called()
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id, 7)
+
     def test_a_link_whose_source_change_is_flagged_before_its_control_push_sends_no_notify(self):
         from netbox_nso_plugin import signals
         from netbox_nso_plugin.models import NSODeviceManagement

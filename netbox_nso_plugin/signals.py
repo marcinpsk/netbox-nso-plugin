@@ -864,6 +864,9 @@ def _onboard_into_adapter(instance, client) -> bool:
         current = type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
         if tuple(getattr(current, field) for field in identity_fields) != expected:
             return False
+        if current.onboard_status:
+            # An asynchronous provision owns the row, also when the caller read it after the provision took it.
+            return False
         # Hold the source through registration so a concurrent rekey receives the new mapping.
         result = client.onboard_device(
             nso_instance=current.nso_instance.adapter_instance_id,
