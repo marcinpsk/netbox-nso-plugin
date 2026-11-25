@@ -1771,8 +1771,8 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         rq_job = RQJob.fetch(str(successor.job_id), connection=queue.connection)
         self.assertEqual(rq_job.timeout, jobs.SYSTEM_JOB_TIMEOUT_SECONDS)
 
-    def _overrun(self, tick, job_class=None):
-        """Run a plugin system job through NetBox's handle under RQ's own 1 s timeout alarm."""
+    def _overrun(self, tick, job_class=None, timeout=1):
+        """Run a plugin system job through NetBox's handle under RQ's own *timeout* alarm."""
         from core.models import Job
         from rq.timeouts import JobTimeoutException, UnixSignalDeathPenalty
 
@@ -1786,7 +1786,7 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         ):
             first = job_class.enqueue(schedule_at=timezone.now() + timedelta(hours=1), interval=1440)
             started = time.monotonic()
-            with UnixSignalDeathPenalty(1, JobTimeoutException, job_id=str(first.job_id)):
+            with UnixSignalDeathPenalty(timeout, JobTimeoutException, job_id=str(first.job_id)):
                 job_class.handle(first)
             elapsed = time.monotonic() - started
         first.refresh_from_db()
@@ -1798,14 +1798,30 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
 
         from netbox_nso_plugin import jobs
 
+        alarmed = threading.Event()
+
         def hold(pk, held):
-            # An editor of this Job row, so that the run's own save waits until RQ's alarm fires.
+            # An editor of this Job row, so that the run's own save waits until the observer raises RQ's alarm.
             try:
                 with transaction.atomic():
                     list(Job.objects.select_for_update().filter(pk=pk))
                     held.set()
-                    time.sleep(2.5)
+                    alarmed.wait(10)
             finally:
+                connection.close()
+
+        def alarm_when_the_save_waits(waiting_pid):
+            try:
+                wait_until_postgres_blocks(waiting_pid, "rotation save")
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT query FROM pg_stat_activity WHERE pid = %s", [waiting_pid])
+                    waiting = cursor.fetchone()[0]
+                    self.assertIn('UPDATE "core_job" SET "data"', waiting)
+                    signal.raise_signal(signal.SIGALRM)
+                    # Cancel the SQL before the holder releases the row lock.
+                    cursor.execute("SELECT pg_cancel_backend(%s)", [waiting_pid])
+            finally:
+                alarmed.set()
                 connection.close()
 
         def tick(job_self):
@@ -1815,9 +1831,15 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             holder.start()
             self.addCleanup(holder.join, 10)
             self.assertTrue(held.wait(10))
+            observer = ThreadPoolExecutor(max_workers=1)
+            self.addCleanup(observer.shutdown)
+            alarm = observer.submit(alarm_when_the_save_waits, connection.connection.info.backend_pid)
+            self.addCleanup(alarm.result, 10)
 
-        job, elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob)
+        # Longer than the run, so that only the observer's alarm can interrupt it.
+        job, elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob, timeout=30)
 
+        self.assertTrue(alarmed.is_set(), "the rotation save never waited on the holder")
         self.assertLess(elapsed, 5, "the run went on after RQ's timeout")
         self.assertEqual(job.status, "errored")
         self.assertEqual(successors, 1)
