@@ -1319,6 +1319,40 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_link_error, "")
 
+    def test_a_link_retry_whose_success_cannot_be_recorded_says_so(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        holders = []
+
+        def notify(_device_id):
+            # An operator edit takes the row after the adapter work, before the success record.
+            holder = HeldRowLock(self.mgmt)
+            holder.__enter__()
+            holders.append(holder)
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-unrecorded"))
+        short_lock_timeout(self)
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+                self.assertLogs("netbox_nso_plugin.signals", level="ERROR"),
+            ):
+                response = self.client.post(
+                    reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+                )
+        finally:
+            for holder in holders:
+                holder.__exit__(None, None, None)
+
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(
+            rendered,
+            ["The adapter linked this device, but NetBox could not save the result. Retry the link."],
+        )
+
     def test_a_control_push_that_sent_nothing_records_no_outcome(self):
         from dcim.models import Device
         from ipam.models import IPAddress

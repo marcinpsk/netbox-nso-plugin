@@ -3773,11 +3773,15 @@ class NSOAdapterLinkRetryView(AuthorizedView):
 
     def post(self, request, pk):
         """Re-attempt the adapter link for the device, then redirect to the NSO tab."""
-        from .signals import _sync_committed_scope_to_adapter
+        from .signals import LINK_NOT_RECORDED, _sync_committed_scope_to_adapter
 
         mgmt = self.target.management
         outcome = _sync_committed_scope_to_adapter(type(mgmt), mgmt.pk, False)
-        if outcome is None:
+        if outcome is LINK_NOT_RECORDED:
+            messages.warning(
+                request, "The adapter linked this device, but NetBox could not save the result. Retry the link."
+            )
+        elif outcome is None:
             messages.warning(
                 request,
                 "The adapter link attempt did not finish, so the link is not confirmed. Retry the link.",

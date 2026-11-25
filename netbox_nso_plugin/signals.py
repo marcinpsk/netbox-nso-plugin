@@ -917,6 +917,10 @@ def _update_management_mirror(instance, **values):
     update_mirror_fields(instance, **values)
 
 
+#: The outcome of a link attempt that linked the device but could not save that on the row.
+LINK_NOT_RECORDED = object()
+
+
 def _start_link_attempt(instance, *, mapping=None) -> int | None:
     """Take the next adapter link attempt number of the row, or None when the row is gone.
 
@@ -1000,8 +1004,8 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
     yet, so mapping/scope/sync would fail or race. The status-advance view clears the
     status to "" on success and re-saves, which fires this handler normally.
 
-    Return this attempt's outcome: "" when it linked, the error message when it failed, or None
-    when it stopped without an outcome.
+    Return this attempt's outcome: "" when it linked, the error message when it failed,
+    :data:`LINK_NOT_RECORDED` when it linked but the record failed, or None when it stopped without an outcome.
     """
     try:
         instance = sender.objects.select_related("nso_instance", "device").get(pk=instance_pk)
@@ -1047,8 +1051,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         return None
     # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
     # goes away. The row is read again under its lock: an older attempt can record its error after this load.
-    _record_link_outcome(instance, attempt, "")
-    return ""
+    return "" if _record_link_outcome(instance, attempt, "") else LINK_NOT_RECORDED
 
 
 def _link_to_adapter(instance, created) -> bool:
@@ -1116,12 +1119,17 @@ def _link_to_adapter(instance, created) -> bool:
     return True
 
 
-def _record_link_outcome(instance, attempt, message):
-    """Record the callback's outcome. A write failure is logged: it is not an adapter link failure."""
+def _record_link_outcome(instance, attempt, message) -> bool:
+    """Record the callback's outcome, and return False when the write failed.
+
+    A write failure is logged: it is not an adapter link failure.
+    """
     try:
         _record_link_error(instance, attempt, message)
     except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
         logger.exception("Could not record the adapter link outcome for management row %s", instance.pk)
+        return False
+    return True
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")
