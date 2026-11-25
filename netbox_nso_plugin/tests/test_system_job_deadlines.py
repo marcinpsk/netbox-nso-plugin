@@ -859,6 +859,33 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
 
         self.assertEqual([entry[:2] for entry in rotation["lock_skipped"]], [[skipped.pk, "vlan"]])
 
+    def test_a_lock_skip_stays_while_its_key_is_not_drainable(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxState
+
+        unlinked, claimed, idle = (
+            make_managed(f"job-deadline-drain-ineligible-{index}", 19262 + index, index=index)[0] for index in range(3)
+        )
+        with without_commit_drain():
+            for device in (unlinked, claimed):
+                with transaction.atomic():
+                    enqueue(device, "vlan")
+        # Both keys still owe a send: one lost its adapter mapping, another drainer holds a fresh claim on the other.
+        NSODeviceManagement.objects.filter(device=unlinked).update(adapter_device_id=None)
+        NSOIntentOutboxState.objects.create(device=claimed, scope="vlan", claimed_at=timezone.now())
+        skipped_at = timezone.now().isoformat()
+        rotation = {"lock_skipped": [[device.pk, "vlan", skipped_at] for device in (unlinked, claimed, idle)]}
+
+        with patch.object(drain, "drain_key", return_value=drain.SUCCEEDED) as drain_key:
+            drain.drain_intent_outbox(limit=5, deadline=time.monotonic() + 30, rotation=rotation)
+
+        drain_key.assert_not_called()
+        self.assertEqual(
+            sorted(entry[0] for entry in rotation["lock_skipped"]),
+            sorted([unlinked.pk, claimed.pk]),
+            "a skip dropped for a key that still owes a send, or kept for a key that owes none",
+        )
+
     def test_two_held_keys_ahead_of_a_one_key_batch_still_let_the_next_key_in(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState

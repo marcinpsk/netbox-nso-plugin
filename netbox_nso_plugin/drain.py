@@ -2045,16 +2045,8 @@ def _ordered_candidates(limit, lock_skipped) -> list[tuple[int, str]]:
         .order_by(F("last_drain_attempted_at").asc(nulls_first=True), "device_id", "scope")
         .values("device_id", "scope", attempted_at=F("last_drain_attempted_at"))
     )
-    rows = [*entries[:fetch], *states[:fetch]]
-    if lock_skipped:
-        # Every skipped key that still owes a send, also one past the window, so that the caller keeps its skip.
-        skipped_keys = Q()
-        for device_id, scope in lock_skipped:
-            skipped_keys |= Q(device_id=device_id, scope=scope)
-        rows += [*entries.filter(skipped_keys), *states.filter(skipped_keys)]
-
     by_key = {}
-    for row in rows:
+    for row in [*entries[:fetch], *states[:fetch]]:
         key = (row["device_id"], row["scope"])
         attempted, skipped = row["attempted_at"], (lock_skipped or {}).get(key)
         by_key[key] = skipped if skipped is not None and (attempted is None or skipped > attempted) else attempted
@@ -2065,6 +2057,22 @@ def _ordered_candidates(limit, lock_skipped) -> list[tuple[int, str]]:
     ]
     ordered.sort(key=lambda item: (item[0], item[1], item[2]))
     return [key for _stamped, _at, key in ordered]
+
+
+def _keys_owing_send(keys) -> set[tuple[int, str]]:
+    """Return the *keys* that still owe a send, also when they are unlinked or another drainer claims them."""
+    from django.db.models import Q
+
+    from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
+
+    if not keys:
+        return set()
+    match = Q()
+    for device_id, scope in keys:
+        match |= Q(device_id=device_id, scope=scope)
+    entries = NSOIntentOutboxEntry.objects.filter(match, consumed_by_push_seq__isnull=True)
+    states = NSOIntentOutboxState.objects.filter(match).filter(Q(push_seq__isnull=False) | ~Q(queued_deletions=[]))
+    return {*entries.values_list("device_id", "scope"), *states.values_list("device_id", "scope")}
 
 
 def compact_intent_outbox(limit=None, *, deadline: float | None = None, rotation: dict | None = None) -> None:
@@ -2143,9 +2151,8 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
     }
     drained = failed = 0
     limit = DRAIN_BATCH if limit is None else limit
-    ordered = _ordered_candidates(limit, skipped)
-    candidates = ordered[:limit]
-    pending = set(ordered)
+    candidates = _ordered_candidates(limit, skipped)[:limit]
+    pending = _keys_owing_send(skipped) | set(candidates)
 
     def keep_skips():
         # A skip outside this batch still orders its key next time. Keys that no longer owe a send drop out.
