@@ -1636,6 +1636,29 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         patch_device.assert_not_called()
         self.assertTrue(NSODeviceManagement.objects.get(pk=self.mgmt.pk).source_rekey_pending)
 
+    def test_a_rekey_whose_row_starts_provisioning_during_its_patch_keeps_the_fence(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True, adapter_source_epoch=4)
+
+        def patch_then_provision(**kwargs):
+            # An asynchronous provision takes the row, with the same NSO source, while the PATCH is in flight.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning"))
+            return {"source_epoch": 5}
+
+        with (
+            patch(f"{_MOD}.patch_device", side_effect=patch_then_provision),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        row = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        self.assertTrue(row.source_rekey_pending)
+        self.assertEqual(row.adapter_source_epoch, 4)
+
     def test_a_link_whose_source_change_is_flagged_before_its_control_push_sends_no_notify(self):
         from netbox_nso_plugin import signals
         from netbox_nso_plugin.models import NSODeviceManagement

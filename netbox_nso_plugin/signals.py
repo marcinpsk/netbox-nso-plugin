@@ -809,7 +809,7 @@ def _sync_source_change(instance, client) -> bool:
 
     with mirror_transaction(footprint_for_instance(instance)):
         current = management_model.objects.get(pk=instance.pk)
-        if (current.nso_instance_id, current.nso_device_name) != expected_source:
+        if (current.nso_instance_id, current.nso_device_name) != expected_source or current.onboard_status:
             return False
         source_epoch = result["source_epoch"]
         source_aware = True
