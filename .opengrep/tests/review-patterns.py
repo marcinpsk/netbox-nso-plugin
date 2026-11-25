@@ -3863,6 +3863,19 @@ def stamp_tombstone_on_unwind(tombstone_id):
             keep_skips()
 
 
+def stamp_tombstone_on_unwind_with_else(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception as exc:
+        timed_out = lock_wait_timed_out(exc)
+    else:
+        log_success()
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        if timed_out or not _stamp_swept(tombstone_id):
+            keep_skips()
+
+
 def stamp_tombstone_on_unwind_without_handler(tombstone_id):
     try:
         sweep_one(tombstone_id)
@@ -3897,6 +3910,22 @@ def stamp_link_on_unwind(management, now):
         repair_link(management)
     except Exception:
         log_failure()
+    finally:
+        if attempted:
+            try:
+                # ruleid: nso-system-job-progress-stamp-in-finally
+                _mirror_management(management, adapter_link_attempted_at=now)
+            except Exception:
+                log_failure()
+
+
+def stamp_link_on_unwind_with_else(management, now):
+    try:
+        repair_link(management)
+    except Exception:
+        log_failure()
+    else:
+        log_success()
     finally:
         if attempted:
             try:
