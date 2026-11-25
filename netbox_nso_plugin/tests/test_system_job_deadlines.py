@@ -1086,14 +1086,15 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         def missing_mappings(method, url, **kwargs):
             return make_response(200, [] if url.endswith("/api/v1/devices") else {})
 
+        stamped = []
+        interrupt = True
+
         def interrupt_before_commit(execute, sql, params, many, context):
             result = execute(sql, params, many, context)
-            if (
-                sql.startswith(f'UPDATE "{management_table}"')
-                and '"adapter_link_attempted_at" =' in sql
-                and params[-1] == first.pk
-            ):
-                signal.raise_signal(signal.SIGALRM)
+            if sql.startswith(f'UPDATE "{management_table}"') and '"adapter_link_attempted_at" =' in sql:
+                stamped.append(params[-1])
+                if interrupt and params[-1] == first.pk:
+                    signal.raise_signal(signal.SIGALRM)
             return result
 
         adapter_client.reset_session()
@@ -1105,15 +1106,16 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         ):
             with self.assertRaises(JobTimeoutException):
                 job.run()
-            with self.assertRaises(JobTimeoutException):
-                system_job(jobs.RefreshDeviceSyncCacheJob).run()
+            job.job.refresh_from_db()
+            self.assertIn(str(first.pk), job.job.data["repair_rotation"]["lock_skipped"])
+            first.refresh_from_db()
+            self.assertIsNone(first.adapter_link_attempted_at)
+            # The recovery tick only has to try the other row first. It need not reach the interrupted one.
+            interrupt = False
+            stamped.clear()
+            system_job(jobs.RefreshDeviceSyncCacheJob).run()
 
-        first.refresh_from_db()
-        later.refresh_from_db()
-        self.assertIsNone(first.adapter_link_attempted_at)
-        self.assertIsNotNone(later.adapter_link_attempted_at)
-        job.job.refresh_from_db()
-        self.assertIn(str(first.pk), job.job.data["repair_rotation"]["lock_skipped"])
+        self.assertEqual(stamped[:1], [later.pk])
 
     def test_an_alarm_during_a_deferral_warning_keeps_the_row_out_of_rotation(self):
         from netbox_nso_plugin import adapter_client, jobs, sync_cache
@@ -1664,6 +1666,13 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
                 cursor.execute("SHOW lock_timeout")
                 return cursor.fetchone()[0]
 
+        def set_lock_timeout(value):
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT set_config('lock_timeout', %s, false)", [value])
+
+        # A baseline that differs from the jobs' cap, whatever the test database starts with.
+        self.addCleanup(set_lock_timeout, lock_timeout())
+        set_lock_timeout("17s")
         before = lock_timeout()
         self.assertNotEqual(before, jobs.SYSTEM_JOB_LOCK_TIMEOUT)
         for job_class in [cls for cls in registry["system_jobs"] if cls.__module__ == jobs.__name__]:
