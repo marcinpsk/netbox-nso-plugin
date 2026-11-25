@@ -195,6 +195,7 @@ def _snapshot(rows):
 
     ``by_id`` is None when the adapter could not be reached — nothing is provable, so callers
     must do nothing rather than treat an outage as "every mapping is broken".
+    A ``request_limit`` error propagates: a read that the caller's time limit cut proves no outage.
     """
     from . import adapter_client as client
     from .adapter_client import AdapterError
@@ -205,6 +206,8 @@ def _snapshot(rows):
     try:
         payload = client.list_devices() or []
     except AdapterError as exc:
+        if exc.code == "request_limit":
+            raise
         logger.debug("adapter snapshot unavailable: %s", exc)
         return candidates, None, None
     by_id, by_identity = _index(payload)

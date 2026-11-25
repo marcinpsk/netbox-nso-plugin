@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
@@ -75,6 +76,8 @@ class SettlementStore:
         self.intent_malformed = False
         #: status ``GET /api/v1/devices`` answers with — the maintenance tick's shared snapshot
         self.devices_status = 200
+        #: seconds ``GET /api/v1/devices`` waits before it answers
+        self.devices_stall = 0
         #: called (on the server thread) while the read-back is in flight, so a test can
         #: commit a concurrent operator edit inside the consumer's real HTTP window
         self.on_readback = None
@@ -360,6 +363,7 @@ class _Handler(BaseHTTPRequestHandler):
         store = self._store
 
         if parsed.path == "/api/v1/devices":
+            time.sleep(store.devices_stall)
             if store.devices_status != 200:
                 self._send(store.devices_status, {"error": {"code": "nso_error", "message": "the adapter is hung"}})
                 return

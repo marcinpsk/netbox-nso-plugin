@@ -345,7 +345,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
     @_deployment_guarded("device maintenance tick")
     def _run(deadline, refresh_rotation, repair_rotation, outbox_rotation, rotation):
         """Refresh the last-sync mirror, repair mappings, drain the outbox, sweep settlements."""
-        from .adapter_client import requests_until
+        from .adapter_client import AdapterError, requests_until
         from .drain import compact_intent_outbox, drain_intent_outbox
         from .models import NSODeviceManagement
         from .settlement import sweep_static_route_settlements
@@ -355,11 +355,17 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         snapshot_started = time.monotonic()
         snapshot_budget = (deadline - snapshot_started) * SNAPSHOT_SHARE
         snapshot = rows, None, None
+        snapshot_cut = False
         # One adapter snapshot for both passes: they ask the same question of the same data,
         # and a second call could disagree with the first mid-sweep.
         if snapshot_budget > 0:
-            with requests_until(snapshot_started + snapshot_budget):
-                snapshot = _snapshot(rows)
+            try:
+                with requests_until(snapshot_started + snapshot_budget):
+                    snapshot = _snapshot(rows)
+            except AdapterError as exc:
+                if exc.code != "request_limit":
+                    raise
+                snapshot_cut = True
 
         budget = max(0, deadline - time.monotonic())
         before_sweep = deadline - budget * SETTLEMENT_SWEEP_SHARE
@@ -398,7 +404,11 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox compaction failed")
             settle_started = time.monotonic()
-            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
+            if snapshot_cut:
+                # A slow inventory read proves no outage, and the sweep reads only per-device feeds.
+                logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit, sends skipped")
+            else:
+                logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
         else:
             # Same rule as the sweep, and for the same reason: a proven global outage is not
             # a per-key failure, and every candidate would wait out its own read timeout.
@@ -410,6 +420,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
             settle_started = time.monotonic()
+        if by_id is not None or snapshot_cut:
             polled, settle_failed = sweep_static_route_settlements(
                 deadline=deadline, feed_deadline=deadline + SETTLEMENT_FEED_GRACE_SECONDS, rotation=rotation
             )

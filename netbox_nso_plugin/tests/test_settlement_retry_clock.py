@@ -473,6 +473,23 @@ class TestTheSweepStandsDownOnAGlobalOutage(_SettlementCase):
             f"{self.adapter.store.feed_requests}"
         )
 
+    def test_a_snapshot_cut_at_its_time_limit_still_polls(self):
+        from netbox_nso_plugin import jobs
+
+        device = _make_device("slowinv")
+        mgmt = _make_mgmt(device, "slowinv", 22, adapter=self.adapter)
+        sr = _route("10.49.0.0/16", "10.49.0.1", devices=[device])
+        _own(sr, mgmt, generation=210)
+        self.adapter.store.terminal_job(22, results=[_result(sr.pk, 210)])
+        self.adapter.store.devices_stall = 8  # longer than the snapshot's share of the run
+
+        with patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 6):
+            self._tick()
+
+        assert {request[0] for request in self.adapter.store.feed_requests} == {22}, (
+            "a slow inventory read stopped the settlement sweep although the adapter answers"
+        )
+
 
 class TestADrainErrorCannotStopTheSweep(_SettlementCase):
     """The sweep is the retry clock, so no earlier pass of the tick may abort it.

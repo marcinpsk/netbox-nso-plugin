@@ -440,12 +440,12 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(len(read_timeouts), 1)
         self.assertLessEqual(read_timeouts[0], 5)
         self.assertIn(
-            "RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped",
+            "RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit, sends skipped",
             [record.getMessage() for record in logs.records],
         )
         self.assertEqual(self._unconsumed(device), 1)
 
-    def test_a_snapshot_that_keeps_sending_past_its_cutoff_is_unavailable(self):
+    def test_a_snapshot_that_keeps_sending_past_its_cutoff_is_cut(self):
         """An HTTP/1.0 answer hands the socket to the response, and the cutoff must still reach it.
 
         Without a Content-Length the body ends at EOF, so a cut before its first byte looks like an empty listing.
@@ -507,7 +507,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertTrue(responding.is_set(), "no request reached the trickling server")
         self.assertLess(elapsed, self.BUDGET + 1, "the inventory read ran past its cutoff")
         self.assertIn(
-            "RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped",
+            "RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit, sends skipped",
             [record.getMessage() for record in logs.records],
         )
 
