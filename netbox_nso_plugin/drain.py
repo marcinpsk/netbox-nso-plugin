@@ -2066,7 +2066,9 @@ def _keys_owing_send(keys) -> set[tuple[int, str]]:
         match |= Q(device_id=device_id, scope=scope)
     entries = NSOIntentOutboxEntry.objects.filter(match, consumed_by_push_seq__isnull=True)
     states = NSOIntentOutboxState.objects.filter(match).filter(Q(push_seq__isnull=False) | ~Q(queued_deletions=[]))
-    return {*entries.values_list("device_id", "scope"), *states.values_list("device_id", "scope")}
+    # One statement, so that work a claim gives back to its entries is seen once, and the database removes duplicates.
+    keys = entries.order_by().values_list("device_id", "scope")
+    return set(keys.union(states.order_by().values_list("device_id", "scope")).order_by())
 
 
 def compact_intent_outbox(limit=None, *, deadline: float | None = None, rotation: dict | None = None) -> None:

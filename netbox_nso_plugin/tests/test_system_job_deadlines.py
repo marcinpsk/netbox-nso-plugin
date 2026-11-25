@@ -893,9 +893,12 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             for device in (unlinked, claimed):
                 with transaction.atomic():
                     enqueue(device, "vlan")
-        # Both keys still owe a send: one lost its adapter mapping, another drainer holds a fresh claim on the other.
+        # Both keys still owe a send: another drainer holds a real claim on one, and the other lost its adapter mapping.
+        self.assertIsNotNone(drain.claim(claimed.pk, "vlan"))
         NSODeviceManagement.objects.filter(device=unlinked).update(adapter_device_id=None)
-        NSOIntentOutboxState.objects.create(device=claimed, scope="vlan", claimed_at=timezone.now())
+        state = NSOIntentOutboxState.objects.get(device=claimed, scope="vlan")
+        self.assertIsNotNone(state.push_seq)
+        self.assertEqual(self._unconsumed(claimed), 0)
         skipped_at = timezone.now().isoformat()
         rotation = {"lock_skipped": [[device.pk, "vlan", skipped_at] for device in (unlinked, claimed, idle)]}
 
@@ -908,6 +911,23 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             sorted([unlinked.pk, claimed.pk]),
             "a skip dropped for a key that still owes a send, or kept for a key that owes none",
         )
+
+    def test_the_skip_retention_check_reads_one_row_per_key_in_one_statement(self):
+        from netbox_nso_plugin import drain
+
+        device, _management = make_managed("job-deadline-drain-retention-read", 19265)
+        with without_commit_drain():
+            for _ in range(3):
+                with transaction.atomic():
+                    enqueue(device, "vlan")
+        self.assertEqual(self._unconsumed(device), 3)
+
+        with CaptureQueriesContext(connection) as queries:
+            owing = drain._keys_owing_send({(device.pk, "vlan"): timezone.now()})
+
+        self.assertEqual(owing, {(device.pk, "vlan")})
+        # One statement sees a claim and the entries it gives back at the same time, and returns no duplicates.
+        self.assertEqual(len(queries), 1, [query["sql"] for query in queries])
 
     def test_two_held_keys_ahead_of_a_one_key_batch_still_let_the_next_key_in(self):
         from netbox_nso_plugin import drain
