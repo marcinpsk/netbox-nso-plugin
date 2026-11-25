@@ -952,12 +952,13 @@ def _record_link_error(instance, attempt, message, *, mapping=None) -> bool | No
         locked = _locked_link_attempt(instance)
         if locked is None:
             return False
-        if locked[1] >= attempt:
-            logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
-            return True
+        # First, so that a later attempt's outcome for another mapping does not confirm this one.
         if mapping is not None and _link_mapping(_current_link_row(instance)) != mapping:
             logger.info("Discarded a link outcome about an earlier mapping of management row %s", instance.pk)
             return None
+        if locked[1] >= attempt:
+            logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
+            return True
         _update_management_mirror(instance, adapter_link_error=message, adapter_link_outcome_attempt=attempt)
     return True
 

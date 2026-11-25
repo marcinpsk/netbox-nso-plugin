@@ -1528,6 +1528,37 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
         self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error, "an earlier failure")
 
+    def test_a_link_retry_whose_replacement_mapping_records_a_later_failure_confirms_nothing(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        def notify_then_remap_and_fail(adapter_device_id):
+            # A repair adopts adapter device 8, and a later attempt records a failure for it, while 7 is notified.
+            def other():
+                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8)
+                replacement = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                signals._record_link_error(replacement, signals._start_link_attempt(replacement), "replacement failed")
+
+            in_thread(other)
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-later-failure"))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify_then_remap_and_fail),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error, "replacement failed")
+
     def test_a_link_whose_row_starts_provisioning_before_onboarding_registers_nothing(self):
         from netbox_nso_plugin import signals
         from netbox_nso_plugin.models import NSODeviceManagement
