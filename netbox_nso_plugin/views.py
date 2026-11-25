@@ -3359,14 +3359,14 @@ def _prepare_apply(mgmt):
 
         # A normal SNMP push can enqueue a shrink-removal job before this Apply. Store the
         # snapshot without executing it, then select that exact receipt for promotion below.
-        deadline = remaining_budget()
+        remaining_budget()
         try:
             outcome = drain.drain_key(
                 mgmt.device_id,
                 "snmp",
                 mode=delivery.MODE_STORE_ONLY,
                 force=True,
-                deadline=deadline,
+                deadline_at=prepare_deadline,
             )
         except (
             AdapterError,

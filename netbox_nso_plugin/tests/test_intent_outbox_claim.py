@@ -99,7 +99,7 @@ class TestPreCaptureDeadline(_ClaimCase):
         own_vlan(self.mgmt, 811, "send-budget")
         config, session = self.adapter.patches()
         with config, session, self.assertRaises(delivery.SendDeadlineExceeded):
-            drain.drain_key(self.device.pk, "vlan", deadline=0)
+            drain.drain_key(self.device.pk, "vlan", deadline_at=drain._send_clock())
 
         self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
         self.assertEqual(self.adapter.requests, [])
@@ -128,7 +128,7 @@ class TestPreCaptureDeadline(_ClaimCase):
             patch.object(deployment, "is_quiesced", side_effect=slow_admission),
             self.assertRaises(delivery.SendDeadlineExceeded),
         ):
-            drain.drain_key(self.device.pk, "vlan", deadline=0.5)
+            drain.drain_key(self.device.pk, "vlan", deadline_at=drain._send_clock() + 0.5)
 
         self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
         self.assertEqual(self.adapter.requests, [])
@@ -545,7 +545,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
             patch("netbox_nso_plugin.delivery.send", new=answer),
             patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks)),
         ):
-            outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline=10)
+            outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline_at=drain._send_clock() + 10)
 
         assert outcome == drain.SUCCEEDED
         assert deadlines == [8, 5]
@@ -566,7 +566,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
             patch("netbox_nso_plugin.delivery.send", new=answer),
             patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks)),
         ):
-            outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline=10)
+            outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline_at=drain._send_clock() + 10)
 
         assert outcome == drain.FAILED
         assert deadlines == [8]
@@ -714,7 +714,7 @@ class TestTheSendBudgetFollowsTheRevocationScan(_ClaimCase):
             patch.object(drain, "revocation_hit", side_effect=slow_scan) as scan,
             patch.object(delivery, "send", wraps=delivery.send) as send,
         ):
-            outcome = drain.drain_key(self.device.pk, "static_route", deadline=10)
+            outcome = drain.drain_key(self.device.pk, "static_route", deadline_at=drain._send_clock() + 10)
         scan.assert_called_once()
         return outcome, send
 

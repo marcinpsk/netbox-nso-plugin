@@ -217,6 +217,31 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(self._unconsumed(device), 0)
         self.assertLessEqual(send.call_args.kwargs["deadline"], drain.SEND_DEADLINE.total_seconds())
 
+    def test_a_pause_before_a_key_starts_does_not_extend_the_tick_deadline(self):
+        from netbox_nso_plugin import drain
+
+        device, _management = make_managed("job-deadline-drain-pause", 19266)
+        with without_commit_drain(), transaction.atomic():
+            enqueue(device, "vlan")
+        clock = [time.monotonic()]
+        real_drain_key = drain.drain_key
+
+        def paused(*args, **kwargs):
+            # The worker pauses after the tick measured its remaining time, and before the key starts.
+            clock[0] += 2
+            return real_drain_key(*args, **kwargs)
+
+        with (
+            patch.object(_SlowAdapter, "DELAY", 0),
+            patch.object(drain, "_send_clock", side_effect=lambda: clock[0]),
+            patch.object(drain, "drain_key", side_effect=paused),
+        ):
+            drain.drain_intent_outbox(deadline=clock[0] + 1.5)
+
+        sent = [request["push_seq"] for request in self.adapter.requests if request["push_seq"] is not None]
+        self.assertEqual(sent, [], "the key sent after the tick deadline")
+        self.assertEqual(self._unconsumed(device), 1)
+
     def test_lock_context_entry_can_use_up_the_repair_send_budget(self):
         from netbox_nso_plugin import drain, jobs, renderer_audit
 

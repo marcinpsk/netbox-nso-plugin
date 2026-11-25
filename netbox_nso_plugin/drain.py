@@ -1535,11 +1535,11 @@ def drain_key(
     force=False,
     chain=DRAIN_CHAIN_MAX,
     reform=1,
-    deadline=None,
+    deadline_at=None,
 ) -> str:
-    """Claim, send and settle one key, then chain a bounded number of further drains."""
+    """Claim, send and settle one key before the monotonic *deadline_at*, then chain a bounded number of further drains."""
     outcome, _answer = _drain_once(
-        device_id, scope, mode=mode, force=force, chain=chain, reform=reform, deadline=deadline
+        device_id, scope, mode=mode, force=force, chain=chain, reform=reform, _deadline_at=deadline_at
     )
     return outcome
 
@@ -2167,8 +2167,10 @@ def _drain_intent_outbox(limit=None, *, deadline=None, compaction_deadline=None,
             break
         try:
             try:
-                budget = None if remaining is None else min(SEND_DEADLINE.total_seconds(), remaining)
-                outcome = drain_key(device_id, scope, deadline=budget)
+                key_deadline = (
+                    None if deadline is None else min(deadline, _send_clock() + SEND_DEADLINE.total_seconds())
+                )
+                outcome = drain_key(device_id, scope, deadline_at=key_deadline)
             except DeploymentQuiesced:
                 logger.info("the intent outbox tick stopped because a deployment started")
                 break

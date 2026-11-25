@@ -469,7 +469,11 @@ def _drain_repaired(device_id, scopes, deadline) -> None:
                         scopes[index:],
                     )
                     return
-                drain.drain_key(device_id, scope, deadline=min(remaining, drain.SEND_DEADLINE.total_seconds()))
+                drain.drain_key(
+                    device_id,
+                    scope,
+                    deadline_at=min(deadline, drain._send_clock() + drain.SEND_DEADLINE.total_seconds()),
+                )
         except Exception as exc:  # noqa: BLE001 (the outbox tick retries the key)
             logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
 
