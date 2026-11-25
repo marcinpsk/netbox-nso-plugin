@@ -1411,6 +1411,28 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id, 8)
         notify.assert_not_called()
 
+    def test_a_link_whose_source_change_is_flagged_before_its_control_push_sends_no_notify(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        real_start = signals._start_link_attempt
+
+        def start_then_flag_rekey(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            # A source edit flags a rekey after the callback chose the ordinary link path.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True))
+            return attempt
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_flag_rekey),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        notify.assert_not_called()
+
     def test_a_link_whose_source_rekeys_after_its_control_push_sends_no_notify(self):
         from netbox_nso_plugin import management_lifecycle
         from netbox_nso_plugin.models import NSODeviceManagement

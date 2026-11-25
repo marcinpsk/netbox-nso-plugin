@@ -1102,10 +1102,10 @@ def _link_to_adapter(instance, created) -> bool:
     if (
         before_push is None
         or current is None
-        or before_push.adapter_device_id != instance.adapter_device_id
+        or _link_mapping(before_push) != _link_mapping(instance)
         or _link_mapping(current) != _link_mapping(before_push)
     ):
-        # The push read the row again, so it may have sent to the new mapping. Confirm neither.
+        # The push read the row again, so it may have sent to a mapping this attempt did not link. Confirm neither.
         logger.info("Adapter link for management row %s saw its mapping change; it records no outcome", instance.pk)
         return False
 
