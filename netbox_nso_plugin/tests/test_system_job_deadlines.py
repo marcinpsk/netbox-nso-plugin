@@ -926,8 +926,12 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
             owing = drain._keys_owing_send({(device.pk, "vlan"): timezone.now()})
 
         self.assertEqual(owing, {(device.pk, "vlan")})
-        # One statement sees a claim and the entries it gives back at the same time, and returns no duplicates.
+        # One statement sees a claim and the entries it gives back at the same time.
         self.assertEqual(len(queries), 1, [query["sql"] for query in queries])
+        # UNION, not UNION ALL: the database removes the duplicate rows of a backlog, not Python.
+        sql = queries[0]["sql"]
+        self.assertIn(" UNION ", sql)
+        self.assertNotIn(" UNION ALL ", sql)
 
     def test_two_held_keys_ahead_of_a_one_key_batch_still_let_the_next_key_in(self):
         from netbox_nso_plugin import drain
