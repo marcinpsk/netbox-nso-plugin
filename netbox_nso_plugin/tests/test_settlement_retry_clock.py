@@ -483,9 +483,14 @@ class TestTheSweepStandsDownOnAGlobalOutage(_SettlementCase):
         self.adapter.store.terminal_job(22, results=[_result(sr.pk, 210)])
         self.adapter.store.devices_stall = 8  # longer than the snapshot's share of the run
 
-        with patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 6):
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 6),
+            self.assertLogs("netbox_nso_plugin.jobs", level="WARNING") as logs,
+        ):
             self._tick()
 
+        assert self.adapter.store.devices_arrivals == 1, "the inventory read never reached the adapter"
+        assert any("adapter snapshot reached its time limit" in line for line in logs.output), logs.output
         assert {request[0] for request in self.adapter.store.feed_requests} == {22}, (
             "a slow inventory read stopped the settlement sweep although the adapter answers"
         )

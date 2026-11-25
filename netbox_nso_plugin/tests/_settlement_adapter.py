@@ -78,6 +78,8 @@ class SettlementStore:
         self.devices_status = 200
         #: seconds ``GET /api/v1/devices`` waits before it answers
         self.devices_stall = 0
+        #: how many ``GET /api/v1/devices`` requests reached the server, counted before the stall
+        self.devices_arrivals = 0
         #: called (on the server thread) while the read-back is in flight, so a test can
         #: commit a concurrent operator edit inside the consumer's real HTTP window
         self.on_readback = None
@@ -363,6 +365,7 @@ class _Handler(BaseHTTPRequestHandler):
         store = self._store
 
         if parsed.path == "/api/v1/devices":
+            store.devices_arrivals += 1
             time.sleep(store.devices_stall)
             if store.devices_status != 200:
                 self._send(store.devices_status, {"error": {"code": "nso_error", "message": "the adapter is hung"}})
