@@ -1848,7 +1848,16 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
 
         from netbox_nso_plugin import jobs
 
-        alarmed = threading.Event()
+        alarmed, recovering = threading.Event(), threading.Event()
+        real_record = jobs.AuditRendererScopesJob._record_rotations
+        records = []
+
+        def record(job_self):
+            records.append(job_self)
+            # The run's own save comes first, and timeout recovery saves again.
+            if len(records) == 2:
+                recovering.set()
+            return real_record(job_self)
 
         def hold(pk, held):
             # An editor of this Job row, so that the run's own save waits until the observer raises RQ's alarm.
@@ -1868,8 +1877,12 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
                     waiting = cursor.fetchone()[0]
                     self.assertIn('UPDATE "core_job" SET "data"', waiting)
                     signal.raise_signal(signal.SIGALRM)
-                    # Cancel the SQL before the holder releases the row lock.
-                    cursor.execute("SELECT pg_cancel_backend(%s)", [waiting_pid])
+                    try:
+                        # The holder still holds the row, so only the alarm can end the save and start recovery.
+                        self.assertTrue(recovering.wait(3), "the alarm did not end the rotation save's lock wait")
+                    finally:
+                        # Cancel the SQL before the holder releases the row lock.
+                        cursor.execute("SELECT pg_cancel_backend(%s)", [waiting_pid])
             finally:
                 alarmed.set()
                 connection.close()
@@ -1887,7 +1900,8 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             self.addCleanup(alarm.result, 10)
 
         # Longer than the run, so that only the observer's alarm can interrupt it.
-        job, elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob, timeout=30)
+        with patch.object(jobs.AuditRendererScopesJob, "_record_rotations", record):
+            job, elapsed, successors = self._overrun(tick, jobs.AuditRendererScopesJob, timeout=30)
 
         self.assertTrue(alarmed.is_set(), "the rotation save never waited on the holder")
         self.assertLess(elapsed, 5, "the run went on after RQ's timeout")
