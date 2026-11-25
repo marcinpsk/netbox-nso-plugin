@@ -363,9 +363,7 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
             with transaction.atomic():
                 enqueue(device, "vlan")
         # The job's own session cap, which is far longer than what is left of the audit.
-        with connection.cursor() as cursor:
-            cursor.execute("SET lock_timeout = '10s'")
-        self.addCleanup(lambda: connection.cursor().execute("SET lock_timeout = 0"))
+        short_lock_timeout(self, "10s")
 
         started = time.monotonic()
         with (
@@ -1679,6 +1677,34 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
         with connection.cursor() as cursor:
             cursor.execute("SHOW lock_timeout")
             self.assertEqual(cursor.fetchone()[0], previous)
+
+    def test_a_short_lock_timeout_gives_back_the_session_s_own_value(self):
+        def lock_timeout():
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW lock_timeout")
+                return cursor.fetchone()[0]
+
+        def set_lock_timeout(value):
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT set_config('lock_timeout', %s, false)", [value])
+
+        class _Cleanups:
+            def __init__(self):
+                self.calls = []
+
+            def addCleanup(self, function, *args):  # noqa: N802 (the TestCase method name)
+                self.calls.append((function, args))
+
+        self.addCleanup(set_lock_timeout, lock_timeout())
+        set_lock_timeout("17s")
+        case = _Cleanups()
+
+        short_lock_timeout(case)
+        self.assertEqual(lock_timeout(), "2s")
+        for function, args in reversed(case.calls):
+            function(*args)
+
+        self.assertEqual(lock_timeout(), "17s")
 
     def test_an_advisory_lock_wait_ends_at_the_deadline(self):
         from django.db import OperationalError

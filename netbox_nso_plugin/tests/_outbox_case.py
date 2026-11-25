@@ -779,13 +779,15 @@ class HeldRowLock:
         self.thread.join(10)
 
 
-def short_lock_timeout(test_case):
-    """Make this connection's lock waits end after two seconds, until the test ends."""
+def short_lock_timeout(test_case, timeout="2s"):
+    """Make this connection's lock waits end after *timeout*, and give back the session's own value when the test ends."""
     with connection.cursor() as cursor:
-        cursor.execute("SET lock_timeout = '2s'")
+        cursor.execute("SHOW lock_timeout")
+        original = cursor.fetchone()[0]
+        cursor.execute("SELECT set_config('lock_timeout', %s, false)", [timeout])
 
     def reset():
         with connection.cursor() as cursor:
-            cursor.execute("SET lock_timeout = 0")
+            cursor.execute("SELECT set_config('lock_timeout', %s, false)", [original])
 
     test_case.addCleanup(reset)
