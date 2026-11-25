@@ -1367,12 +1367,40 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         with (
             patch.object(management_lifecycle, "push_management_control", side_effect=push_then_remap),
-            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
             patch(f"{_MOD}.sync_notify", return_value=None) as notify,
         ):
             outcome = _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
 
         self.assertIsNone(outcome)
+        self.assertEqual([call.args[0] for call in set_scope.call_args_list], [7])
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id, 8)
+        notify.assert_not_called()
+
+    def test_a_link_whose_source_rekeys_after_its_control_push_sends_no_notify(self):
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=4)
+        real_push = management_lifecycle.push_management_control
+
+        def push_then_rekey(device_id):
+            pushed = real_push(device_id)
+            # An in-place source rekey commits the next epoch. The adapter device id stays 7.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=5))
+            return pushed
+
+        with (
+            patch.object(management_lifecycle, "push_management_control", side_effect=push_then_rekey),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            outcome = _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        self.assertEqual([call.args[0] for call in set_scope.call_args_list], [7])
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_source_epoch, 5)
         notify.assert_not_called()
 
     def test_a_link_retry_that_sent_nothing_is_reported_as_unconfirmed(self):

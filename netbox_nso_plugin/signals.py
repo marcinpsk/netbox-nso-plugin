@@ -958,6 +958,11 @@ def _current_link_row(instance):
     return type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
 
 
+def _stored_link_row(instance):
+    """Read the committed row with its NSO instance, or None when the row is gone."""
+    return type(instance).objects.select_related("nso_instance").filter(pk=instance.pk).first()
+
+
 def _link_mapping(mgmt) -> tuple:
     """Return the fields that the link sweep classifies a management row's adapter mapping by."""
     return (
@@ -1066,6 +1071,7 @@ def _link_to_adapter(instance, created) -> bool:
 
     from .management_lifecycle import push_management_control
 
+    before_push = _stored_link_row(instance)
     try:
         pushed = push_management_control(instance.device_id)
     except AdapterError as exc:
@@ -1083,13 +1089,19 @@ def _link_to_adapter(instance, created) -> bool:
         )
         if not _onboard_into_adapter(instance, client):
             return False
+        before_push = _stored_link_row(instance)
         pushed = push_management_control(instance.device_id)
     if not pushed:
         # The row or its addresses changed under the push. The renderer audit sends the new control state.
         logger.info("Adapter link for management row %s sent no control state; it records no outcome", instance.pk)
         return False
-    mapped = type(instance).objects.filter(pk=instance.pk).values_list("adapter_device_id", flat=True).first()
-    if mapped != instance.adapter_device_id:
+    current = _stored_link_row(instance)
+    if (
+        before_push is None
+        or current is None
+        or before_push.adapter_device_id != instance.adapter_device_id
+        or _link_mapping(current) != _link_mapping(before_push)
+    ):
         # The push read the row again, so it may have sent to the new mapping. Confirm neither.
         logger.info("Adapter link for management row %s saw its mapping change; it records no outcome", instance.pk)
         return False
