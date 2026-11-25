@@ -775,7 +775,8 @@ def _sync_source_change(instance, client) -> bool:
         current = (
             management_model.objects.select_for_update(of=("self",)).select_related("nso_instance").get(pk=instance.pk)
         )
-        if (current.nso_instance_id, current.nso_device_name) != expected_source:
+        # An asynchronous provision that took the row owns its mapping too.
+        if (current.nso_instance_id, current.nso_device_name) != expected_source or current.onboard_status:
             return False
         invalidated = _invalidate_source_admissions(current)
 
