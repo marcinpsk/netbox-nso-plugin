@@ -3915,6 +3915,25 @@ def stamp_tombstone_directly_on_unwind_with_else(tombstone_id):
         _stamp_swept(tombstone_id)
 
 
+def stamp_link_assigned_on_unwind(management, now):
+    try:
+        repair_link(management)
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        stamped = _mirror_management(management, adapter_link_attempted_at=now)
+        log_stamp(stamped)
+
+
+def stamp_link_assigned_after_repair(management, now):
+    try:
+        repair_link(management)
+    finally:
+        log_poll()
+    # ok: nso-system-job-progress-stamp-in-finally
+    stamped = _mirror_management(management, adapter_link_attempted_at=now)
+    log_stamp(stamped)
+
+
 def stamp_tombstone_directly_after_poll(tombstone_id):
     try:
         sweep_one(tombstone_id)

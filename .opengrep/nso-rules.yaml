@@ -1405,10 +1405,10 @@ rules:
                       except ...:
                           ...
                   ...
-      # Anchored, so that a $STAMP bound to a whole if statement does not match.
+      # Anchored, so that a $STAMP bound to a whole if statement does not match. A plain assignment of the stamp does.
       - metavariable-regex:
           metavariable: $STAMP
-          regex: ^(_stamp_swept|_mirror_management)\(
+          regex: ^(\w+\s*=\s*)?(_stamp_swept|_mirror_management)\(
       - focus-metavariable: $STAMP
     paths:
       include: ["netbox_nso_plugin/provision_lifecycle.py", "netbox_nso_plugin/sync_cache.py"]
