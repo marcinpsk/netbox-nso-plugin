@@ -850,6 +850,7 @@ def _onboard_into_adapter(instance, client) -> bool:
     from .management_lifecycle import save_management
 
     identity_fields = (
+        "onboard_status",
         "device_id",
         "nso_instance_id",
         "nso_device_name",
@@ -939,11 +940,11 @@ def _start_link_attempt(instance, *, mapping=None) -> int | None:
     return current
 
 
-def _record_link_error(instance, attempt, message, *, mapping=None) -> bool:
+def _record_link_error(instance, attempt, message, *, mapping=None) -> bool | None:
     """Record this attempt's link outcome unless an attempt that started later has recorded its own.
 
     With *mapping*, the outcome describes that :func:`_link_mapping` and is discarded when the row's mapping changed.
-    Return False when the row is gone.
+    Return False when the row is gone, and None when the outcome was discarded.
     """
     from django.db import transaction
 
@@ -956,7 +957,7 @@ def _record_link_error(instance, attempt, message, *, mapping=None) -> bool:
             return True
         if mapping is not None and _link_mapping(_current_link_row(instance)) != mapping:
             logger.info("Discarded a link outcome about an earlier mapping of management row %s", instance.pk)
-            return True
+            return None
         _update_management_mirror(instance, adapter_link_error=message, adapter_link_outcome_attempt=attempt)
     return True
 
@@ -1055,7 +1056,10 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         return None
     # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
     # goes away. The row is read again under its lock: an older attempt can record its error after this load.
-    return "" if _record_link_outcome(instance, attempt, "") else LINK_NOT_RECORDED
+    recorded = _record_link_outcome(instance, attempt, "", mapping=_link_mapping(instance))
+    if recorded is None:
+        return None
+    return "" if recorded else LINK_NOT_RECORDED
 
 
 def _link_to_adapter(instance, created) -> bool:
@@ -1123,13 +1127,13 @@ def _link_to_adapter(instance, created) -> bool:
     return True
 
 
-def _record_link_outcome(instance, attempt, message) -> bool:
+def _record_link_outcome(instance, attempt, message, *, mapping=None) -> bool | None:
     """Record the callback's outcome, and return False when the write failed or the row is gone.
 
-    A write failure is logged: it is not an adapter link failure.
+    None means that the row's mapping is no longer *mapping*. A write failure is logged: it is not an adapter link failure.
     """
     try:
-        return _record_link_error(instance, attempt, message)
+        return _record_link_error(instance, attempt, message, mapping=mapping)
     except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
         logger.exception("Could not record the adapter link outcome for management row %s", instance.pk)
         return False

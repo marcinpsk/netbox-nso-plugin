@@ -1500,6 +1500,59 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id, 8)
         notify.assert_not_called()
 
+    def test_a_link_retry_whose_mapping_changes_during_its_notify_confirms_nothing(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def notify_then_remap(adapter_device_id):
+            # A repair adopts adapter device 8 while this attempt notifies device 7.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-notify-remap"))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify_then_remap) as notify,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        self.assertEqual([call.args[0] for call in notify.call_args_list], [7])
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error, "an earlier failure")
+
+    def test_a_link_whose_row_starts_provisioning_before_onboarding_registers_nothing(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=None)
+        real_start = signals._start_link_attempt
+
+        def start_then_provision(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            # An asynchronous provision takes the row after the callback read its blank status.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning"))
+            return attempt
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_provision),
+            patch(f"{_MOD}.onboard_device", return_value={"id": 7}) as onboard,
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        onboard.assert_not_called()
+        self.assertIsNone(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id)
+
     def test_a_link_whose_source_change_is_flagged_before_its_control_push_sends_no_notify(self):
         from netbox_nso_plugin import signals
         from netbox_nso_plugin.models import NSODeviceManagement
