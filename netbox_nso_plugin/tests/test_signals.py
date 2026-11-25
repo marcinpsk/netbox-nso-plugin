@@ -37,6 +37,9 @@ from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_f
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
+DELETED_DURING_LINK = (
+    "The NSO management record of this device was deleted during the link attempt, so NetBox saved no result."
+)
 
 
 def _bulk_create_management_without_signals(rows):
@@ -1353,6 +1356,35 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
             ["The adapter linked this device, but NetBox could not save the result. Retry the link."],
         )
 
+    def test_a_link_retry_whose_row_is_deleted_after_the_push_does_not_ask_for_a_retry(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        real_push = management_lifecycle.push_management_control
+
+        def push_then_delete(device_id):
+            pushed = real_push(device_id)
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).delete())
+            return pushed
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-deleted-push"))
+        with (
+            patch.object(management_lifecycle, "push_management_control", side_effect=push_then_delete),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        notify.assert_not_called()
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(rendered, [DELETED_DURING_LINK])
+
     def test_a_link_retry_whose_row_is_deleted_before_the_record_does_not_report_a_link(self):
         from django.contrib.auth import get_user_model
         from django.contrib.messages import get_messages
@@ -1377,7 +1409,7 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         rendered = [str(message) for message in get_messages(response.wsgi_request)]
         self.assertEqual(
             rendered,
-            ["The adapter linked this device, but its NSO management record was deleted, so NetBox saved no result."],
+            [DELETED_DURING_LINK],
         )
 
     def test_a_control_push_that_sent_nothing_records_no_outcome(self):
