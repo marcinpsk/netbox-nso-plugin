@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from django.db import transaction
+from django.db import OperationalError, transaction
 from django.utils import timezone
 
 from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
+from .jobs import _RunTimedOut, lock_wait_timed_out
 
 logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
@@ -124,8 +125,12 @@ def mark_provision_terminal(provision_attempt_id, evidence: dict) -> bool:
 
 
 @_deployment_guarded("provisioning")
-def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | None = None):
-    """Advance matching provision tombstones through the fenced completion states."""
+def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | None = None, rotation=None):
+    """Advance matching provision tombstones through the fenced completion states.
+
+    A fleet sweep takes the attempts it swept longest ago first. When a timeout prevents the stamp,
+    *rotation* (carried between runs) keeps when the sweep last reached the attempt.
+    """
     from .models import NSOProvisionTombstone
 
     inventory_cache = {}
@@ -143,21 +148,61 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
 
     checked = 0
     closed = 0
-    for tombstone_id in tombstones.values_list("provision_attempt_id", flat=True)[:_FLEET_SWEEP_LIMIT]:
+    skipped = {key: datetime.fromisoformat(at) for key, at in (rotation or {}).get("lock_skipped", {}).items()}
+    # A lock-skipped attempt moves back after the database's order, so the query reads one more row for each.
+    fetched = list(tombstones.values_list("provision_attempt_id", "updated_at")[: _FLEET_SWEEP_LIMIT + len(skipped)])
+    pending = {str(attempt_id) for attempt_id, _updated_at in fetched}
+    skipped = {key: at for key, at in skipped.items() if key in pending}
+    ordered = sorted(fetched, key=lambda row: max(row[1], skipped.get(str(row[0]), row[1])))
+    attempt_ids = [attempt_id for attempt_id, _updated_at in ordered][:_FLEET_SWEEP_LIMIT]
+
+    def keep_skips():
+        # At each skip, so that the run's timeout recovery records it too.
+        if rotation is not None:
+            rotation["lock_skipped"] = {key: at.isoformat() for key, at in skipped.items()}
+
+    keep_skips()
+    for index, tombstone_id in enumerate(attempt_ids):
         if deadline is not None and _monotonic() >= deadline:
+            logger.info("provision tombstone sweep deferred %d attempts to the next run", len(attempt_ids) - index)
             break
-        checked += 1
         try:
-            closed += int(_sweep_one(tombstone_id, inventory_cache))
-        except DeploymentQuiesced:
+            checked += 1
+            timed_out = False
+            try:
+                closed += int(_sweep_one(tombstone_id, inventory_cache))
+            except DeploymentQuiesced:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one attempt must not stop the fleet sweep
+                timed_out = lock_wait_timed_out(exc)
+                logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
+            # After a lock timeout, the stamp would wait on the same row.
+            if timed_out or not _stamp_swept(tombstone_id):
+                skipped[str(tombstone_id)] = timezone.now()
+                keep_skips()
+        except _RunTimedOut:
+            skipped[str(tombstone_id)] = timezone.now()
+            keep_skips()
             raise
-        except Exception:  # noqa: BLE001 - one attempt must not stop the fleet sweep
-            logger.exception("Provision tombstone sweep failed for attempt %s", tombstone_id)
-        finally:
-            NSOProvisionTombstone.objects.filter(
-                provision_attempt_id=tombstone_id,
-            ).exclude(state="closed").update(updated_at=timezone.now())
     return checked, closed
+
+
+def _stamp_swept(provision_attempt_id) -> bool:
+    """Stamp one swept attempt so that it rotates to the back. Return False when its lock wait timed out."""
+    from .models import NSOProvisionTombstone
+
+    try:
+        NSOProvisionTombstone.objects.filter(
+            provision_attempt_id=provision_attempt_id,
+        ).exclude(state="closed").update(updated_at=timezone.now())
+    except OperationalError as exc:
+        if not lock_wait_timed_out(exc):
+            raise
+        logger.warning(
+            "Provision tombstone sweep left attempt %s unstamped: its lock wait timed out", provision_attempt_id
+        )
+        return False
+    return True
 
 
 def _sweep_one(provision_attempt_id, inventory_cache) -> bool:

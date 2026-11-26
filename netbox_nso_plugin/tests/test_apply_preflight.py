@@ -497,7 +497,7 @@ class TestApplyPreflightFlow(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
     def test_preview_refuses_a_send_deadline_that_expires_before_the_drain_audit(self):
         adapter = PreflightAdapter()
-        clock = iter((0, 0, 0, 0, 241))
+        clock = iter((0, 0, 0, 241))
         config, session = adapter.patches()
         with config, session, patch("netbox_nso_plugin.drain._send_clock", side_effect=lambda: next(clock, 241)):
             response = self.client.post(self.preview_url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")

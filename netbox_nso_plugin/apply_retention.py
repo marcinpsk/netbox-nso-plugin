@@ -3,6 +3,7 @@
 """Bounded retention of terminal Apply history with no remaining authority."""
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
@@ -14,6 +15,7 @@ from django.utils import timezone
 from . import adapter_client, refusal_contract
 from .deployment import guarded
 from .durable_capture import mapping_epoch
+from .jobs import skipped_on_lock_timeout
 from .models import (
     APPLY_ATTEMPT_PRUNABLE,
     APPLY_ATTEMPT_RETENTION_AT,
@@ -41,10 +43,15 @@ class PruneResult:
     deleted: int
     next_cursor: str | None
     adapter_unavailable: bool = False
+    request_limit_reached: bool = False
 
 
 class _AdapterUnavailable(Exception):
     """The adapter cannot answer for any device."""
+
+
+class _RequestLimitReached(Exception):
+    """The run's time limit for adapter requests has passed."""
 
 
 def _valid_execution_evidence(execution, attempt):
@@ -183,6 +190,8 @@ def _remote_generations(management_id):
         adapter_client.raise_evidence_errors(unreleased)
         _page, final_incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
     except adapter_client.AdapterError as exc:
+        if exc.code == "request_limit":
+            raise _RequestLimitReached from exc
         if exc.code in ADAPTER_DOWN_CODES:
             raise _AdapterUnavailable from exc
         logger.warning(
@@ -218,9 +227,57 @@ def _expired_attempts(cutoff):
     ).filter(APPLY_ATTEMPT_PRUNABLE, retention_at__lt=cutoff)
 
 
+def _read_remote(management_id, remote_by_management) -> bool:
+    """Read one management row's adapter generations. Return False when the adapter is unavailable."""
+    try:
+        remote_by_management[management_id] = _remote_generations(management_id)
+    except _AdapterUnavailable:
+        # The shared deployment lock is held: waiting out the timeout per device would block quiesce().
+        logger.warning("Apply ledger retention stops: the adapter is unavailable")
+        return False
+    return True
+
+
+def _resume_cursor(candidates, examined, cursor):
+    """Return the cursor after the last examined candidate, or the batch's own when it examined none."""
+    last = candidates[examined - 1] if examined else None
+    return f"{last[2].isoformat()}|{last[0]}" if last is not None else cursor
+
+
+def _prune_one(attempt_id, management_id, remote, cutoff, execute) -> tuple[int, int]:
+    """Judge and delete one expired attempt in its own transaction. Return ``(eligible, deleted)``."""
+    with transaction.atomic():
+        management = NSODeviceManagement.objects.select_for_update().get(pk=management_id)
+        if management.adapter_device_id != remote.adapter_device_id:
+            return 0, 0
+        attempt = _expired_attempts(cutoff).select_for_update().filter(pk=attempt_id).first()
+        if attempt is None or not _eligible(attempt, management):
+            return 0, 0
+        if _historical_certificate_required(attempt, management, remote):
+            return 0, 0
+        if not execute:
+            return 1, 0
+        selection_ids = list(attempt.overlay_snapshots.values_list("selection_id", flat=True))
+        try:
+            with transaction.atomic():
+                attempt.delete()
+        except (ProtectedError, RestrictedError):
+            return 1, 0
+        NSOAcceptedSelection.objects.filter(
+            pk__in=selection_ids,
+            binding_state="invalidated",
+            overlay_snapshots__isnull=True,
+        ).delete()
+        return 1, 1
+
+
 @guarded("Apply ledger retention")
-def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=None):
-    """Examine at most one batch and retain all unresolved or referenced records."""
+def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=None, deadline=None):
+    """Examine at most one batch and retain all unresolved or referenced records.
+
+    A monotonic *deadline* stops the batch before its next candidate (never before the
+    first one), and the returned cursor resumes after the last examined record.
+    """
     if type(batch_size) is not int or not 1 <= batch_size <= 10000:
         raise ValueError("batch size must be between 1 and 10000")
     cutoff = timezone.now() - timedelta(days=RETENTION_DAYS)
@@ -244,45 +301,38 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
     eligible = deleted = 0
     remote_by_management = {}
     examined = len(candidates)
+    expired = limited = False
     for index, (attempt_id, management_id, _completed_at) in enumerate(candidates):
+        # Only after the first candidate, so that every run makes progress.
+        if index and deadline is not None and time.monotonic() >= deadline:
+            examined, expired = index, True
+            break
         if management_id not in remote_by_management:
             try:
-                remote_by_management[management_id] = _remote_generations(management_id)
-            except _AdapterUnavailable:
-                # The shared deployment lock is held: waiting out the timeout per device would block quiesce().
-                logger.warning("Apply ledger retention stops: the adapter is unavailable")
+                available = _read_remote(management_id, remote_by_management)
+            except _RequestLimitReached:
+                # Like the deadline: the cursor stays before this record, which no listing judged.
+                examined, limited = index, True
+                break
+            if not available:
                 examined = index
                 break
         remote = remote_by_management[management_id]
         if remote is None:
             continue
-        with transaction.atomic():
-            management = NSODeviceManagement.objects.select_for_update().get(pk=management_id)
-            if management.adapter_device_id != remote.adapter_device_id:
-                continue
-            attempt = _expired_attempts(cutoff).select_for_update().filter(pk=attempt_id).first()
-            if attempt is None or not _eligible(attempt, management):
-                continue
-            if _historical_certificate_required(attempt, management, remote):
-                continue
-            eligible += 1
-            if not execute:
-                continue
-            selection_ids = list(attempt.overlay_snapshots.values_list("selection_id", flat=True))
-            try:
-                with transaction.atomic():
-                    attempt.delete()
-            except (ProtectedError, RestrictedError):
-                continue
-            deleted += 1
-            NSOAcceptedSelection.objects.filter(
-                pk__in=selection_ids,
-                binding_state="invalidated",
-                overlay_snapshots__isnull=True,
-            ).delete()
+        with skipped_on_lock_timeout(f"Apply ledger retention keeps attempt {attempt_id}"):
+            found, removed = _prune_one(attempt_id, management_id, remote, cutoff, execute)
+            eligible += found
+            deleted += removed
     if examined < len(candidates):
-        last = candidates[examined - 1] if examined else None
-        next_cursor = f"{last[2].isoformat()}|{last[0]}" if last is not None else cursor
-        return PruneResult(examined, eligible, deleted, next_cursor, adapter_unavailable=True)
+        next_cursor = _resume_cursor(candidates, examined, cursor)
+        return PruneResult(
+            examined,
+            eligible,
+            deleted,
+            next_cursor,
+            adapter_unavailable=not (expired or limited),
+            request_limit_reached=limited,
+        )
     next_cursor = f"{candidates[-1][2].isoformat()}|{candidates[-1][0]}" if len(candidates) == batch_size else None
     return PruneResult(len(candidates), eligible, deleted, next_cursor)

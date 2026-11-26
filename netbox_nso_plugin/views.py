@@ -3235,7 +3235,7 @@ def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
         raise ApplyRefused from exc
 
 
-def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, int], dict[str, int]]:
+def _push_direct_snapshots(mgmt, registry, remaining_budget, prepare_deadline) -> tuple[dict[str, int], dict[str, int]]:
     """Prepare switching snapshots and return selection and source revisions."""
     from . import delivery, drain
     from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed
@@ -3245,7 +3245,7 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, 
     source_revisions = {}
     for entry in (candidate for candidate in registry.values() if not candidate.in_protocol):
         try:
-            deadline = remaining_budget()
+            remaining_budget()
         except ApplyDeadlineExpired as exc:
             raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_NOT_STARTED) from exc
         try:
@@ -3254,7 +3254,7 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, 
                 entry.key,
                 mode=delivery.MODE_NORMAL,
                 force=True,
-                deadline=deadline,
+                deadline_at=prepare_deadline,
             )
         except (
             AdapterError,
@@ -3329,14 +3329,14 @@ def _prepare_apply(mgmt):
         for entry in (candidate for candidate in registry.values() if candidate.in_protocol):
             if entry.key == "snmp":
                 continue
-            deadline = remaining_budget()
+            remaining_budget()
             try:
                 response = drain.push_now(
                     mgmt.device_id,
                     entry.key,
                     mode=delivery.MODE_STORE_ONLY,
                     force=True,
-                    deadline=deadline,
+                    deadline_at=prepare_deadline,
                 )
             except (
                 AdapterError,
@@ -3359,14 +3359,14 @@ def _prepare_apply(mgmt):
 
         # A normal SNMP push can enqueue a shrink-removal job before this Apply. Store the
         # snapshot without executing it, then select that exact receipt for promotion below.
-        deadline = remaining_budget()
+        remaining_budget()
         try:
             outcome = drain.drain_key(
                 mgmt.device_id,
                 "snmp",
                 mode=delivery.MODE_STORE_ONLY,
                 force=True,
-                deadline=deadline,
+                deadline_at=prepare_deadline,
             )
         except (
             AdapterError,
@@ -3393,7 +3393,9 @@ def _prepare_apply(mgmt):
     _audit_capture(mgmt, tuple(registry), "views._prepare_apply.finalize", remaining_budget)
 
     # Switching preparations select the exact adapter slot returned by each POST.
-    direct_selected, direct_source_revisions = _push_direct_snapshots(mgmt, registry, remaining_budget)
+    direct_selected, direct_source_revisions = _push_direct_snapshots(
+        mgmt, registry, remaining_budget, prepare_deadline
+    )
 
     if not static_route_stored:
         logger.warning(
@@ -3763,23 +3765,37 @@ class NSOIntentResyncView(AuthorizedView):
 class NSOAdapterLinkRetryView(AuthorizedView):
     """POST: retry linking a managed device to the adapter after a failed onboard/scope/sync.
 
-    Re-fires ``sync_scope_to_adapter`` by re-saving the management row (the same recovery the
-    async-onboarding status advance uses), which onboards/adopts the adapter device, pushes scope
-    and sends sync-notify. On success the row's ``adapter_link_error`` is cleared and
-    ``adapter_device_id`` set; on a repeated failure the error is refreshed for the tab banner.
+    Runs one adapter link attempt, the same one a management-row save queues, which onboards or
+    adopts the adapter device, pushes scope and sends sync-notify. On success the row's
+    ``adapter_link_error`` is cleared and ``adapter_device_id`` set; on a repeated failure the error
+    is refreshed for the tab banner. The message reports this attempt's own outcome.
     """
 
     policy = EndpointPolicy(Management("change"), "adapter_action")
 
     def post(self, request, pk):
         """Re-attempt the adapter link for the device, then redirect to the NSO tab."""
-        from .management_lifecycle import save_management
+        from .signals import LINK_NOT_RECORDED, _sync_committed_scope_to_adapter
 
         mgmt = self.target.management
-        save_management(mgmt)
-        mgmt.refresh_from_db()
-        if mgmt.adapter_link_error:
-            messages.error(request, f"Still couldn't link this device to the adapter: {mgmt.adapter_link_error}")
+        outcome = _sync_committed_scope_to_adapter(type(mgmt), mgmt.pk, False)
+        if outcome != "" and not type(mgmt).objects.filter(pk=mgmt.pk).exists():
+            messages.warning(
+                request,
+                "The NSO management record of this device was deleted during the link attempt, "
+                "so NetBox saved no result.",
+            )
+        elif outcome is LINK_NOT_RECORDED:
+            messages.warning(
+                request, "The adapter linked this device, but NetBox could not save the result. Retry the link."
+            )
+        elif outcome is None:
+            messages.warning(
+                request,
+                "The adapter link attempt did not finish, so the link is not confirmed. Retry the link.",
+            )
+        elif outcome:
+            messages.error(request, f"Still couldn't link this device to the adapter: {outcome}")
         else:
             messages.success(request, "Device linked to the adapter.")
         return redirect(_device_nso_tab_url(mgmt.device.pk))

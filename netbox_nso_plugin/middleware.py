@@ -4,6 +4,7 @@
 
 import logging
 
+from django.conf import settings
 from django.db import transaction
 from django.http import HttpResponse, JsonResponse
 
@@ -22,12 +23,17 @@ class IntentDeploymentMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        if request.path_info == "/api/plugins/nso/sync-complete/":
+        path = request.path_info
+        base = f"/{settings.BASE_PATH}"
+        if path.startswith(base):
+            # NetBox mounts every URL under BASE_PATH.
+            path = "/" + path[len(base) :]
+        if path == "/api/plugins/nso/sync-complete/":
             return self.get_response(request)
         if request.method in _SAFE_METHODS:
             return self.get_response(request)
         try:
-            if request.path_info.startswith(_PLUGIN_PATH_PREFIXES):
+            if path.startswith(_PLUGIN_PATH_PREFIXES):
                 with operation("HTTP mutations"):
                     return self.get_response(request)
             with transaction.atomic():

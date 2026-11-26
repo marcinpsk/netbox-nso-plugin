@@ -10,24 +10,36 @@ instances plus a sys.modules-injected fake `models` module, which bypassed exact
 queries — e.g. the OWNED-states filter — and so could not catch a regression in them.)
 """
 
+import contextlib
 import copy
 import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.db import connections, transaction
+from django.db import connection, connections, transaction
+from django.db.models import F
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._candidate_render_case import ACCEPTED_AT
-from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
+from ._outbox_case import (
+    HeldRowLock,
+    content_bulk_update,
+    in_thread,
+    mirror_update,
+    short_lock_timeout,
+    wait_until_postgres_blocks,
+)
 from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
+DELETED_DURING_LINK = (
+    "The NSO management record of this device was deleted during the link attempt, so NetBox saved no result."
+)
 
 
 def _bulk_create_management_without_signals(rows):
@@ -1048,44 +1060,1035 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(self.mgmt.adapter_source_epoch, 5)
         self.assertTrue(self.mgmt.source_epoch_aware)
 
-    def test_adapter_failure_survives_a_stale_error_mirror_plan(self):
+    def test_adapter_failure_is_recorded_beside_a_concurrent_management_edit(self):
+        from django.db import connection
+
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.models import NSODeviceManagement
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
 
-        original_build = RendererMutationPlan.build
-        plan_staled = False
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_backend_pid()")
+            writer_pid = cursor.fetchone()[0]
+        held, release, worker_errors = threading.Event(), threading.Event(), []
 
-        def build_then_stale(*args, **kwargs):
-            nonlocal plan_staled
-            plan = original_build(*args, **kwargs)
-            if not plan_staled:
-                plan_staled = True
-                in_thread(
-                    lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent")
-                )
-            return plan
+        def hold_an_uncommitted_edit():
+            try:
+                with transaction.atomic():
+                    NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent")
+                    held.set()
+                    release.wait(10)
+            except BaseException as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                worker_errors.append(exc)
+            finally:
+                connection.close()
+
+        def commit_once_the_error_record_waits():
+            try:
+                wait_until_postgres_blocks(writer_pid, "the error record", timeout=5)
+            except BaseException as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                worker_errors.append(exc)
+            finally:
+                release.set()
+                connection.close()
+
+        holder = threading.Thread(target=hold_an_uncommitted_edit)
+        watcher = threading.Thread(target=commit_once_the_error_record_waits)
+
+        def concurrent_edit_then_render(exc):
+            # Between the failed call and the error record, after the push released its locks.
+            holder.start()
+            self.assertTrue(held.wait(10), "the concurrent edit did not take the row")
+            watcher.start()
+            return str(exc)
 
         errors = []
-        with (
-            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale),
-            patch(
-                f"{_MOD}.set_scope",
-                side_effect=AdapterError("adapter unavailable", code="nso_unreachable"),
-            ),
-            self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as captured,
-        ):
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", side_effect=AdapterError("adapter unavailable", code="nso_unreachable")),
+                patch(f"{_MOD}.public_error_message", side_effect=concurrent_edit_then_render),
+                self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as captured,
+            ):
+                try:
+                    _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+                except Exception as exc:  # noqa: BLE001 (the assertion reports the escaped callback error)
+                    errors.append(exc)
+        finally:
+            release.set()
+            for thread in (holder, watcher):
+                if thread.ident is not None:
+                    thread.join(10)
+
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(errors, [], f"the adapter callback raised {errors!r}")
+        self.assertTrue(any("adapter unavailable" in message for message in captured.output), captured.output)
+        self.mgmt.refresh_from_db()
+        # The error record locks and writes its own field only, so the concurrent edit stands.
+        self.assertEqual(self.mgmt.last_sync_status, "concurrent")
+        self.assertEqual(self.mgmt.adapter_link_error, "adapter unavailable")
+
+    def _link_error_after(self, newer_attempt, *, sync_scope):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def newer(value):
+            # A newer attempt started and recorded its outcome.
+            in_thread(
+                lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+                    adapter_link_attempt=F("adapter_link_attempt") + 1,
+                    adapter_link_outcome_attempt=F("adapter_link_attempt") + 1,
+                    adapter_link_error=value,
+                )
+            )
+
+        with sync_scope(lambda: newer(newer_attempt)):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+        self.mgmt.refresh_from_db()
+        return self.mgmt.adapter_link_error
+
+    def test_an_older_failed_attempt_does_not_restore_its_error_over_a_newer_success(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        @contextlib.contextmanager
+        def failing(newer_commits):
+            def render(exc):
+                # A newer attempt links and clears the error before this one records its own.
+                newer_commits()
+                return str(exc)
+
+            with (
+                patch(f"{_MOD}.set_scope", side_effect=AdapterError("adapter unavailable", code="nso_unreachable")),
+                patch(f"{_MOD}.public_error_message", side_effect=render),
+                self.assertLogs("netbox_nso_plugin.signals", level="WARNING"),
+            ):
+                yield
+
+        self.assertEqual(self._link_error_after("", sync_scope=failing), "")
+
+    def test_an_older_linked_attempt_does_not_clear_a_newer_failure(self):
+        @contextlib.contextmanager
+        def linking(newer_commits):
+            def notify(_device_id):
+                # A newer attempt fails and records its error before this one clears the old one.
+                newer_commits()
+
+            with (
+                patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+            ):
+                yield
+
+        self.assertEqual(self._link_error_after("a newer failure", sync_scope=linking), "a newer failure")
+
+    def test_a_newer_linked_attempt_clears_the_error_an_older_attempt_recorded_after_it_started(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+        main = threading.current_thread()
+        newer_started, older_recorded, newer_errors = threading.Event(), threading.Event(), []
+
+        def set_scope(*_args, **_kwargs):
+            if threading.current_thread() is main:
+                raise AdapterError("adapter unavailable", code="nso_unreachable")
+            return {"device_id": 7}
+
+        def notify(_device_id):
+            newer_started.set()
+            self.assertTrue(older_recorded.wait(10), "the older attempt did not record its error")
+
+        def newer_attempt():
             try:
                 _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
-            except Exception as exc:  # noqa: BLE001 (the assertion reports the escaped callback error)
-                errors.append(exc)
+            except BaseException as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                newer_errors.append(exc)
+            finally:
+                connection.close()
 
-        self.assertEqual(errors, [], f"the adapter callback raised {errors!r}")
-        self.assertTrue(any("adapter unavailable" in message for message in captured.output))
-        self.assertTrue(any("Skipped adapter error mirror update" in message for message in captured.output))
+        newer = threading.Thread(target=newer_attempt)
+
+        def render(exc):
+            # The newer attempt starts before this older one records its failure.
+            newer.start()
+            self.assertTrue(newer_started.wait(10), "the newer attempt did not start")
+            return str(exc)
+
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", side_effect=set_scope),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+                patch(f"{_MOD}.public_error_message", side_effect=render),
+                self.assertLogs("netbox_nso_plugin.signals", level="WARNING"),
+            ):
+                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+                recorded = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                self.assertEqual(
+                    (recorded.adapter_link_error, recorded.adapter_link_outcome_attempt), ("adapter unavailable", 1)
+                )
+                older_recorded.set()
+                newer.join(10)
+        finally:
+            older_recorded.set()
+            if newer.ident is not None:
+                newer.join(10)
+
+        self.assertEqual(newer_errors, [])
         self.mgmt.refresh_from_db()
-        self.assertEqual(self.mgmt.last_sync_status, "concurrent")
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_retry_that_read_no_error_still_clears_a_failure_recorded_before_its_turn(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        real_start = signals._start_link_attempt
+
+        def older_records_first(instance, **kwargs):
+            # An older attempt records its failure after this retry read the row, before it takes its turn.
+            in_thread(
+                lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="older failure")
+            )
+            return real_start(instance, **kwargs)
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=older_records_first),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_later_attempt_that_records_nothing_does_not_block_an_earlier_success(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def notify(_device_id):
+            # A later attempt takes its number, then stops without an outcome (a stale mapping).
+            in_thread(lambda: signals._start_link_attempt(NSODeviceManagement.objects.get(pk=self.mgmt.pk)))
+
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_an_attempt_number_that_cannot_be_taken_is_logged_and_does_not_reach_the_saver(self):
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        short_lock_timeout(self)
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+            self.assertLogs("netbox_nso_plugin.signals", level="ERROR") as logs,
+            HeldRowLock(self.mgmt),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        set_scope.assert_not_called()
+        self.assertTrue(any("Could not start an adapter link attempt" in line for line in logs.output), logs.output)
+
+    def test_a_success_that_cannot_be_recorded_is_logged_and_not_recorded_as_a_link_failure(self):
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        holders = []
+
+        def notify(_device_id):
+            # An operator edit takes the row after the adapter work, before the success record.
+            holder = HeldRowLock(self.mgmt)
+            holder.__enter__()
+            holders.append(holder)
+
+        short_lock_timeout(self)
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+                self.assertLogs("netbox_nso_plugin.signals", level="ERROR") as logs,
+            ):
+                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+        finally:
+            for holder in holders:
+                holder.__exit__(None, None, None)
+
+        self.assertTrue(any("Could not record the adapter link outcome" in line for line in logs.output), logs.output)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_retry_whose_success_cannot_be_recorded_says_so(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        holders = []
+
+        def notify(_device_id):
+            # An operator edit takes the row after the adapter work, before the success record.
+            holder = HeldRowLock(self.mgmt)
+            holder.__enter__()
+            holders.append(holder)
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-unrecorded"))
+        short_lock_timeout(self)
+        try:
+            with (
+                patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+                patch(f"{_MOD}.sync_notify", side_effect=notify),
+                self.assertLogs("netbox_nso_plugin.signals", level="ERROR"),
+            ):
+                response = self.client.post(
+                    reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+                )
+        finally:
+            for holder in holders:
+                holder.__exit__(None, None, None)
+
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(
+            rendered,
+            ["The adapter linked this device, but NetBox could not save the result. Retry the link."],
+        )
+
+    def test_a_link_retry_whose_row_is_deleted_after_the_push_does_not_ask_for_a_retry(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        real_push = management_lifecycle.push_management_control
+
+        def push_then_delete(device_id):
+            pushed = real_push(device_id)
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).delete())
+            return pushed
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-deleted-push"))
+        with (
+            patch.object(management_lifecycle, "push_management_control", side_effect=push_then_delete),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        notify.assert_not_called()
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(rendered, [DELETED_DURING_LINK])
+
+    def test_a_link_retry_whose_unmapped_row_is_deleted_before_onboarding_does_not_report_a_failure(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=None)
+        real_start = signals._start_link_attempt
+
+        def start_then_delete(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).delete())
+            return attempt
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-deleted-onboard"))
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_delete),
+            patch(f"{_MOD}.onboard_device", return_value={"id": 7}) as onboard,
+            self.assertLogs("netbox_nso_plugin.signals", level="WARNING"),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        onboard.assert_not_called()
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(rendered, [DELETED_DURING_LINK])
+
+    def test_a_link_retry_whose_row_is_deleted_before_the_record_does_not_report_a_link(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        def notify(_device_id):
+            # The management row is deleted after the adapter work, before the success record.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).delete())
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-deleted"))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        self.assertFalse(NSODeviceManagement.objects.filter(pk=self.mgmt.pk).exists())
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertEqual(
+            rendered,
+            [DELETED_DURING_LINK],
+        )
+
+    def test_a_control_push_that_sent_nothing_records_no_outcome(self):
+        from dcim.models import Device
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+        before = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        address = IPAddress.objects.create(address="192.0.2.77/32")
+        real_footprint = management_lifecycle._control_footprint
+
+        def footprint_then_new_primary(device_id):
+            footprint = real_footprint(device_id)
+            # The device gets a new primary address after the push read its lock footprint.
+            in_thread(lambda: Device.objects.filter(pk=self.device.pk).update(primary_ip4=address))
+            return footprint
+
+        with (
+            patch.object(management_lifecycle, "_control_footprint", side_effect=footprint_then_new_primary),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        set_scope.assert_not_called()
+        notify.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "an earlier failure")
+        self.assertEqual(self.mgmt.adapter_link_attempt, before.adapter_link_attempt + 1)
+        self.assertEqual(self.mgmt.adapter_link_outcome_attempt, before.adapter_link_outcome_attempt)
+
+    def test_a_link_whose_mapping_changes_after_its_control_push_confirms_nothing(self):
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        real_push = management_lifecycle.push_management_control
+
+        def push_then_remap(device_id):
+            pushed = real_push(device_id)
+            # A repair adopts adapter device 8 after this attempt pushed control state to 7.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            return pushed
+
+        with (
+            patch.object(management_lifecycle, "push_management_control", side_effect=push_then_remap),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            outcome = _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        self.assertEqual([call.args[0] for call in set_scope.call_args_list], [7])
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id, 8)
+        notify.assert_not_called()
+
+    def test_a_link_retry_whose_mapping_changes_during_its_notify_confirms_nothing(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def notify_then_remap(adapter_device_id):
+            # A repair adopts adapter device 8 while this attempt notifies device 7.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-notify-remap"))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify_then_remap) as notify,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        self.assertEqual([call.args[0] for call in notify.call_args_list], [7])
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error, "an earlier failure")
+
+    def test_a_link_retry_whose_replacement_mapping_records_a_later_failure_confirms_nothing(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        def notify_then_remap_and_fail(adapter_device_id):
+            # A repair adopts adapter device 8, and a later attempt records a failure for it, while 7 is notified.
+            def other():
+                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8)
+                replacement = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                signals._record_link_error(replacement, signals._start_link_attempt(replacement), "replacement failed")
+
+            in_thread(other)
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-later-failure"))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify_then_remap_and_fail),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error, "replacement failed")
+
+    def _retry_link_with_failing_notify(self, username, *, remap):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def notify_then_fail(adapter_device_id):
+            if remap:
+                # A repair adopts adapter device 8 while this attempt notifies device 7.
+                in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            raise AdapterError("adapter down", code="nso_unreachable")
+
+        self.client.force_login(get_user_model().objects.create_superuser(username))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify_then_fail) as notify,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        self.assertEqual([call.args[0] for call in notify.call_args_list], [7])
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        return rendered, NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error
+
+    def test_a_link_retry_whose_notify_fails_records_and_reports_the_failure(self):
+        rendered, stored = self._retry_link_with_failing_notify("signal-race-admin-notify-fails", remap=False)
+
+        self.assertTrue(any("Still couldn't link" in message for message in rendered), rendered)
+        self.assertNotEqual(stored, "an earlier failure")
+        self.assertTrue(stored)
+
+    def test_a_link_retry_whose_notify_fails_after_its_mapping_changed_records_nothing(self):
+        rendered, stored = self._retry_link_with_failing_notify("signal-race-admin-remap-fails", remap=True)
+
+        self.assertFalse(any("Still couldn't link" in message for message in rendered), rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+        self.assertEqual(stored, "an earlier failure")
+
+    def test_a_link_whose_row_starts_provisioning_before_onboarding_registers_nothing(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=None)
+        real_start = signals._start_link_attempt
+
+        def start_then_provision(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            # An asynchronous provision takes the row after the callback read its blank status.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning"))
+            return attempt
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_provision),
+            patch(f"{_MOD}.onboard_device", return_value={"id": 7}) as onboard,
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        onboard.assert_not_called()
+        self.assertIsNone(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id)
+
+    def test_a_dead_rekey_whose_row_starts_provisioning_registers_nothing(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True)
+
+        def provision_then_not_found(**kwargs):
+            # An asynchronous provision takes the row after the rekey left its first lock.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning"))
+            raise AdapterError("Device not found", code="not_found")
+
+        with (
+            patch(f"{_MOD}.patch_device", side_effect=provision_then_not_found) as patch_device,
+            patch(f"{_MOD}.onboard_device", return_value={"id": 71, "source_epoch": 5}) as onboard,
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 71}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        patch_device.assert_called_once()
+        onboard.assert_not_called()
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_device_id, 7)
+
+    def test_a_rekey_whose_row_starts_provisioning_changes_no_adapter_mapping(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True)
+        real_start = signals._start_link_attempt
+
+        def start_then_provision(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            # An asynchronous provision takes the row before the rekey reads it under its lock.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning"))
+            return attempt
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_provision),
+            patch(f"{_MOD}.patch_device", return_value={"source_epoch": 5}) as patch_device,
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        patch_device.assert_not_called()
+        self.assertTrue(NSODeviceManagement.objects.get(pk=self.mgmt.pk).source_rekey_pending)
+
+    def test_a_rekey_whose_row_starts_provisioning_during_its_patch_keeps_the_fence(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True, adapter_source_epoch=4)
+
+        def patch_then_provision(**kwargs):
+            # An asynchronous provision takes the row, with the same NSO source, while the PATCH is in flight.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning"))
+            return {"source_epoch": 5}
+
+        with (
+            patch(f"{_MOD}.patch_device", side_effect=patch_then_provision),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        row = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        self.assertTrue(row.source_rekey_pending)
+        self.assertEqual(row.adapter_source_epoch, 4)
+
+    def test_a_link_whose_source_change_is_flagged_before_its_control_push_sends_no_notify(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        real_start = signals._start_link_attempt
+
+        def start_then_flag_rekey(instance, **kwargs):
+            attempt = real_start(instance, **kwargs)
+            # A source edit flags a rekey after the callback chose the ordinary link path.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True))
+            return attempt
+
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=start_then_flag_rekey),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            outcome = signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        notify.assert_not_called()
+
+    def test_a_link_whose_source_rekeys_after_its_control_push_sends_no_notify(self):
+        from netbox_nso_plugin import management_lifecycle
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=4)
+        real_push = management_lifecycle.push_management_control
+
+        def push_then_rekey(device_id):
+            pushed = real_push(device_id)
+            # An in-place source rekey commits the next epoch. The adapter device id stays 7.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=5))
+            return pushed
+
+        with (
+            patch.object(management_lifecycle, "push_management_control", side_effect=push_then_rekey),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+            patch(f"{_MOD}.sync_notify", return_value=None) as notify,
+        ):
+            outcome = _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.assertIsNone(outcome)
+        self.assertEqual([call.args[0] for call in set_scope.call_args_list], [7])
+        self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_source_epoch, 5)
+        notify.assert_not_called()
+
+    def test_a_link_retry_that_sent_nothing_is_reported_as_unconfirmed(self):
+        from dcim.models import Device
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import management_lifecycle
+
+        address = IPAddress.objects.create(address="192.0.2.78/32")
+        real_footprint = management_lifecycle._control_footprint
+
+        def footprint_then_new_primary(device_id):
+            footprint = real_footprint(device_id)
+            # The device gets a new primary address after the push read its lock footprint.
+            in_thread(lambda: Device.objects.filter(pk=self.device.pk).update(primary_ip4=address))
+            return footprint
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin"))
+        with (
+            patch.object(management_lifecycle, "_control_footprint", side_effect=footprint_then_new_primary),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}) as set_scope,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        set_scope.assert_not_called()
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+
+    def test_a_link_retry_that_sent_nothing_does_not_report_an_earlier_attempt_s_success(self):
+        from dcim.models import Device
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import management_lifecycle, signals
+
+        address = IPAddress.objects.create(address="192.0.2.79/32")
+        real_footprint = management_lifecycle._control_footprint
+        real_start = signals._start_link_attempt
+
+        def complete_another_attempt_first(instance):
+            # Another request's attempt starts and succeeds after this view read the row.
+            def other():
+                signals._record_link_error(instance, real_start(instance), "")
+
+            in_thread(other)
+            return real_start(instance)
+
+        def footprint_then_new_primary(device_id):
+            footprint = real_footprint(device_id)
+            in_thread(lambda: Device.objects.filter(pk=self.device.pk).update(primary_ip4=address))
+            return footprint
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-2"))
+        with (
+            patch.object(signals, "_start_link_attempt", side_effect=complete_another_attempt_first),
+            patch.object(management_lifecycle, "_control_footprint", side_effect=footprint_then_new_primary),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+
+    def test_a_link_retry_that_sent_nothing_does_not_report_a_later_attempt_s_success(self):
+        from dcim.models import Device
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin import management_lifecycle, signals
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        address = IPAddress.objects.create(address="192.0.2.80/32")
+        real_footprint = management_lifecycle._control_footprint
+
+        def later_success_then_new_primary(device_id):
+            footprint = real_footprint(device_id)
+
+            def later_attempt():
+                # Another request's attempt starts after this one and succeeds before this view reads the row.
+                row = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                signals._record_link_error(row, signals._start_link_attempt(row), "")
+                Device.objects.filter(pk=self.device.pk).update(primary_ip4=address)
+
+            in_thread(later_attempt)
+            return footprint
+
+        self.client.force_login(get_user_model().objects.create_superuser("signal-race-admin-3"))
+        with (
+            patch.object(management_lifecycle, "_control_footprint", side_effect=later_success_then_new_primary),
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertNotIn("Device linked to the adapter.", rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+
+    def test_a_link_repair_of_an_nso_instance_an_operator_corrected_writes_nothing(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        real_broken = sync_cache._broken_links
+
+        def broken_then_corrected(*args):
+            broken = real_broken(*args)
+            # An operator corrects the NSO instance's adapter id after the sweep classified the row.
+            NSOInstance.objects.filter(pk=self.nso_instance.pk).update(adapter_instance_id="signal-race-corrected")
+            return broken
+
+        rows = list(NSODeviceManagement.objects.select_related("nso_instance").filter(pk=self.mgmt.pk))
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch.object(sync_cache, "_broken_links", side_effect=broken_then_corrected),
+        ):
+            sync_cache.reconcile_device_links(rows)
+
+        self.mgmt.refresh_from_db()
+        self.assertIsNone(self.mgmt.adapter_link_attempted_at)
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_about_an_nso_instance_an_operator_corrected_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        NSOInstance.objects.filter(pk=self.nso_instance.pk).update(adapter_instance_id="signal-race-corrected")
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_about_a_mapping_replaced_after_its_first_check_is_discarded(self):
+        from netbox_nso_plugin import signals, sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        attempt_before = classified.adapter_link_attempt
+        real_start = signals._start_link_attempt
+
+        def remap_then_start(instance, **kwargs):
+            # A link adopts a new adapter device after the sweep's unlocked check.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            return real_start(instance, **kwargs)
+
+        with patch.object(signals, "_start_link_attempt", side_effect=remap_then_start):
+            sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+        self.assertEqual(self.mgmt.adapter_link_attempt, attempt_before)
+
+    def test_a_link_sweep_warning_about_a_mapping_replaced_after_its_attempt_started_is_discarded(self):
+        from netbox_nso_plugin import signals, sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        real_record = signals._record_link_error
+
+        def remap_then_record(instance, attempt, message, **kwargs):
+            # A link adopts a new adapter device after the warning took its attempt number.
+            in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            return real_record(instance, attempt, message, **kwargs)
+
+        with patch.object(signals, "_record_link_error", side_effect=remap_then_record):
+            sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_about_a_source_a_rekey_replaced_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        # A repair patched the adapter's source identity in place: only the source epoch advanced.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=5)
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_does_not_replace_the_error_of_a_rekey_armed_after_it(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        # A repair arms the rekey fence after the sweep classified the row, and its adapter patch fails.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+            source_rekey_pending=True, adapter_link_error="The rekey failed."
+        )
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "The rekey failed.")
+
+    def test_a_link_sweep_warning_about_a_row_a_provision_took_over_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        # A provision starts after the sweep classified the row; the sweep skips such rows.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(onboard_status="provisioning")
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_about_a_previous_adapter_store_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        classified = NSODeviceManagement.objects.select_related("nso_instance").get(pk=self.mgmt.pk)
+        # A read adopts a rebuilt adapter store; its ids and source epochs can repeat.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_incarnation="signal-race-rebuilt")
+
+        sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_about_a_mapping_a_link_replaced_is_discarded(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        # The sweep classified mapping 7 as broken before the link replaced it.
+        classified = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+
+        def set_scope(adapter_device_id, *args, **kwargs):
+            if adapter_device_id == 7:
+                raise AdapterError("Device not found", code="not_found")
+            return {"device_id": adapter_device_id}
+
+        def notify(_device_id):
+            in_thread(lambda: sync_cache._flag_link_error(classified, sync_cache._BROKEN_LINK_MESSAGE))
+
+        with (
+            patch(f"{_MOD}.onboard_device", return_value={"id": 8}),
+            patch(f"{_MOD}.set_scope", side_effect=set_scope),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_device_id, 8)
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_a_link_sweep_warning_written_during_the_link_is_kept(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        warning = "Adapter identity is ambiguous; repair requires operator action."
+
+        def notify(_device_id):
+            # The link sweep finds an ambiguous identity after the notification.
+            in_thread(lambda: sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning))
+
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, warning)
+
+    def test_a_link_sweep_that_confirms_its_existing_warning_during_the_link_keeps_it(self):
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        warning = "Adapter identity is ambiguous; repair requires operator action."
+        sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning)
+
+        def notify(_device_id):
+            # The link sweep confirms the same ambiguity after the notification.
+            in_thread(lambda: sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning))
+
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify),
+        ):
+            _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_error, warning)
+
+    def test_a_link_sweep_that_confirms_a_settled_warning_writes_nothing(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        warning = "Adapter identity is ambiguous; repair requires operator action."
+        sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning)
+        recorded = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+
+        with CaptureQueriesContext(connection) as queries:
+            sync_cache._flag_link_error(NSODeviceManagement.objects.get(pk=self.mgmt.pk), warning)
+
+        self.assertFalse([query for query in queries if query["sql"].lstrip().upper().startswith("UPDATE")])
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_link_attempt, recorded.adapter_link_attempt)
+
+    def test_a_stale_full_save_does_not_restore_an_error_a_later_attempt_cleared(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+        stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+        ):
+            signals._sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+        # A provisioning save of the copy loaded before the success, which starts no link attempt.
+        stale.onboard_status = "provisioning"
+        save_management(stale)
+
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.onboard_status, "provisioning")
         self.assertEqual(self.mgmt.adapter_link_error, "")
 
     def test_new_source_rekey_waits_for_adapter_finalization(self):

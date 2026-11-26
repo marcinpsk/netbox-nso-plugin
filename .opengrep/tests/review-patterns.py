@@ -3746,3 +3746,316 @@ def model_label_in_intend_refusal(model, row, read, label, native):
     return _refusal(f"Explicit restart is required for {model._meta.verbose_name} on {native}.")
     # ok: nso-model-label-in-intend-refusal
     return IntendResult("refused", "No acquisition occurred.")
+
+
+class _RotationInFinallyJob(_PluginSystemJob):
+    def tick(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            return audit_renderer_fleet(rotation=rotation)
+        except DeploymentQuiesced:
+            return None
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
+    def tick_without_handler(self):
+        rotation = self.carried("settlement_rotation") or {}
+        try:
+            return sweep(rotation=rotation)
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("settlement_rotation", rotation)
+
+    def tick_with_else(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            result = audit_renderer_fleet(rotation=rotation)
+        except DeploymentQuiesced:
+            return None
+        else:
+            return result
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
+    def tick_with_two_handlers(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            return audit_renderer_fleet(rotation=rotation)
+        except DeploymentQuiesced:
+            return None
+        except ValueError:
+            return None
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
+    def tick_with_bare_handler_and_else(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            result = audit_renderer_fleet(rotation=rotation)
+        except:  # noqa: E722
+            return None
+        else:
+            return result
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
+    def tick_with_bare_handler(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            return audit_renderer_fleet(rotation=rotation)
+        except:  # noqa: E722
+            return None
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+
+    def tick_with_conditional_carry(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            return audit_renderer_fleet(rotation=rotation)
+        finally:
+            # ruleid: nso-system-job-carry-in-finally
+            if rotation:
+                # ruleid: nso-system-job-carry-in-finally
+                self.carry("fleet_rotation", rotation)
+
+    def tick_saving_in_else(self):
+        rotation = self.carried("fleet_rotation") or {}
+        try:
+            result = audit_renderer_fleet(rotation=rotation)
+        except DeploymentQuiesced:
+            return None
+        else:
+            # ok: nso-system-job-carry-in-finally
+            self.carry("fleet_rotation", rotation)
+            return result
+
+    def tick_with_rotation(self):
+        try:
+            return audit_renderer_fleet(rotation=self.rotation("fleet_rotation"))
+        finally:
+            # ok: nso-system-job-carry-in-finally
+            logger.info("tick done")
+
+    def tick_with_checkpoints(self):
+        cursor = self.carried("apply_ledger_cursor")
+        try:
+            while True:
+                cursor = prune(cursor)
+                # ok: nso-system-job-carry-in-finally
+                self.carry("apply_ledger_cursor", cursor)
+        except DeploymentQuiesced:
+            return None
+
+
+def stamp_tombstone_on_unwind(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception as exc:
+        timed_out = lock_wait_timed_out(exc)
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        if timed_out or not _stamp_swept(tombstone_id):
+            keep_skips()
+
+
+def stamp_tombstone_on_unwind_with_else(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception as exc:
+        timed_out = lock_wait_timed_out(exc)
+    else:
+        log_success()
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        if timed_out or not _stamp_swept(tombstone_id):
+            keep_skips()
+
+
+def stamp_tombstone_on_unwind_without_handler(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        if timed_out or not _stamp_swept(tombstone_id):
+            keep_skips()
+
+
+def stamp_tombstone_directly_on_unwind(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        _stamp_swept(tombstone_id)
+
+
+def stamp_tombstone_directly_on_unwind_with_handler(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception:
+        log_failure()
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        _stamp_swept(tombstone_id)
+
+
+def stamp_tombstone_directly_on_unwind_with_else(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception:
+        log_failure()
+    else:
+        log_success()
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        _stamp_swept(tombstone_id)
+
+
+def stamp_link_assigned_on_unwind(management, now):
+    try:
+        repair_link(management)
+    finally:
+        # ruleid: nso-system-job-progress-stamp-in-finally
+        stamped = _mirror_management(management, adapter_link_attempted_at=now)
+        log_stamp(stamped)
+
+
+def stamp_link_assigned_after_repair(management, now):
+    try:
+        repair_link(management)
+    finally:
+        log_poll()
+    # ok: nso-system-job-progress-stamp-in-finally
+    stamped = _mirror_management(management, adapter_link_attempted_at=now)
+    log_stamp(stamped)
+
+
+def stamp_link_under_bare_if_on_unwind(management, now, attempted):
+    try:
+        repair_link(management)
+    finally:
+        if attempted:
+            # ruleid: nso-system-job-progress-stamp-in-finally
+            stamped = _mirror_management(management, adapter_link_attempted_at=now)
+            log_stamp(stamped)
+
+
+def stamp_link_under_bare_if_with_handler_on_unwind(management, now, attempted):
+    try:
+        repair_link(management)
+    except ValueError:
+        log_poll()
+    finally:
+        if attempted:
+            # ruleid: nso-system-job-progress-stamp-in-finally
+            _mirror_management(management, adapter_link_attempted_at=now)
+
+
+def stamp_link_under_bare_if_with_else_on_unwind(management, now, attempted):
+    try:
+        repair_link(management)
+    except ValueError:
+        log_poll()
+    else:
+        log_stamp(management)
+    finally:
+        if attempted:
+            # ruleid: nso-system-job-progress-stamp-in-finally
+            _mirror_management(management, adapter_link_attempted_at=now)
+
+
+def stamp_link_under_bare_if_after_repair(management, now, attempted):
+    try:
+        repair_link(management)
+    finally:
+        log_poll()
+    if attempted:
+        # ok: nso-system-job-progress-stamp-in-finally
+        _mirror_management(management, adapter_link_attempted_at=now)
+
+
+def stamp_tombstone_directly_after_poll(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    finally:
+        log_poll()
+    # ok: nso-system-job-progress-stamp-in-finally
+    _stamp_swept(tombstone_id)
+
+
+def stamp_tombstone_after_poll_without_handler(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    finally:
+        log_poll()
+    # ok: nso-system-job-progress-stamp-in-finally
+    if timed_out or not _stamp_swept(tombstone_id):
+        keep_skips()
+
+
+def stamp_tombstone_after_poll(tombstone_id):
+    try:
+        sweep_one(tombstone_id)
+    except Exception as exc:
+        timed_out = lock_wait_timed_out(exc)
+    # ok: nso-system-job-progress-stamp-in-finally
+    if timed_out or not _stamp_swept(tombstone_id):
+        keep_skips()
+
+
+def stamp_link_on_unwind(management, now):
+    try:
+        repair_link(management)
+    except Exception:
+        log_failure()
+    finally:
+        if attempted:
+            try:
+                # ruleid: nso-system-job-progress-stamp-in-finally
+                _mirror_management(management, adapter_link_attempted_at=now)
+            except Exception:
+                log_failure()
+
+
+def stamp_link_on_unwind_with_else(management, now):
+    try:
+        repair_link(management)
+    except Exception:
+        log_failure()
+    else:
+        log_success()
+    finally:
+        if attempted:
+            try:
+                # ruleid: nso-system-job-progress-stamp-in-finally
+                _mirror_management(management, adapter_link_attempted_at=now)
+            except Exception:
+                log_failure()
+
+
+def stamp_link_on_unwind_without_handler(management, now):
+    try:
+        repair_link(management)
+    finally:
+        if attempted:
+            try:
+                # ruleid: nso-system-job-progress-stamp-in-finally
+                _mirror_management(management, adapter_link_attempted_at=now)
+            except Exception:
+                log_failure()
+
+
+def stamp_link_after_failure(management, now):
+    try:
+        repair_link(management)
+    except Exception:
+        if attempted:
+            try:
+                # ok: nso-system-job-progress-stamp-in-finally
+                _mirror_management(management, adapter_link_attempted_at=now)
+            except Exception:
+                log_failure()

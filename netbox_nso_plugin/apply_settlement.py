@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import ChainMap
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -846,7 +847,7 @@ def _replay_unknown_attempts(management, unknown, incarnation):
     return replay_answers, replayed
 
 
-def load_deployment_evidence(management, *, attempt_ids=None, defer_carriers=False):
+def load_deployment_evidence(management, *, attempt_ids=None, defer_carriers=False, deadline=None):
     """Fetch attempt evidence and recover unknown UUIDs by replaying their exact request."""
     from . import adapter_client as client
     from .models import NSOApplyAttempt
@@ -892,6 +893,8 @@ def load_deployment_evidence(management, *, attempt_ids=None, defer_carriers=Fal
         )
         page = feed
         while len(page) == SETTLE_FEED_PAGE and _positive_int(page[-1]["settle_seq"]):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise EvidenceInvariantError("settlement_feed_deadline")
             page, next_incarnation = client.get_settlement_feed(
                 management.adapter_device_id, after_settle_seq=page[-1]["settle_seq"], limit=SETTLE_FEED_PAGE
             )

@@ -4,8 +4,10 @@
 and the remaining API call functions not covered by test_models.py.
 """
 
+import contextlib
 import sys
 import threading
+import time
 import unittest
 from types import MappingProxyType
 from unittest.mock import patch
@@ -18,6 +20,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from netbox_nso_plugin.models import AdapterConnection
 
 from ._adapter_http import make_response, make_session
+from ._settlement_adapter import LoopbackOnlySession
 from ._settlement_wire import generation_wire, job_wire
 from .mixins import _CascadeFlushMixin
 
@@ -449,6 +452,91 @@ class TestRequestErrorPaths(unittest.TestCase):
                 _request("GET", "/test")
 
         self.assertEqual(ctx.exception.code, "nso_unreachable")
+
+
+class TestTheRequestLimitCutsOnlyReads(unittest.TestCase):
+    """A real loopback adapter that sends its JSON answer one byte every 0.05 s, past the limit."""
+
+    BODY = b'{"id": 7' + b" " * 40 + b"}"
+
+    def setUp(self):
+        import http.server
+        import socketserver
+
+        body = self.BODY
+
+        class _Trickle(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _answer(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                with contextlib.suppress(OSError):
+                    for byte in body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.05)
+
+            do_GET = do_PATCH = do_POST = _answer
+
+            def log_message(self, *args):
+                pass
+
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Trickle)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        cfg = {**_BASE_CFG, "url": f"http://127.0.0.1:{server.server_address[1]}"}
+        for patcher in (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=cfg),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", LoopbackOnlySession),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_read_still_arriving_at_the_limit_is_a_request_limit(self):
+        from netbox_nso_plugin import adapter_client
+
+        started = time.monotonic()
+        with adapter_client.requests_until(started + 0.5), self.assertRaises(adapter_client.AdapterError) as ctx:
+            adapter_client.get_device(7)
+
+        self.assertEqual(ctx.exception.code, "request_limit")
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_a_settlement_read_sent_as_a_post_is_cut_like_a_get(self):
+        from netbox_nso_plugin import adapter_client
+
+        reads = {
+            "deployment evidence": lambda: adapter_client.get_deployment_evidence(7, []),
+            "settlement observation": lambda: adapter_client.get_settlement_observation(
+                7, job_id=1, after_settle_seq=0, apply_attempt_ids=[]
+            ),
+        }
+        for name, read in reads.items():
+            with self.subTest(name):
+                started = time.monotonic()
+                with (
+                    adapter_client.requests_until(started + 0.5),
+                    self.assertRaises(adapter_client.AdapterError) as ctx,
+                ):
+                    read()
+
+                self.assertEqual(ctx.exception.code, "request_limit")
+                self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_a_write_still_arriving_at_the_limit_runs_to_its_answer(self):
+        """Cutting a write the adapter may already have applied would leave its outcome unknown."""
+        from netbox_nso_plugin import adapter_client
+
+        with adapter_client.requests_until(time.monotonic() + 0.5):
+            answer = adapter_client.patch_device(7, nso_device_name="renamed")
+
+        self.assertEqual(answer, {"id": 7})
 
 
 #: One job exactly as the adapter's JobOut renders it — every key present, nullables null.

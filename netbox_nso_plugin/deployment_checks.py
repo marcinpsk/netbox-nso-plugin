@@ -15,7 +15,7 @@ from .models import (
     NSODeviceManagement,
 )
 
-PLUGIN_MIGRATION_HEAD = "0048_outbox_refused_identity"
+PLUGIN_MIGRATION_HEAD = "0049_nsodevicemanagement_adapter_link_attempt"
 
 
 def check_contracts():

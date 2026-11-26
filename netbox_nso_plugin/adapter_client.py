@@ -155,6 +155,39 @@ _session_cls = None
 # builds its own (#1503 §4.2, O-P16) and binds it here for the duration of that one call.
 _bound_session = contextvars.ContextVar("nso_bound_session", default=None)
 
+# A monotonic instant after which no request starts; a request's timeouts end at it too.
+_request_limit = contextvars.ContextVar("nso_request_limit", default=None)
+
+# The session that requests_until cuts off at its limit. Only a read uses it: a cut write has an unknown outcome.
+_read_session = contextvars.ContextVar("nso_read_session", default=None)
+# A request with these methods is a read unless its caller says otherwise; a read sent as a POST passes read=True.
+_READ_METHODS = frozenset({"GET", "HEAD"})
+
+
+@contextmanager
+def requests_until(limit: float):
+    """Refuse every adapter request that would start after the monotonic *limit*, or an earlier outer one.
+
+    A read still arriving at the limit is cut off: its timeouts measure the gap between bytes, so they cannot.
+    A write runs to its own timeouts, because the adapter may already have applied it.
+    """
+    outer = _request_limit.get()
+    limit = limit if outer is None else min(limit, outer)
+    transport = AbortableTransport()
+    session = new_session(transport=transport)
+    cutoff = threading.Timer(max(0.0, limit - time.monotonic()), transport.abort)
+    cutoff.daemon = True
+    token = _request_limit.set(limit)
+    read_token = _read_session.set(session)
+    try:
+        cutoff.start()
+        yield
+    finally:
+        cutoff.cancel()
+        session.close()
+        _read_session.reset(read_token)
+        _request_limit.reset(token)
+
 
 class AbortableTransport(requests.adapters.HTTPAdapter):
     """An HTTP transport that can end the requests it has in flight (#1503 O-P16).
@@ -170,6 +203,8 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         self._live: set = set()
         self._instrumented: set = set()
         self._instrumented_connections: weakref.WeakSet = weakref.WeakSet()
+        # http.client drops conn.sock when a response will close the connection; the read still uses it.
+        self._sockets: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._aborted = False
         super().__init__(*args, **kwargs)
 
@@ -213,6 +248,8 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
             conn = checkout(timeout)
             with self._lock:
                 self._live.add(conn)
+                if conn.sock is not None:
+                    self._sockets[conn] = conn.sock
                 _checkout_stack().append(conn)
                 fresh = conn not in self._instrumented_connections
                 self._instrumented_connections.add(conn)
@@ -220,7 +257,7 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
             if fresh:
                 self._instrument_connection(conn)
             if aborted:
-                self._shutdown(conn)
+                self._shutdown(conn.sock)
             return conn
 
         def _put_conn(conn):
@@ -239,17 +276,17 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         def _connect():
             result = connect()
             with self._lock:
+                self._sockets[conn] = conn.sock
                 aborted = self._aborted
             if aborted:
-                self._shutdown(conn)
+                self._shutdown(conn.sock)
             return result
 
         conn.connect = _connect
 
     @staticmethod
-    def _shutdown(conn) -> None:
-        """Shut down *conn* when it has a socket, leaving descriptor ownership with its pool."""
-        sock = conn.sock
+    def _shutdown(sock) -> None:
+        """Shut down *sock* when there is one, leaving descriptor ownership with its pool."""
         if sock is None:
             return
         with suppress(OSError):
@@ -260,9 +297,9 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         """Shut down the socket of every request in flight, so its reader comes back."""
         with self._lock:
             self._aborted = True
-            live = list(self._live)
-        for conn in live:
-            self._shutdown(conn)
+            sockets = [conn.sock or self._sockets.get(conn) for conn in self._live]
+        for sock in sockets:
+            self._shutdown(sock)
 
 
 def new_session(transport=None):
@@ -289,13 +326,16 @@ def bound_session(session):
         _bound_session.reset(token)
 
 
-def _get_session():
-    """Return this context's bound session, or the process-wide pooled one."""
+def _get_session(read=False):
+    """Return this context's bound session, the requests_until session for a read, or the process-wide pooled one."""
     global _session, _session_cls
 
     bound = _bound_session.get()
     if bound is not None:
         return bound
+    cut_off = _read_session.get()
+    if read and cut_off is not None:
+        return cut_off
     if _session is None or _session_cls is not requests.Session:
         _session = new_session()
         _session_cls = requests.Session
@@ -603,8 +643,53 @@ def _error_envelope(resp):
     return err if isinstance(err, dict) else {}
 
 
-def _request_response(method, path, **kwargs):
-    """Send one adapter request and return the raw response, for callers that read a header."""
+def _request_timeouts(override, cfg) -> tuple[float, float]:
+    """Return one request's ``(connect, read)`` timeouts, ended at the :func:`requests_until` limit."""
+    # READSEM S4 (R5-5): callers may pass an endpoint-specific (connect, read)
+    # timeout — e.g. the tab's live read-state fetch — instead of the configured one.
+    if override is not None:
+        connect_timeout, read_timeout = override
+    else:
+        read_timeout = cfg["timeout"]
+        connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
+    limit = _request_limit.get()
+    if limit is None:
+        return connect_timeout, read_timeout
+    remaining = limit - time.monotonic()
+    if remaining <= 0:
+        raise AdapterError("The run's time limit for adapter requests has passed.", code="request_limit")
+    return min(connect_timeout, remaining), min(read_timeout, remaining)
+
+
+def _cut_read_error(read):
+    """Return the request_limit error for a read that ended at or after the limit, where the cutoff may have cut it."""
+    limit = _request_limit.get()
+    if read and limit is not None and time.monotonic() >= limit:
+        return AdapterError(
+            "The adapter's answer reached the run's time limit for adapter requests.", code="request_limit"
+        )
+    return None
+
+
+def _send(method, url, *, read, **kwargs):
+    """Send one request on this context's session. A read that the request limit cut raises request_limit."""
+    try:
+        resp = _get_session(read).request(method, url, **kwargs)
+    except requests.RequestException as exc:
+        if (cut := _cut_read_error(read)) is not None:
+            raise cut from exc
+        raise
+    # The cutoff can end a body that has no length at a clean EOF, so a late answer may be truncated.
+    if (cut := _cut_read_error(read)) is not None:
+        raise cut
+    return resp
+
+
+def _request_response(method, path, *, read=None, **kwargs):
+    """Send one adapter request and return the raw response, for callers that read a header.
+
+    *read* defaults to whether *method* is GET or HEAD; requests_until cuts off only a read.
+    """
     from .native_authorization import refuse_adapter_call_in_mutation_phase
 
     refuse_adapter_call_in_mutation_phase(method)
@@ -646,18 +731,12 @@ def _request_response(method, path, **kwargs):
     else:
         verify = True
 
-    # READSEM S4 (R5-5): callers may pass an endpoint-specific (connect, read)
-    # timeout — e.g. the tab's live read-state fetch — instead of the configured one.
-    override = kwargs.pop("timeout", None)
-    if override is not None:
-        connect_timeout, read_timeout = override
-    else:
-        read_timeout = cfg["timeout"]
-        connect_timeout = min(_CONNECT_TIMEOUT, read_timeout)
+    connect_timeout, read_timeout = _request_timeouts(kwargs.pop("timeout", None), cfg)
+    if read is None:
+        read = method in _READ_METHODS
     try:
-        session = _get_session()
-        resp = session.request(
-            method, url, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs
+        resp = _send(
+            method, url, read=read, headers=headers, timeout=(connect_timeout, read_timeout), verify=verify, **kwargs
         )
     except requests.exceptions.ReadTimeout as exc:
         # Connected but no response within the read window — the adapter is up but
@@ -2011,6 +2090,7 @@ def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
     resp = _request_response(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/deployment-evidence",
+        read=True,
         json={"apply_attempt_ids": [str(attempt_id) for attempt_id in apply_attempt_ids]},
     )
     return _settlement_response(resp, "DeviceDeploymentEvidenceOut", adapter_device_id)
@@ -2023,7 +2103,9 @@ def get_settlement_observation(adapter_device_id, *, job_id, after_settle_seq, a
         "after_settle_seq": after_settle_seq,
         "apply_attempt_ids": sorted({str(attempt_id) for attempt_id in apply_attempt_ids}),
     }
-    resp = _request_response("POST", f"/api/v1/devices/{adapter_device_id}/settlement-observation", json=request)
+    resp = _request_response(
+        "POST", f"/api/v1/devices/{adapter_device_id}/settlement-observation", read=True, json=request
+    )
     observation = _settlement_response(resp, "SettlementObservationOut", adapter_device_id)
     job = observation["job"]
     absent = observation["absent"]["job_id"]

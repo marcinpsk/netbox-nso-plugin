@@ -333,7 +333,7 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
 
         self.assertIn("audit_renderer_scopes", _calls(delivery["deliver"]))
         self.assertIn("audit_renderer_scopes", _calls(drain["claim"]))
-        self.assertIn("audit_renderer_scopes", _calls(drain["_drain_once"]))
+        self.assertIn("audit_renderer_scopes", _reachable_calls(drain, "_drain_once"))
         self.assertIn("audit_renderer_scopes", _reachable_calls(views, "_prepare_apply"))
 
     def test_every_production_claim_call_uses_an_audited_entry_point(self):

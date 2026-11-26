@@ -551,6 +551,10 @@ class NSODeviceManagement(NetBoxModel):
     # hold the cap on every run and starve a repairable tail row; ordering the broken list
     # least-recently-attempted first bounds every broken row at ceil(B / C) ticks.
     adapter_link_attempted_at = models.DateTimeField(null=True, blank=True)
+    # Each adapter link callback takes the next number, and records its outcome only when no attempt that
+    # started later has recorded one. adapter_link_outcome_attempt is the number of the recorded outcome.
+    adapter_link_attempt = models.PositiveIntegerField(default=0)
+    adapter_link_outcome_attempt = models.PositiveIntegerField(default=0)
     # ── READSEM S4 (D5): adopted store incarnation + durable reset markers ──────
     # The adapter store mints an (incarnation UUID, born) pair on every DB rebuild;
     # the gated reconcile ADOPTS the newest born (resetting per-family read state),
@@ -670,7 +674,14 @@ class NSODeviceManagement(NetBoxModel):
         permissions = [(ACKNOWLEDGE_SETTLEMENT_ISSUE, "Acknowledge a settlement issue as outcome unknown")]
 
     # Columns a save that does not name them must never carry — see save().
-    _PUSH_RECORD_FIELDS = ("intent_push_errors", "intent_push_attempts")
+    _PUSH_RECORD_FIELDS = (
+        "intent_push_errors",
+        "intent_push_attempts",
+        "adapter_link_attempt",
+        "adapter_link_outcome_attempt",
+        # Written with its outcome number, so that the two cannot disagree.
+        "adapter_link_error",
+    )
     # The settlement cursor, its epoch, the stall triple and the link-repair clock. All are
     # written by a sweep through ``.update()`` while it holds this row's lock, and all lose
     # their meaning when rewound: a cursor that moves backwards re-consumes settled results,

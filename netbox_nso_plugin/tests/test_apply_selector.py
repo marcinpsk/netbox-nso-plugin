@@ -2936,6 +2936,64 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
+    def test_a_pause_before_a_preparation_push_does_not_extend_the_apply_deadline(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import drain
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        clock = [0.0]
+        real_push_now = drain.push_now
+        sent_before_pause = []
+
+        def paused(*args, **kwargs):
+            if not sent_before_pause:
+                sent_before_pause.append(len(adapter.receipts))
+                # The worker pauses after Apply measured its remaining time, until past the preparation deadline.
+                clock[0] = drain.SEND_DEADLINE.total_seconds() + 1
+            return real_push_now(*args, **kwargs)
+
+        with (
+            patch("netbox_nso_plugin.drain._send_clock", lambda: clock[0]),
+            patch.object(drain, "push_now", side_effect=paused),
+        ):
+            response = self._post(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(len(adapter.receipts), sent_before_pause[0], "a preparation push sent after the deadline")
+        self.assertEqual(adapter.apply_requests, [])
+
+    def test_a_capture_that_uses_up_the_apply_deadline_allocates_no_push_attempt(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import drain, switching_preparation
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        clock = [0.0]
+        real_capture = switching_preparation._capture
+        captured_scopes = []
+
+        def slow_capture(device_id, scope, force):
+            result = real_capture(device_id, scope, force)
+            captured_scopes.append(scope)
+            # The capture's lock waits use up the preparation deadline after its loop checked it.
+            clock[0] = drain.SEND_DEADLINE.total_seconds() + 1
+            return result
+
+        with (
+            patch("netbox_nso_plugin.drain._send_clock", lambda: clock[0]),
+            patch.object(switching_preparation, "_capture", side_effect=slow_capture),
+        ):
+            response = self._post(adapter)
+
+        self.assertTrue(captured_scopes, "no switching capture ran, as this pin needs")
+        self.assertEqual(response.status_code, 409)
+        attempts = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_attempts or {}
+        self.assertFalse(
+            set(captured_scopes) & set(attempts), f"an expired preparation allocated a push attempt: {attempts}"
+        )
+
     def test_no_op_surfaces_every_skipped_reason_and_rolls_back_prepared_rows(self):
         adapter = _ApplyContractAdapter(lambda selected: (202, _no_op(selected)))
 

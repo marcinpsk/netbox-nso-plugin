@@ -142,10 +142,10 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
         enqueue(devices["healthy"][0], "static_route")
         real = settlement.settle_static_routes
 
-        def settle(pk):
+        def settle(pk, **kwargs):
             if pk == devices["unexpected"][1].pk:
                 raise RuntimeError("unexpected settlement defect")
-            return real(pk)
+            return real(pk, **kwargs)
 
         with (
             patch.object(settlement, "settle_static_routes", side_effect=settle),
@@ -471,6 +471,46 @@ class TestTheSweepStandsDownOnAGlobalOutage(_SettlementCase):
         assert self.adapter.store.feed_requests == [], (
             "the sweep polled every candidate after the adapter had already been proven hung: "
             f"{self.adapter.store.feed_requests}"
+        )
+
+    def test_a_snapshot_cut_at_its_time_limit_still_polls(self):
+        from netbox_nso_plugin import jobs
+
+        device = _make_device("slowinv")
+        mgmt = _make_mgmt(device, "slowinv", 22, adapter=self.adapter)
+        sr = _route("10.49.0.0/16", "10.49.0.1", devices=[device])
+        _own(sr, mgmt, generation=210)
+        self.adapter.store.terminal_job(22, results=[_result(sr.pk, 210)])
+        self.adapter.store.devices_stall = 8  # longer than the snapshot's share of the run
+
+        with (
+            patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 6),
+            self.assertLogs("netbox_nso_plugin.jobs", level="WARNING") as logs,
+        ):
+            self._tick()
+
+        assert self.adapter.store.devices_arrivals == 1, "the inventory read never reached the adapter"
+        assert any("adapter snapshot reached its time limit" in line for line in logs.output), logs.output
+        assert {request[0] for request in self.adapter.store.feed_requests} == {22}, (
+            "a slow inventory read stopped the settlement sweep although the adapter answers"
+        )
+
+    def test_a_snapshot_with_no_budget_left_still_polls(self):
+        from netbox_nso_plugin import jobs
+
+        device = _make_device("nobudget")
+        mgmt = _make_mgmt(device, "nobudget", 23, adapter=self.adapter)
+        sr = _route("10.50.0.0/16", "10.50.0.1", devices=[device])
+        _own(sr, mgmt, generation=211)
+        self.adapter.store.terminal_job(23, results=[_result(sr.pk, 211)])
+
+        # The run's budget is gone before the inventory read starts, so the tick proves no outage.
+        with patch.object(jobs, "SYSTEM_JOB_BUDGET_SECONDS", 0):
+            self._tick()
+
+        assert ("GET", "/api/v1/devices") not in self.adapter.store.requests
+        assert {request[0] for request in self.adapter.store.feed_requests} == {23}, (
+            "a run with no snapshot budget left stopped the settlement sweep"
         )
 
 

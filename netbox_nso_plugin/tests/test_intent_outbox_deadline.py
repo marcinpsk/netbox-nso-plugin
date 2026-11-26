@@ -148,6 +148,98 @@ class TestTheSendCarriesItsOwnDeadline(_DripCase):
         errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
         assert "vlan" in errors, errors
 
+    def test_a_slow_attempt_allocation_does_not_extend_the_send_deadline(self):
+        from netbox_nso_plugin import drain, signals
+
+        own_vlan(self.mgmt, 882, self.tag)
+        real_allocate = signals._allocate_push_attempt
+        allocated: list[int] = []
+
+        def slow_allocate(device_id, scope):
+            attempt = real_allocate(device_id, scope)
+            allocated.append(attempt)
+            # A lock wait on the attempt row uses up the whole send budget after the pre-send check.
+            time.sleep(3.5)
+            return attempt
+
+        with (
+            patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=3)),
+            patch.object(signals, "_allocate_push_attempt", side_effect=slow_allocate),
+            self.pointed_at_the_drip(),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert allocated, "the send never reached attempt allocation, as this pin needs"
+        assert outcome == drain.FAILED
+        assert not self.server.streaming.wait(1), "the request started after the send cutoff"
+        row = state_of(self.device, "vlan")
+        assert row.claimed_at is None and row.push_seq is not None, "the operation is replayed"
+
+    def test_a_slow_send_setup_does_not_extend_the_send_deadline(self):
+        from netbox_nso_plugin import adapter_client, drain
+
+        own_vlan(self.mgmt, 883, self.tag)
+        real_new_session = adapter_client.new_session
+        prepared: list[bool] = []
+
+        def slow_new_session(*args, **kwargs):
+            if "transport" in kwargs:
+                prepared.append(True)
+                # The send thread's own session setup uses up the budget after the call measured it.
+                time.sleep(3.5)
+            return real_new_session(*args, **kwargs)
+
+        with (
+            patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=3)),
+            patch.object(adapter_client, "new_session", side_effect=slow_new_session),
+            self.pointed_at_the_drip(),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert prepared, "the send never built its own session, as this pin needs"
+        assert outcome == drain.FAILED
+        assert not self.server.streaming.wait(1), "the request started after the send cutoff"
+        row = state_of(self.device, "vlan")
+        assert row.claimed_at is None and row.push_seq is not None, "the operation is replayed"
+
+    def test_a_send_setup_that_uses_part_of_the_budget_shortens_the_wait(self):
+        from netbox_nso_plugin import adapter_client, delivery, drain
+
+        own_vlan(self.mgmt, 884, self.tag)
+        real_new_session = adapter_client.new_session
+        real_under_deadline = delivery._under_deadline
+        real_abort = adapter_client.AbortableTransport.abort
+        cutoffs: list[float] = []
+        aborted_at: list[float] = []
+
+        def slow_new_session(*args, **kwargs):
+            if "transport" in kwargs:
+                # The send thread's session setup uses two of the three seconds after the call measured them.
+                time.sleep(2)
+            return real_new_session(*args, **kwargs)
+
+        def recorded_under_deadline(do_push, deadline_at):
+            cutoffs.append(deadline_at)
+            return real_under_deadline(do_push, deadline_at)
+
+        def recorded_abort(transport):
+            aborted_at.append(drain._send_clock())
+            return real_abort(transport)
+
+        with (
+            patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=3)),
+            patch.object(adapter_client, "new_session", side_effect=slow_new_session),
+            patch.object(delivery, "_under_deadline", side_effect=recorded_under_deadline),
+            patch.object(adapter_client.AbortableTransport, "abort", recorded_abort),
+            self.pointed_at_the_drip(),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert outcome == drain.FAILED
+        assert self.server.streaming.is_set(), "the far side never began the response this pin needs"
+        assert len(cutoffs) == 1 and aborted_at, (cutoffs, aborted_at)
+        assert aborted_at[0] - cutoffs[0] < 1, "the wait ran past the cutoff by the setup time"
+
     def test_direct_delivery_bounds_a_dripping_response(self):
         from netbox_nso_plugin import delivery, drain
         from netbox_nso_plugin.models import NSODeviceManagement
@@ -340,7 +432,7 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
         from netbox_nso_plugin import delivery
 
         with patch("django.db.connections.close_all", side_effect=RuntimeError("teardown boom")):
-            answer = delivery._under_deadline(lambda body: {"ok": 1}, 0.5)({})
+            answer = delivery._under_deadline(lambda body: {"ok": 1}, time.monotonic() + 0.5)({})
 
         assert answer == {"ok": 1}
 
@@ -357,7 +449,7 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
             answered.set()
             return {"count": 1}
 
-        call = delivery._under_deadline(slow, 0.5)
+        call = delivery._under_deadline(slow, time.monotonic() + 0.5)
         try:
             call({})
         except delivery.SendDeadlineExceeded:

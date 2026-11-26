@@ -677,6 +677,8 @@ _MANAGEMENT_MIRROR_FIELDS = frozenset(
         "adapter_incarnation",
         "adapter_link_error",
         "adapter_link_attempted_at",
+        "adapter_link_attempt",
+        "adapter_link_outcome_attempt",
         "settle_cursor_seq",
         "settle_cursor_incarnation",
         "settle_cursor_device_id",
@@ -773,7 +775,8 @@ def _sync_source_change(instance, client) -> bool:
         current = (
             management_model.objects.select_for_update(of=("self",)).select_related("nso_instance").get(pk=instance.pk)
         )
-        if (current.nso_instance_id, current.nso_device_name) != expected_source:
+        # An asynchronous provision that took the row owns its mapping too.
+        if (current.nso_instance_id, current.nso_device_name) != expected_source or current.onboard_status:
             return False
         invalidated = _invalidate_source_admissions(current)
 
@@ -806,7 +809,7 @@ def _sync_source_change(instance, client) -> bool:
 
     with mirror_transaction(footprint_for_instance(instance)):
         current = management_model.objects.get(pk=instance.pk)
-        if (current.nso_instance_id, current.nso_device_name) != expected_source:
+        if (current.nso_instance_id, current.nso_device_name) != expected_source or current.onboard_status:
             return False
         source_epoch = result["source_epoch"]
         source_aware = True
@@ -848,6 +851,7 @@ def _onboard_into_adapter(instance, client) -> bool:
     from .management_lifecycle import save_management
 
     identity_fields = (
+        "onboard_status",
         "device_id",
         "nso_instance_id",
         "nso_device_name",
@@ -860,6 +864,9 @@ def _onboard_into_adapter(instance, client) -> bool:
     with mirror_transaction(footprint_for_instance(instance)):
         current = type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
         if tuple(getattr(current, field) for field in identity_fields) != expected:
+            return False
+        if current.onboard_status:
+            # An asynchronous provision owns the row, also when the caller read it after the provision took it.
             return False
         # Hold the source through registration so a concurrent rekey receives the new mapping.
         result = client.onboard_device(
@@ -908,18 +915,92 @@ def _queue_scope_sync(sender, instance, created, *, update_fields=None):
 
 
 def _update_management_mirror(instance, **values):
-    """Persist management lifecycle fields through the exact mirror writer."""
-    from .management_lifecycle import save_management
+    """Persist management lifecycle fields under the management row lock alone."""
+    from .intent_state import update_mirror_fields
 
-    fields = set(values)
-    current = type(instance).objects.filter(pk=instance.pk).first()
-    if current is None:
-        return
-    for field_name, value in values.items():
-        setattr(current, field_name, value)
-    save_management(current, update_fields=fields)
-    for field_name, value in values.items():
-        setattr(instance, field_name, value)
+    # The row lock is enough: the device's full renderer footprint re-reads every interface it has.
+    update_mirror_fields(instance, **values)
+
+
+#: The outcome of a link attempt that linked the device but could not save that on the row.
+LINK_NOT_RECORDED = object()
+
+
+def _start_link_attempt(instance, *, mapping=None) -> int | None:
+    """Take the next adapter link attempt number of the row, or None when the row is gone.
+
+    With *mapping*, also None when the row's :func:`_link_mapping` changed.
+    """
+    from django.db import transaction
+
+    with transaction.atomic():
+        locked = _locked_link_attempt(instance)
+        if locked is None:
+            return None
+        if mapping is not None and _link_mapping(_current_link_row(instance)) != mapping:
+            return None
+        current = locked[0] + 1
+        _update_management_mirror(instance, adapter_link_attempt=current)
+    return current
+
+
+def _record_link_error(instance, attempt, message, *, mapping=None) -> bool | None:
+    """Record this attempt's link outcome unless an attempt that started later has recorded its own.
+
+    With *mapping*, the outcome describes that :func:`_link_mapping` and is discarded when the row's mapping changed.
+    Return False when the row is gone, and None when the outcome was discarded.
+    """
+    from django.db import transaction
+
+    with transaction.atomic():
+        locked = _locked_link_attempt(instance)
+        if locked is None:
+            return False
+        # First, so that a later attempt's outcome for another mapping does not confirm this one.
+        if mapping is not None and _link_mapping(_current_link_row(instance)) != mapping:
+            logger.info("Discarded a link outcome about an earlier mapping of management row %s", instance.pk)
+            return None
+        if locked[1] >= attempt:
+            logger.info("Kept the adapter link outcome of a later attempt for management row %s", instance.pk)
+            return True
+        _update_management_mirror(instance, adapter_link_error=message, adapter_link_outcome_attempt=attempt)
+    return True
+
+
+def _current_link_row(instance):
+    """Read the row again with its NSO instance, under the row lock the caller holds."""
+    return type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
+
+
+def _stored_link_row(instance):
+    """Read the committed row with its NSO instance, or None when the row is gone."""
+    return type(instance).objects.select_related("nso_instance").filter(pk=instance.pk).first()
+
+
+def _link_mapping(mgmt) -> tuple:
+    """Return the fields that the link sweep classifies a management row's adapter mapping by."""
+    return (
+        mgmt.onboard_status,
+        mgmt.device_id,
+        mgmt.nso_instance_id,
+        mgmt.nso_instance.adapter_instance_id,
+        mgmt.nso_device_name,
+        mgmt.adapter_incarnation,
+        mgmt.adapter_device_id,
+        mgmt.adapter_source_epoch,
+        mgmt.source_rekey_pending,
+    )
+
+
+def _locked_link_attempt(instance):
+    """Lock the management row and return its ``(adapter_link_attempt, adapter_link_outcome_attempt)``, or None."""
+    return (
+        type(instance)
+        .objects.select_for_update(of=("self",))
+        .filter(pk=instance.pk)
+        .values_list("adapter_link_attempt", "adapter_link_outcome_attempt")
+        .first()
+    )
 
 
 def _sync_committed_scope_to_adapter(sender, instance_pk, created):
@@ -932,60 +1013,32 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
     provision job hasn't finished) or ``provision_failed``, the NSO node may not exist
     yet, so mapping/scope/sync would fail or race. The status-advance view clears the
     status to "" on success and re-saves, which fires this handler normally.
+
+    Return this attempt's outcome: "" when it linked, the error message when it failed,
+    :data:`LINK_NOT_RECORDED` when it linked but the record failed, or None when it stopped without an outcome.
     """
     try:
         instance = sender.objects.select_related("nso_instance", "device").get(pk=instance_pk)
     except sender.DoesNotExist:
-        return
+        return None
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
-        return
+        return None
+    try:
+        attempt = _start_link_attempt(instance)
+    except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
+        logger.exception("Could not start an adapter link attempt for management row %s", instance.pk)
+        return None
+    if attempt is None:
+        return None
 
-    from . import adapter_client as client
     from .adapter_client import AdapterError
 
+    notified_mapping = None
     try:
-        if created or instance.adapter_device_id is None:
-            linked = _onboard_into_adapter(instance, client)
-        elif instance.source_rekey_pending:
-            # _sync_source_change recovers a dead mapping itself — it owns the fencing state.
-            linked = _sync_source_change(instance, client)
-        else:
-            linked = True
-        if not linked:
-            return
-
-        from .management_lifecycle import push_management_control
-
-        try:
-            push_management_control(instance.device_id)
-        except AdapterError as exc:
-            # The stored id points at an adapter device row that no longer exists (a provision
-            # that rolled back, a manual delete, a restored DB). Without this the branch above
-            # never re-onboards — the id is set — so every push 404s forever and even the tab's
-            # "Retry adapter link" can't heal it. Only 'not_found' proves the id is dead; any
-            # other error is an outage and must not mint a second device row.
-            if exc.code != "not_found":
-                raise
-            logger.warning(
-                "Adapter no longer has device %s for NetBox device %s — re-onboarding",
-                instance.adapter_device_id,
-                instance.device_id,
-            )
-            if not _onboard_into_adapter(instance, client):
-                return
-            push_management_control(instance.device_id)
-
-        notify_result = client.sync_notify(instance.adapter_device_id)
-        if notify_result and notify_result.get("job_id"):
-            logger.debug(
-                "Sync-notify sent for device %s, job_id=%s",
-                instance.device_id,
-                notify_result["job_id"],
-            )
-        # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
-        # goes away.
-        if instance.adapter_link_error:
-            _update_management_mirror(instance, adapter_link_error="")
+        linked = _link_to_adapter(instance, created)
+        if linked:
+            notified_mapping = _link_mapping(instance)
+            _notify_adapter(instance)
     except Exception as exc:
         logger.warning("Failed to sync scope to adapter for device %s: %s", instance.device_id, exc)
         # Surface the failure on the row instead of only logging it: otherwise the device looks
@@ -1005,18 +1058,103 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         # TransactionManagementError — and that save is rolling back regardless, so recording is moot.
         from django.db import connection
 
-        if not connection.needs_rollback:
-            from .intent_state import RendererTargetsChanged
-            from .renderer_writer import IntentPlanStaleError
+        # A notify failure describes the mapping this attempt confirmed, so a replaced mapping discards it.
+        if (
+            not connection.needs_rollback
+            and _record_link_outcome(instance, attempt, message, mapping=notified_mapping) is None
+        ):
+            return None
+        return message
+    if not linked:
+        return None
+    # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
+    # goes away. The row is read again under its lock: an older attempt can record its error after this load.
+    recorded = _record_link_outcome(instance, attempt, "", mapping=notified_mapping)
+    if recorded is None:
+        return None
+    return "" if recorded else LINK_NOT_RECORDED
 
-            try:
-                _update_management_mirror(instance, adapter_link_error=message)
-            except (IntentPlanStaleError, RendererTargetsChanged) as mirror_exc:
-                logger.warning(
-                    "Skipped adapter error mirror update for management row %s because its renderer plan changed: %s",
-                    instance.pk,
-                    mirror_exc,
-                )
+
+def _link_to_adapter(instance, created) -> bool:
+    """Onboard or re-key the row and push its control state.
+
+    Return False when the attempt stopped without an outcome to record.
+    """
+    from . import adapter_client as client
+    from .adapter_client import AdapterError
+
+    if created or instance.adapter_device_id is None:
+        linked = _onboard_into_adapter(instance, client)
+    elif instance.source_rekey_pending:
+        # _sync_source_change recovers a dead mapping itself — it owns the fencing state.
+        linked = _sync_source_change(instance, client)
+    else:
+        linked = True
+    if not linked:
+        return False
+
+    from .management_lifecycle import push_management_control
+
+    before_push = _stored_link_row(instance)
+    try:
+        pushed = push_management_control(instance.device_id)
+    except AdapterError as exc:
+        # The stored id points at an adapter device row that no longer exists (a provision
+        # that rolled back, a manual delete, a restored DB). Without this the branch above
+        # never re-onboards — the id is set — so every push 404s forever and even the tab's
+        # "Retry adapter link" can't heal it. Only 'not_found' proves the id is dead; any
+        # other error is an outage and must not mint a second device row.
+        if exc.code != "not_found":
+            raise
+        logger.warning(
+            "Adapter no longer has device %s for NetBox device %s — re-onboarding",
+            instance.adapter_device_id,
+            instance.device_id,
+        )
+        if not _onboard_into_adapter(instance, client):
+            return False
+        before_push = _stored_link_row(instance)
+        pushed = push_management_control(instance.device_id)
+    if not pushed:
+        # The row or its addresses changed under the push. The renderer audit sends the new control state.
+        logger.info("Adapter link for management row %s sent no control state; it records no outcome", instance.pk)
+        return False
+    current = _stored_link_row(instance)
+    if (
+        before_push is None
+        or current is None
+        or _link_mapping(before_push) != _link_mapping(instance)
+        or _link_mapping(current) != _link_mapping(before_push)
+    ):
+        # The push read the row again, so it may have sent to a mapping this attempt did not link. Confirm neither.
+        logger.info("Adapter link for management row %s saw its mapping change; it records no outcome", instance.pk)
+        return False
+    return True
+
+
+def _notify_adapter(instance):
+    """Ask the adapter to sync the linked device now instead of at its next poll."""
+    from . import adapter_client as client
+
+    notify_result = client.sync_notify(instance.adapter_device_id)
+    if notify_result and notify_result.get("job_id"):
+        logger.debug(
+            "Sync-notify sent for device %s, job_id=%s",
+            instance.device_id,
+            notify_result["job_id"],
+        )
+
+
+def _record_link_outcome(instance, attempt, message, *, mapping=None) -> bool | None:
+    """Record the callback's outcome, and return False when the write failed or the row is gone.
+
+    None means that the row's mapping is no longer *mapping*. A write failure is logged: it is not an adapter link failure.
+    """
+    try:
+        return _record_link_error(instance, attempt, message, mapping=mapping)
+    except Exception:  # noqa: BLE001 (an on_commit callback must not raise into the code that saved the row)
+        logger.exception("Could not record the adapter link outcome for management row %s", instance.pk)
+        return False
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")
