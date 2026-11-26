@@ -265,8 +265,7 @@ def _under_deadline(do_push: Callable, deadline_at: float) -> Callable:
         from . import adapter_client, drain
 
         # Measured at the call, so that work between the caller's check and this call cannot extend the cutoff.
-        seconds = deadline_at - drain._send_clock()
-        if seconds <= 0:
+        if drain._send_clock() >= deadline_at:
             raise SendDeadlineExceeded("the send deadline expired before transport")
         transport = adapter_client.AbortableTransport()
         session = adapter_client.new_session(transport=transport)
@@ -282,6 +281,9 @@ def _under_deadline(do_push: Callable, deadline_at: float) -> Callable:
             try:
                 from django.db import connections
 
+                # Session setup and the thread start also count, so the cutoff is checked again here.
+                if drain._send_clock() >= deadline_at:
+                    raise SendDeadlineExceeded("the send deadline expired before transport")
                 result = context.run(do_push, body)
                 if not expired.is_set():
                     answer["result"] = result
@@ -299,11 +301,11 @@ def _under_deadline(do_push: Callable, deadline_at: float) -> Callable:
                     done.set()
 
         threading.Thread(target=_run, name="nso-intent-push", daemon=True).start()
-        if not done.wait(seconds):
+        if not done.wait(max(0.0, deadline_at - drain._send_clock())):
             expired.set()
             transport.abort()
             session.close()
-            raise SendDeadlineExceeded(f"the adapter did not answer within {seconds}s")
+            raise SendDeadlineExceeded("the adapter did not answer before the send deadline")
         if "error" in answer:
             raise answer["error"]
         return answer["result"]

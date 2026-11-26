@@ -175,6 +175,33 @@ class TestTheSendCarriesItsOwnDeadline(_DripCase):
         row = state_of(self.device, "vlan")
         assert row.claimed_at is None and row.push_seq is not None, "the operation is replayed"
 
+    def test_a_slow_send_setup_does_not_extend_the_send_deadline(self):
+        from netbox_nso_plugin import adapter_client, drain
+
+        own_vlan(self.mgmt, 883, self.tag)
+        real_new_session = adapter_client.new_session
+        prepared: list[bool] = []
+
+        def slow_new_session(*args, **kwargs):
+            if "transport" in kwargs:
+                prepared.append(True)
+                # The send thread's own session setup uses up the budget after the call measured it.
+                time.sleep(3.5)
+            return real_new_session(*args, **kwargs)
+
+        with (
+            patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=3)),
+            patch.object(adapter_client, "new_session", side_effect=slow_new_session),
+            self.pointed_at_the_drip(),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert prepared, "the send never built its own session, as this pin needs"
+        assert outcome == drain.FAILED
+        assert not self.server.streaming.wait(1), "the request started after the send cutoff"
+        row = state_of(self.device, "vlan")
+        assert row.claimed_at is None and row.push_seq is not None, "the operation is replayed"
+
     def test_direct_delivery_bounds_a_dripping_response(self):
         from netbox_nso_plugin import delivery, drain
         from netbox_nso_plugin.models import NSODeviceManagement
