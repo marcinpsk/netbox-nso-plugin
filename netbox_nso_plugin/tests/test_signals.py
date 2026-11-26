@@ -1559,6 +1559,49 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
         self.assertEqual(NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error, "replacement failed")
 
+    def _retry_link_with_failing_notify(self, username, *, remap):
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_link_error="an earlier failure")
+
+        def notify_then_fail(adapter_device_id):
+            if remap:
+                # A repair adopts adapter device 8 while this attempt notifies device 7.
+                in_thread(lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=8))
+            raise AdapterError("adapter down", code="nso_unreachable")
+
+        self.client.force_login(get_user_model().objects.create_superuser(username))
+        with (
+            patch(f"{_MOD}.set_scope", return_value={"device_id": 7}),
+            patch(f"{_MOD}.sync_notify", side_effect=notify_then_fail) as notify,
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+            )
+
+        self.assertEqual([call.args[0] for call in notify.call_args_list], [7])
+        rendered = [str(message) for message in get_messages(response.wsgi_request)]
+        return rendered, NSODeviceManagement.objects.get(pk=self.mgmt.pk).adapter_link_error
+
+    def test_a_link_retry_whose_notify_fails_records_and_reports_the_failure(self):
+        rendered, stored = self._retry_link_with_failing_notify("signal-race-admin-notify-fails", remap=False)
+
+        self.assertTrue(any("Still couldn't link" in message for message in rendered), rendered)
+        self.assertNotEqual(stored, "an earlier failure")
+        self.assertTrue(stored)
+
+    def test_a_link_retry_whose_notify_fails_after_its_mapping_changed_records_nothing(self):
+        rendered, stored = self._retry_link_with_failing_notify("signal-race-admin-remap-fails", remap=True)
+
+        self.assertFalse(any("Still couldn't link" in message for message in rendered), rendered)
+        self.assertTrue(any("not confirmed" in message for message in rendered), rendered)
+        self.assertEqual(stored, "an earlier failure")
+
     def test_a_link_whose_row_starts_provisioning_before_onboarding_registers_nothing(self):
         from netbox_nso_plugin import signals
         from netbox_nso_plugin.models import NSODeviceManagement

@@ -1033,8 +1033,12 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
 
     from .adapter_client import AdapterError
 
+    notified_mapping = None
     try:
         linked = _link_to_adapter(instance, created)
+        if linked:
+            notified_mapping = _link_mapping(instance)
+            _notify_adapter(instance)
     except Exception as exc:
         logger.warning("Failed to sync scope to adapter for device %s: %s", instance.device_id, exc)
         # Surface the failure on the row instead of only logging it: otherwise the device looks
@@ -1054,21 +1058,25 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         # TransactionManagementError — and that save is rolling back regardless, so recording is moot.
         from django.db import connection
 
-        if not connection.needs_rollback:
-            _record_link_outcome(instance, attempt, message)
+        # A notify failure describes the mapping this attempt confirmed, so a replaced mapping discards it.
+        if (
+            not connection.needs_rollback
+            and _record_link_outcome(instance, attempt, message, mapping=notified_mapping) is None
+        ):
+            return None
         return message
     if not linked:
         return None
     # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
     # goes away. The row is read again under its lock: an older attempt can record its error after this load.
-    recorded = _record_link_outcome(instance, attempt, "", mapping=_link_mapping(instance))
+    recorded = _record_link_outcome(instance, attempt, "", mapping=notified_mapping)
     if recorded is None:
         return None
     return "" if recorded else LINK_NOT_RECORDED
 
 
 def _link_to_adapter(instance, created) -> bool:
-    """Onboard or re-key the row, push its control state and notify the adapter.
+    """Onboard or re-key the row and push its control state.
 
     Return False when the attempt stopped without an outcome to record.
     """
@@ -1121,6 +1129,12 @@ def _link_to_adapter(instance, created) -> bool:
         # The push read the row again, so it may have sent to a mapping this attempt did not link. Confirm neither.
         logger.info("Adapter link for management row %s saw its mapping change; it records no outcome", instance.pk)
         return False
+    return True
+
+
+def _notify_adapter(instance):
+    """Ask the adapter to sync the linked device now instead of at its next poll."""
+    from . import adapter_client as client
 
     notify_result = client.sync_notify(instance.adapter_device_id)
     if notify_result and notify_result.get("job_id"):
@@ -1129,7 +1143,6 @@ def _link_to_adapter(instance, created) -> bool:
             instance.device_id,
             notify_result["job_id"],
         )
-    return True
 
 
 def _record_link_outcome(instance, attempt, message, *, mapping=None) -> bool | None:
