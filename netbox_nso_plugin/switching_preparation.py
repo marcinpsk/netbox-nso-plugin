@@ -170,13 +170,13 @@ def send_switchport(adapter_device_id, body):
     )
 
 
-def send(captured: Captured, *, deadline: float | None = None):
+def send(captured: Captured, *, deadline_at: float | None = None):
     """Send one captured body through the ordinary attempt and error journal."""
     from . import signals
 
     rendered = captured.rendered
-    if deadline is not None:
-        rendered = dataclasses.replace(rendered, do_push=delivery._under_deadline(rendered.do_push, deadline))
+    if deadline_at is not None:
+        rendered = dataclasses.replace(rendered, do_push=delivery._under_deadline(rendered.do_push, deadline_at))
     with _bound(captured.deleted_roots, captured.source_revision):
         return signals._send_rendered(rendered, rendered.payload)
 
@@ -259,7 +259,7 @@ def prepare(device_id: int, scope: str, *, force: bool, deadline_at: float):
         if captured is None:
             return outcome, None
         try:
-            answer = send(captured, deadline=drain._remaining_send_deadline(deadline_at))
+            answer = send(captured, deadline_at=deadline_at)
             unauthorized = _validate(answer, captured)
             _retire(captured, unauthorized, answer=answer)
         except adapter_client.AdapterError as exc:

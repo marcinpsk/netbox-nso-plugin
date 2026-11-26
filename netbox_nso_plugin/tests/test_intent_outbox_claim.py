@@ -537,7 +537,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         deadlines = []
 
         def answer(_rendered, _payload, **kwargs):
-            deadlines.append(kwargs["deadline"])
+            deadlines.append(kwargs["deadline_at"])
             return {"count": 1}
 
         ticks = iter((100, 100, 102, 105))
@@ -548,7 +548,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
             outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline_at=drain._send_clock() + 10)
 
         assert outcome == drain.SUCCEEDED
-        assert deadlines == [8, 5]
+        assert deadlines == [110, 110]
 
     def test_an_exhausted_carried_budget_fails_the_chained_send_instead_of_escaping(self):
         from netbox_nso_plugin import drain
@@ -558,7 +558,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         deadlines = []
 
         def answer(_rendered, _payload, **kwargs):
-            deadlines.append(kwargs["deadline"])
+            deadlines.append(kwargs["deadline_at"])
             return {"count": 1}
 
         ticks = iter((100, 100, 102, 111))
@@ -569,7 +569,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
             outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline_at=drain._send_clock() + 10)
 
         assert outcome == drain.FAILED
-        assert deadlines == [8]
+        assert deadlines == [110]
         row = state_of(self.device, "vlan")
         assert row.claimed_at is None
         assert (row.attempts, row.last_error_code) == (1, "nso_send_deadline")
@@ -717,13 +717,13 @@ class TestTheSendBudgetFollowsTheRevocationScan(_ClaimCase):
         scan.assert_called_once()
         return outcome, send
 
-    def test_the_send_gets_the_time_left_after_the_scan(self):
+    def test_the_send_keeps_the_cutoff_that_the_scan_used_up_in_part(self):
         from netbox_nso_plugin import drain
 
         outcome, send = self._drain_with_a_slow_scan(7)
 
         assert outcome == drain.SUCCEEDED
-        assert send.call_args.kwargs["deadline"] == 3
+        assert send.call_args.kwargs["deadline_at"] == 110
 
     def test_a_scan_that_uses_the_whole_deadline_keeps_the_claim_for_replay(self):
         from netbox_nso_plugin import drain

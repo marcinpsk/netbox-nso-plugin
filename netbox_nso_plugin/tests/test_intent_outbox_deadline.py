@@ -148,6 +148,33 @@ class TestTheSendCarriesItsOwnDeadline(_DripCase):
         errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
         assert "vlan" in errors, errors
 
+    def test_a_slow_attempt_allocation_does_not_extend_the_send_deadline(self):
+        from netbox_nso_plugin import drain, signals
+
+        own_vlan(self.mgmt, 882, self.tag)
+        real_allocate = signals._allocate_push_attempt
+        allocated: list[int] = []
+
+        def slow_allocate(device_id, scope):
+            attempt = real_allocate(device_id, scope)
+            allocated.append(attempt)
+            # A lock wait on the attempt row uses up the whole send budget after the pre-send check.
+            time.sleep(3.5)
+            return attempt
+
+        with (
+            patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=3)),
+            patch.object(signals, "_allocate_push_attempt", side_effect=slow_allocate),
+            self.pointed_at_the_drip(),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert allocated, "the send never reached attempt allocation, as this pin needs"
+        assert outcome == drain.FAILED
+        assert not self.server.streaming.wait(1), "the request started after the send cutoff"
+        row = state_of(self.device, "vlan")
+        assert row.claimed_at is None and row.push_seq is not None, "the operation is replayed"
+
     def test_direct_delivery_bounds_a_dripping_response(self):
         from netbox_nso_plugin import delivery, drain
         from netbox_nso_plugin.models import NSODeviceManagement
@@ -340,7 +367,7 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
         from netbox_nso_plugin import delivery
 
         with patch("django.db.connections.close_all", side_effect=RuntimeError("teardown boom")):
-            answer = delivery._under_deadline(lambda body: {"ok": 1}, 0.5)({})
+            answer = delivery._under_deadline(lambda body: {"ok": 1}, time.monotonic() + 0.5)({})
 
         assert answer == {"ok": 1}
 
@@ -357,7 +384,7 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
             answered.set()
             return {"count": 1}
 
-        call = delivery._under_deadline(slow, 0.5)
+        call = delivery._under_deadline(slow, time.monotonic() + 0.5)
         try:
             call({})
         except delivery.SendDeadlineExceeded:

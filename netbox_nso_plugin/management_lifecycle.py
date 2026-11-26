@@ -196,11 +196,10 @@ def _update_management_control(device_id: int, *, compare_adapter: bool, deadlin
 
         from .delivery import SendDeadlineExceeded, _under_deadline
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if deadline - time.monotonic() <= 0:
             raise SendDeadlineExceeded("management reconciliation exhausted the audit budget")
         # One abortable session bounds both reads and the write while this thread owns the locks.
-        return _under_deadline(update_control, remaining)(None)
+        return _under_deadline(update_control, deadline)(None)
 
 
 def reconcile_management_control(device_id: int, *, deadline: float | None = None) -> bool:

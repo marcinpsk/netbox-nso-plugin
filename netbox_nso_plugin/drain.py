@@ -975,8 +975,7 @@ def send_claim(claim: Claim, *, deadline_at=None):
         deletions=claim.deletions,
         marking_mode=claim.marking_mode,
         push_seq=claim.push_seq,
-        # Measured after the scan, which can wait on the state-row lock.
-        deadline=_remaining_send_deadline(deadline_at),
+        deadline_at=_send_cutoff(deadline_at),
     )
 
 
@@ -988,6 +987,12 @@ def _send_clock() -> float:
 def _past(deadline) -> bool:
     """Whether a monotonic *deadline* is set and has passed."""
     return deadline is not None and _send_clock() >= deadline
+
+
+def _send_cutoff(deadline_at) -> float:
+    """Return the monotonic cutoff of one send, and refuse a cutoff that has passed."""
+    _remaining_send_deadline(deadline_at)
+    return _send_clock() + SEND_DEADLINE.total_seconds() if deadline_at is None else deadline_at
 
 
 def _remaining_send_deadline(deadline_at) -> float:

@@ -246,7 +246,7 @@ class SendDeadlineExceeded(Exception):
     code = "nso_send_deadline"
 
 
-def _under_deadline(do_push: Callable, seconds: float) -> Callable:
+def _under_deadline(do_push: Callable, deadline_at: float) -> Callable:
     """Bound one transport call by wall clock, which the client's timeouts cannot do.
 
     ``(connect, read)`` measures the gap between bytes, so a response dripping one byte at
@@ -262,8 +262,12 @@ def _under_deadline(do_push: Callable, seconds: float) -> Callable:
     """
 
     def _call(body):
-        from . import adapter_client
+        from . import adapter_client, drain
 
+        # Measured at the call, so that work between the caller's check and this call cannot extend the cutoff.
+        seconds = deadline_at - drain._send_clock()
+        if seconds <= 0:
+            raise SendDeadlineExceeded("the send deadline expired before transport")
         transport = adapter_client.AbortableTransport()
         session = adapter_client.new_session(transport=transport)
         with adapter_client.bound_session(session):
@@ -316,7 +320,7 @@ def send(
     deletions=(),
     marking_mode: str | None = None,
     push_seq: int | None = None,
-    deadline: float | None = None,
+    deadline_at: float | None = None,
 ):
     """Send *body* for an already-rendered key, and return the adapter's answer.
 
@@ -338,8 +342,8 @@ def send(
     marking_mode = _resolved_marking_mode(entry, marking_mode)
     if mark and marking_mode == MARKING_PER_OBJECT and not deletions:
         raise ValueError("a marked per-object request requires deletion records")
-    if deadline is not None:
-        rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline))
+    if deadline_at is not None:
+        rendered = dataclasses.replace(rendered, do_push=_under_deadline(rendered.do_push, deadline_at))
     with contextlib.ExitStack() as stack:
         if mode == MODE_STORE_ONLY:
             stack.enter_context(adapter_client.store_only_pushes())
@@ -355,13 +359,11 @@ def send(
 
 def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, mark: bool = False):
     """Render *key* for one device and send it straight away, outside the claim protocol."""
-    from . import adapter_client
+    from . import adapter_client, drain
     from .drain import SEND_DEADLINE
     from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed, audit_renderer_scopes
 
     if key in direct_keys():
-        from . import drain
-
         if mode != MODE_NORMAL or mark:
             raise ValueError("switching preparation requires normal unmarked delivery")
         response = drain.push_now(
@@ -382,4 +384,10 @@ def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, 
     except (RendererAuditBudgetExceeded, RendererAuditRepairFailed) as exc:
         raise adapter_client.AdapterError("Renderer audit failed.", code="renderer_audit_failed") from exc
     rendered = render(key, device_id, adapter_device_id)
-    return send(rendered, rendered.payload, mode=mode, mark=mark, deadline=SEND_DEADLINE.total_seconds())
+    return send(
+        rendered,
+        rendered.payload,
+        mode=mode,
+        mark=mark,
+        deadline_at=drain._send_clock() + SEND_DEADLINE.total_seconds(),
+    )

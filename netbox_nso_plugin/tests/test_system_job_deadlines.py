@@ -215,7 +215,9 @@ class TestTheRendererAuditJobStopsAtItsDeadline(_DeadlineCase):
             renderer_audit._drain_repaired(device.pk, ("vlan",), renderer_audit._monotonic() + 230)
 
         self.assertEqual(self._unconsumed(device), 0)
-        self.assertLessEqual(send.call_args.kwargs["deadline"], drain.SEND_DEADLINE.total_seconds())
+        self.assertLessEqual(
+            send.call_args.kwargs["deadline_at"], drain._send_clock() + drain.SEND_DEADLINE.total_seconds()
+        )
 
     def test_a_pause_before_a_key_starts_does_not_extend_the_tick_deadline(self):
         from netbox_nso_plugin import delivery, drain
