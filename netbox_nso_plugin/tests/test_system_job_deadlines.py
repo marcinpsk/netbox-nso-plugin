@@ -439,7 +439,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(len(read_timeouts), 1)
         self.assertLessEqual(read_timeouts[0], 200)
 
-    def test_a_snapshot_that_exceeds_its_budget_leaves_outbox_compaction_enabled(self):
+    def test_a_snapshot_that_exceeds_its_budget_still_drains_the_outbox(self):
         from netbox_nso_plugin import adapter_client, jobs
 
         device, _management = make_managed("job-deadline-snapshot-expired", 19202)
@@ -472,10 +472,11 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertEqual(len(read_timeouts), 1)
         self.assertLessEqual(read_timeouts[0], 5)
         self.assertIn(
-            "RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit, sends skipped",
+            "RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit",
             [record.getMessage() for record in logs.records],
         )
-        self.assertEqual(self._unconsumed(device), 1)
+        # A slow inventory read proves no outage, so the per-device sends still run.
+        self.assertEqual(self._unconsumed(device), 0)
 
     def test_a_snapshot_that_keeps_sending_past_its_cutoff_is_cut(self):
         """An HTTP/1.0 answer hands the socket to the response, and the cutoff must still reach it.
@@ -539,7 +540,7 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         self.assertTrue(responding.is_set(), "no request reached the trickling server")
         self.assertLess(elapsed, self.BUDGET + 1, "the inventory read ran past its cutoff")
         self.assertIn(
-            "RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit, sends skipped",
+            "RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit",
             [record.getMessage() for record in logs.records],
         )
 

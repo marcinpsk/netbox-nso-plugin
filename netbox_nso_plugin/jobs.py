@@ -398,18 +398,18 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
         drain_started = settle_started = time.monotonic()
         # The drain guards each key, not its own candidate query, so an error there would
         # abort the tick before the sweep — the one pass that must always run.
-        if by_id is None:
+        # A slow inventory read proves no outage: the drain and the sweep read only per-device state.
+        outage = by_id is None and not snapshot_cut
+        if snapshot_cut:
+            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit")
+        if outage:
             try:
                 with lock_waits_until(before_sweep):
                     compact_intent_outbox(deadline=before_sweep, rotation=outbox_rotation)
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox compaction failed")
             settle_started = time.monotonic()
-            if snapshot_cut:
-                # A slow inventory read proves no outage, and the sweep reads only per-device feeds.
-                logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot reached its time limit, sends skipped")
-            else:
-                logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
+            logger.warning("RefreshDeviceSyncCacheJob: adapter snapshot unavailable, sends and sweep skipped")
         else:
             # Same rule as the sweep, and for the same reason: a proven global outage is not
             # a per-key failure, and every candidate would wait out its own read timeout.
@@ -421,7 +421,7 @@ class RefreshDeviceSyncCacheJob(_PluginSystemJob):
             except Exception:  # noqa: BLE001 — the sweep below is the retry clock
                 logger.exception("RefreshDeviceSyncCacheJob: intent-outbox drain failed")
             settle_started = time.monotonic()
-        if by_id is not None or snapshot_cut:
+        if not outage:
             polled, settle_failed = sweep_static_route_settlements(
                 deadline=deadline, feed_deadline=deadline + SETTLEMENT_FEED_GRACE_SECONDS, rotation=rotation
             )
