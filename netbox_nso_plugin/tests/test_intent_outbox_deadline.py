@@ -202,6 +202,44 @@ class TestTheSendCarriesItsOwnDeadline(_DripCase):
         row = state_of(self.device, "vlan")
         assert row.claimed_at is None and row.push_seq is not None, "the operation is replayed"
 
+    def test_a_send_setup_that_uses_part_of_the_budget_shortens_the_wait(self):
+        from netbox_nso_plugin import adapter_client, delivery, drain
+
+        own_vlan(self.mgmt, 884, self.tag)
+        real_new_session = adapter_client.new_session
+        real_under_deadline = delivery._under_deadline
+        real_abort = adapter_client.AbortableTransport.abort
+        cutoffs: list[float] = []
+        aborted_at: list[float] = []
+
+        def slow_new_session(*args, **kwargs):
+            if "transport" in kwargs:
+                # The send thread's session setup uses two of the three seconds after the call measured them.
+                time.sleep(2)
+            return real_new_session(*args, **kwargs)
+
+        def recorded_under_deadline(do_push, deadline_at):
+            cutoffs.append(deadline_at)
+            return real_under_deadline(do_push, deadline_at)
+
+        def recorded_abort(transport):
+            aborted_at.append(drain._send_clock())
+            return real_abort(transport)
+
+        with (
+            patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=3)),
+            patch.object(adapter_client, "new_session", side_effect=slow_new_session),
+            patch.object(delivery, "_under_deadline", side_effect=recorded_under_deadline),
+            patch.object(adapter_client.AbortableTransport, "abort", recorded_abort),
+            self.pointed_at_the_drip(),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert outcome == drain.FAILED
+        assert self.server.streaming.is_set(), "the far side never began the response this pin needs"
+        assert len(cutoffs) == 1 and aborted_at, (cutoffs, aborted_at)
+        assert aborted_at[0] - cutoffs[0] < 1, "the wait ran past the cutoff by the setup time"
+
     def test_direct_delivery_bounds_a_dripping_response(self):
         from netbox_nso_plugin import delivery, drain
         from netbox_nso_plugin.models import NSODeviceManagement

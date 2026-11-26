@@ -477,6 +477,10 @@ class TestTheSyncCacheJobStopsAtItsDeadline(_DeadlineCase):
         )
         # A slow inventory read proves no outage, so the per-device sends still run.
         self.assertEqual(self._unconsumed(device), 0)
+        self.assertTrue(
+            any(request["url"].endswith("/vlan-intent") for request in self.adapter.requests),
+            "no VLAN intent request reached the adapter",
+        )
 
     def test_a_snapshot_that_keeps_sending_past_its_cutoff_is_cut(self):
         """An HTTP/1.0 answer hands the socket to the response, and the cutoff must still reach it.
