@@ -3934,6 +3934,50 @@ def stamp_link_assigned_after_repair(management, now):
     log_stamp(stamped)
 
 
+def stamp_link_under_bare_if_on_unwind(management, now, attempted):
+    try:
+        repair_link(management)
+    finally:
+        if attempted:
+            # ruleid: nso-system-job-progress-stamp-in-finally
+            stamped = _mirror_management(management, adapter_link_attempted_at=now)
+            log_stamp(stamped)
+
+
+def stamp_link_under_bare_if_with_handler_on_unwind(management, now, attempted):
+    try:
+        repair_link(management)
+    except ValueError:
+        log_poll()
+    finally:
+        if attempted:
+            # ruleid: nso-system-job-progress-stamp-in-finally
+            _mirror_management(management, adapter_link_attempted_at=now)
+
+
+def stamp_link_under_bare_if_with_else_on_unwind(management, now, attempted):
+    try:
+        repair_link(management)
+    except ValueError:
+        log_poll()
+    else:
+        log_stamp(management)
+    finally:
+        if attempted:
+            # ruleid: nso-system-job-progress-stamp-in-finally
+            _mirror_management(management, adapter_link_attempted_at=now)
+
+
+def stamp_link_under_bare_if_after_repair(management, now, attempted):
+    try:
+        repair_link(management)
+    finally:
+        log_poll()
+    if attempted:
+        # ok: nso-system-job-progress-stamp-in-finally
+        _mirror_management(management, adapter_link_attempted_at=now)
+
+
 def stamp_tombstone_directly_after_poll(tombstone_id):
     try:
         sweep_one(tombstone_id)
