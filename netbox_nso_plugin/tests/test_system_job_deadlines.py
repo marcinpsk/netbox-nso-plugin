@@ -1994,10 +1994,33 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             rotation["lock_skipped"] = [[4, "vlan", "2026-11-17T00:00:00+00:00"]]
             return 0, 0
 
+        sleeping = threading.Event()
+        main = threading.main_thread().ident
+
+        def alarm_when_sleeping(worker_pid):
+            # RQ's alarm, raised only after a second connection sees the worker's statement run.
+            try:
+                give_up = time.monotonic() + 10
+                while time.monotonic() < give_up:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = %s AND state = 'active' "
+                            "AND query = 'SELECT pg_sleep(6)')",
+                            [worker_pid],
+                        )
+                        if cursor.fetchone()[0]:
+                            sleeping.set()
+                            signal.pthread_kill(main, signal.SIGALRM)
+                            return
+                    time.sleep(0.02)
+            finally:
+                connection.close()
+
         def sweep(*, deadline, feed_deadline, rotation):
             rotation["after_pk"] = 3
-            # RQ's alarm stops this statement in flight.
             with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                threading.Thread(target=alarm_when_sleeping, args=(cursor.fetchone()[0],), daemon=True).start()
                 cursor.execute("SELECT pg_sleep(6)")
             return 0, 0
 
@@ -2008,8 +2031,9 @@ class TestSystemJobsSetTheirOwnTimeout(_CascadeFlushMixin, TransactionTestCase):
             patch("netbox_nso_plugin.drain.drain_intent_outbox", side_effect=drain),
             patch("netbox_nso_plugin.settlement.sweep_static_route_settlements", side_effect=sweep),
         ):
-            job, elapsed, successors = self._overrun(None, jobs.RefreshDeviceSyncCacheJob)
+            job, elapsed, successors = self._overrun(None, jobs.RefreshDeviceSyncCacheJob, timeout=30)
 
+        self.assertTrue(sleeping.is_set(), "the alarm did not reach a running statement")
         self.assertLess(elapsed, 4, "the run went on after RQ's timeout")
         self.assertEqual(job.status, "errored")
         self.assertEqual(successors, 1)
