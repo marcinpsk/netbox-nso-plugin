@@ -259,7 +259,7 @@ def prepare(device_id: int, scope: str, *, force: bool, deadline_at: float):
         if captured is None:
             return outcome, None
         try:
-            answer = send(captured, deadline_at=deadline_at)
+            answer = send(captured, deadline_at=drain._send_cutoff(deadline_at))
             unauthorized = _validate(answer, captured)
             _retire(captured, unauthorized, answer=answer)
         except adapter_client.AdapterError as exc:
